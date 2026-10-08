@@ -118,17 +118,6 @@ extension QUICStreamHandle {
     }
 }
 
-// MARK: - NetworkFramework indexing
-
-// When creating a `ProtocolInstanceReference` for a given stream you can specify the container and
-// an index. That is, a `ProtocolInstanceContainer` can service many `ProtocolInstance`s as each is
-// keyed by an `Int` index. Since the index is only an `Int` we need to pack the whole handle into
-// it: its slot index and generation.
-//
-// Note that this will change in SwiftNetwork so this is unlikely to be the end state and will need
-// to be revisited then. (That's no bad thing because the slot indexing and generation are a lot
-// smaller on 32-bit platforms to squeeze them into an `Int`.)
-
 #if _pointerBitWidth(_64)
 @usableFromInline
 /// An unsigned integer with half the bytes of a `UInt`.
@@ -140,18 +129,3 @@ typealias UIntHalf = UInt16
 #else
 #error("Unsupported pointer size")
 #endif
-
-@available(anyAppleOS 26, *)
-extension QUICStreamHandle {
-    /// The index stored by SwiftNetwork for a given handle.
-    @inlinable
-    var protocolInstanceReferenceIndex: Int {
-        Int(bitPattern: self.rawValue)
-    }
-
-    /// Rebuilds the handle the stack was given as a container index.
-    @inlinable
-    init(protocolInstanceReferenceIndex: Int) {
-        self.init(rawValue: UInt(bitPattern: protocolInstanceReferenceIndex))
-    }
-}

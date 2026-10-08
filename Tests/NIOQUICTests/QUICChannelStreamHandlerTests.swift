@@ -18,7 +18,7 @@ import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
 import NIOQUICHelpers
-@_spi(ProtocolProvider) import SwiftNetwork
+@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 import Synchronization
 import Testing
 
@@ -68,7 +68,7 @@ struct QUICChannelStreamHandlerTests {
             // Data arrives once.
             let testData = ByteBuffer(string: "test")
             streamChannel._testOnly_appendToBufferedReadData(testData)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             // The buffer should be drained exactly once.
             #expect(recorder.events == [.read, .read, .channelRead(testData), .channelReadComplete])
@@ -95,7 +95,7 @@ struct QUICChannelStreamHandlerTests {
             // Now simulate data arriving from the network.
             let testData = ByteBuffer(string: "test")
             streamChannel._testOnly_appendToBufferedReadData(testData)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             // The data should be delivered downstream.
             #expect(recorder.channelReadCount == 1)
@@ -141,7 +141,7 @@ struct QUICChannelStreamHandlerTests {
             // Simulate data arriving from the network.
             let testData = ByteBuffer(string: "test")
             streamChannel._testOnly_appendToBufferedReadData(testData)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             // Since the downstream has not requested a read, the data should not be delivered downstream just yet.
             #expect(recorder.channelReadCount == 0)
@@ -195,7 +195,7 @@ struct QUICChannelStreamHandlerTests {
             // Data arrives from the network before `read` is called.
             let testData = ByteBuffer(string: "test")
             streamChannel._testOnly_appendToBufferedReadData(testData)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             // Since the downstream has not requested a read, the data should not be delivered downstream just yet.
             #expect(recorder.channelReadCount == 0)
@@ -213,7 +213,7 @@ struct QUICChannelStreamHandlerTests {
             for i in 1...3 {
                 let testData = ByteBuffer(string: "test\(i)")
                 streamChannel._testOnly_appendToBufferedReadData(testData)
-                streamChannel.handleInboundDataAvailableEvent(.init())
+                streamChannel.deliverInboundDataAvailableEvent()
             }
 
             switch autoRead {
@@ -280,7 +280,7 @@ struct QUICChannelStreamHandlerTests {
 
             // FIN arrives with no data.
             _ = try streamChannel.streamStateMachine.receiveFin(finalSize: 0)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             streamChannel.pipeline.read()
 
@@ -305,7 +305,7 @@ struct QUICChannelStreamHandlerTests {
             streamChannel._testOnly_appendToBufferedReadData(testData)
             // Tell the state machine we have received a FIN.
             _ = try streamChannel.streamStateMachine.receiveFin(finalSize: 0)
-            streamChannel.handleInboundDataAvailableEvent(.init())
+            streamChannel.deliverInboundDataAvailableEvent()
 
             // Since the downstream has not requested a read, the data should not be delivered downstream just yet.
             #expect(recorder.channelReadCount == 0)
@@ -368,7 +368,7 @@ struct QUICChannelStreamHandlerTests {
             #expect(isActiveBefore)
 
             // Fire `handleDisconnectedEvent`, actually perform the full close
-            streamChannel.handleDisconnectedEvent(.init(), error: nil)
+            streamChannel.deliverDisconnectedEvent(error: nil)
 
             // `_close` defers its body to the next event-loop tick; flush.
             (streamChannel.eventLoop as! EmbeddedEventLoop).run()
@@ -401,7 +401,7 @@ struct QUICChannelStreamHandlerTests {
             // already be `false`. If the cascade were deferred via
             // `eventLoop.execute` (the pre-fix shape), `_isActive` would
             // still be `true` here.
-            streamChannel.handleDisconnectedEvent(.init(), error: nil)
+            streamChannel.deliverDisconnectedEvent(error: nil)
 
             let isActiveAfterImmediately = streamChannel.isActive
             #expect(
@@ -411,6 +411,41 @@ struct QUICChannelStreamHandlerTests {
 
             // Drain the deferred pipeline body.
             (streamChannel.eventLoop as! EmbeddedEventLoop).run()
+        }
+    }
+
+    /// A stream the application closes stays attached until its flow's disconnect arrives, after
+    /// all ACKs. The flow delivers that event to the handler, so it must still be registered then.
+    @available(anyAppleOS 26, *)
+    @Test("A stream closed while attached unregisters only once its flow's disconnect detaches it")
+    func closedStreamUnregistersOnceDetached() throws {
+        try Self.withServerStream { streamChannel in
+            streamChannel.close(promise: nil)
+            (streamChannel.eventLoop as! EmbeddedEventLoop).run()
+
+            // The close has completed, and the flow still has the handler as its upper.
+            let isAttached = streamChannel.swiftNetworkStreamHandle.isAttached
+            #expect(isAttached)
+            try #require(!streamChannel.identifier.isNone)
+
+            streamChannel.deliverDisconnectedEvent(error: nil)
+            #expect(streamChannel.identifier.isNone)
+        }
+    }
+
+    /// As above, when `stop` detaches the stream instead of its flow's disconnect.
+    @available(anyAppleOS 26, *)
+    @Test("A stream closed while attached unregisters once stop detaches it")
+    func closedStreamUnregistersOnceStopDetachesIt() throws {
+        try Self.withServerStream { streamChannel in
+            streamChannel.close(promise: nil)
+            (streamChannel.eventLoop as! EmbeddedEventLoop).run()
+            try #require(!streamChannel.identifier.isNone)
+
+            streamChannel.fromExternal { eventContext in
+                streamChannel.stop(detachFromLowerProtocol: true, in: &eventContext)
+            }
+            #expect(streamChannel.identifier.isNone)
         }
     }
 
@@ -452,7 +487,7 @@ struct QUICChannelStreamHandlerTests {
     func invokeWrappersReleaseBorrowBeforeReturning() throws {
         try Self.withServerStream { streamChannel in
             // Extract the linkage from the non-mutating send-data wrapper.
-            let linkage: OutboundStreamLinkage
+            let linkage: BaseOutboundStreamLinkage
             switch streamChannel.swiftNetworkStreamHandle.invokeSendStreamData() {
             case .proceed(let extracted):
                 linkage = extracted
@@ -491,6 +526,24 @@ struct QUICChannelStreamHandlerTests {
 
             connection._forTesting_handlePathValidated(remote: newAddress.toAddressEndpoint())
             #expect(streamChannel.remoteAddress == newAddress)
+        }
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension QUICChannelStreamHandler {
+    /// Delivers the stack's inbound-data-available event the way the stack does: with the event
+    /// context held, which this fabricates by entering as the handler.
+    fileprivate func deliverInboundDataAvailableEvent() {
+        self.fromExternal { eventContext in
+            self.handleInboundDataAvailableEvent(for: InstanceIdentifier(), in: &eventContext)
+        }
+    }
+
+    /// Delivers the stack's disconnected event, as ``deliverInboundDataAvailableEvent()`` does.
+    fileprivate func deliverDisconnectedEvent(error: NetworkError?) {
+        self.fromExternal { eventContext in
+            self.handleDisconnectedEvent(error: error, for: InstanceIdentifier(), in: &eventContext)
         }
     }
 }

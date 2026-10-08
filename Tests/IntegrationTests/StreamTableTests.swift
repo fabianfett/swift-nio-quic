@@ -19,13 +19,6 @@ import Testing
 
 @testable import NIOQUIC
 
-/// swift-network-evolution 0.4.0 hands a closed stream's flow ID to the next stream, so a late ACK for the
-/// old stream can mark the new stream's data as delivered before it was sent. Fixed on its main branch by
-/// apple/swift-network-evolution#165 (4ed1faa39) during the protocol stack refactor.
-///
-/// TODO: Remove the known issues using this once a release has it.
-private let flowIDReuse: Comment = "Flow ID reuse, fixed by apple/swift-network-evolution#165"
-
 @Suite(.timeLimit(.minutes(5)))
 struct StreamTableTests {
     @available(anyAppleOS 26, *)
@@ -83,10 +76,8 @@ struct StreamTableTests {
             let visits = await recording.visits(untilClosedStreams: streamCount)
 
             let closed = visits.filter { $0.events.contains(.closed) }
-            withKnownIssue(flowIDReuse, isIntermittent: true) {
-                #expect(Set(closed.map { $0.handle }).count == streamCount)
-                #expect(closed.allSatisfy { $0.bytesReadSoFar == request })
-            }
+            #expect(Set(closed.map { $0.handle }).count == streamCount)
+            #expect(closed.allSatisfy { $0.bytesReadSoFar == request })
         }
 
         #expect(failures.withLockedValue { $0 }.isEmpty)
@@ -144,10 +135,8 @@ struct StreamTableTests {
             let visits = await recording.visits(untilClosedStreams: requestCount)
 
             let responses = visits.filter { $0.events.contains(.closed) }.map { $0.bytesReadSoFar }
-            withKnownIssue(flowIDReuse, isIntermittent: true) {
-                #expect(responses.count == requestCount)
-                #expect(responses.allSatisfy { $0 == expected })
-            }
+            #expect(responses.count == requestCount)
+            #expect(responses.allSatisfy { $0 == expected })
         }
 
         #expect(failures.withLockedValue { $0 }.isEmpty)
@@ -622,9 +611,7 @@ struct StreamTableTests {
             let visits = await recording.visits(untilClosedStreams: streamCount)
 
             let echoed = Set(visits.filter { $0.events.contains(.closed) }.map { $0.bytesReadSoFar })
-            withKnownIssue(flowIDReuse, isIntermittent: true) {
-                #expect(echoed == Set(payloads))
-            }
+            #expect(echoed == Set(payloads))
         }
 
         #expect(failures.withLockedValue { $0 }.isEmpty)
@@ -764,6 +751,42 @@ struct StreamTableTests {
             }.get()
 
             #expect(openFailed == true)
+        }
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func forceCloseClosesEveryStream() async throws {
+        let recording = StreamRecording()
+
+        try await withConsumerPair(
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer()
+        ) { pair in
+            // No FIN, so the stream is still open when the connection is forced closed.
+            let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /quic"), fin: false)
+
+            // What the registry does once a graceful shutdown overruns its deadline.
+            let channel = try #require(pair.clientConnection.channel as? QUICConnectionChannel<RecordConsumer>)
+            try await channel.eventLoop.submit {
+                channel.transportView.forceClose()
+            }.get()
+            // Completes once the channel has torn down, which retires the table's anchor.
+            try await channel.closeFuture.get()
+
+            // The stream closed with the connection: its handle no longer resolves, so there is
+            // nothing left to flush.
+            let resolved = try await pair.clientConnection.withStreams { streams -> Bool in
+                try streams.withStream(handle: handle) { stream, _ in
+                    try stream.flush(fin: true)
+                } != nil
+            }.get()
+
+            #expect(resolved == false)
+
+            let visits = await recording.visits(untilClosedStreams: 1)
+            let closed = visits.filter { $0.events.contains(.closed) }
+            #expect(closed.map { $0.handle } == [handle])
         }
     }
 

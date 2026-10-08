@@ -33,9 +33,8 @@ struct QUICStreamHandleTests {
         #expect(lhs != rhs)
     }
 
-    @available(anyAppleOS 26, *)
     @Test
-    func pirIndexRoundTrips() {
+    func rawValueRoundTrips() {
         let maxIndex = QUICStreamHandle.Index(UIntHalf.max)
         let maxGeneration = QUICStreamHandle.Generation(UIntHalf.max)
 
@@ -46,7 +45,7 @@ struct QUICStreamHandleTests {
             QUICStreamHandle(index: maxIndex, generation: .first),
             QUICStreamHandle(index: .first, generation: maxGeneration),
         ] {
-            #expect(QUICStreamHandle(protocolInstanceReferenceIndex: handle.protocolInstanceReferenceIndex) == handle)
+            #expect(QUICStreamHandle(rawValue: handle.rawValue) == handle)
         }
     }
 }

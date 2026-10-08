@@ -41,6 +41,46 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     @usableFromInline
     var _byID: QUICStreamIDDictionary<QUICStreamHandle>
 
+    /// Stream handles keyed by the identifier of the flow each stream is attached to.
+    ///
+    /// The stack delivers a stream's events `for` the flow that sent them, not for the identifier
+    /// this table registered for the stream, so this is how the `ExternalInboundStreamLinkage`
+    /// witnesses resolve an event back to its stream.
+    @usableFromInline
+    @_spi(Essentials) @_spi(ProtocolProvider)
+    var _byFlowIdentifier: [InstanceIdentifier: QUICStreamHandle]
+
+    /// The identifier of whichever stream is currently being attached to the stack.
+    ///
+    /// `BaseInboundStreamLinkage.init(external:)` reads `identifier` exactly once, at
+    /// construction, to seed its own immutable field — it is never consulted again after that.
+    /// This is therefore only ever read immediately after being set, from directly within the
+    /// same (single-threaded, per-connection) call that just registered it.
+    ///
+    /// `@usableFromInline` rather than `private`: the `identifier` getter that reads this lives in
+    /// `QUICStreamTable+ExternalInboundStreamLinkage.swift`, a different file, and — like every
+    /// other witness for `ExternalInboundStreamLinkage` there — must be at least as visible as
+    /// this `@usableFromInline` type itself.
+    @usableFromInline
+    @_spi(Essentials) @_spi(ProtocolProvider)
+    var _pendingAttachIdentifier: InstanceIdentifier
+
+    /// The lower linkage for the stream `open` is currently attaching to the stack.
+    ///
+    /// `ListenerLinkage.invokeAttachUpperProtocolToNewFlow` returns `Void` — it delivers the new
+    /// stream's `BaseOutboundStreamLinkage` synchronously via a callback to this table's own
+    /// `invokeAttachLowerProtocol`, fired from inside that same call. The callback stashes the
+    /// linkage here once its attach has succeeded, and `open` takes it as soon as that call
+    /// returns, so this is `nil` outside an `open`. `_pendingAttachIdentifier`, by contrast, keeps
+    /// the identifier registered last.
+    ///
+    /// `@usableFromInline` for the same reason as `_pendingAttachIdentifier` above: written from
+    /// `invokeAttachLowerProtocol` in `QUICStreamTable+ExternalInboundStreamLinkage.swift`, a
+    /// different file.
+    @usableFromInline
+    @_spi(Essentials) @_spi(ProtocolProvider)
+    var _pendingAttachLinkage: BaseOutboundStreamLinkage?
+
     /// Whether there is any pending output that needs to be drained by the connection.
     @usableFromInline
     var _outputPending: Bool
@@ -69,23 +109,50 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// Context for the `SwiftNetwork` stack.
     let context: NetworkContext
 
-    init(role: Role, context: NetworkContext) {
+    /// The connection's event context slot. The table's operations acquire the context through it.
+    let eventContextSlot: EventContextSlot
+
+    /// The instance the table's operations enter the stack as.
+    ///
+    /// Registered for the table's lifetime, and retired by ``retireAnchor()``, which must run
+    /// before the table is released: the anchor's event manager traps on deinit otherwise.
+    let anchor: EventContextAnchor
+
+    /// Creates a table. Must be called with no event context held: it registers the table's anchor.
+    init(role: Role, context: NetworkContext, eventContextSlot: EventContextSlot) {
         self._transportStates = QUICStreamSlots()
         self._consumerStates = QUICStreamConsumerStates()
         self._ready = []
         self._needsState = []
         self._byID = QUICStreamIDDictionary()
+        self._byFlowIdentifier = [:]
+        self._pendingAttachIdentifier = InstanceIdentifier()
+        self._pendingAttachLinkage = nil
         self._outputPending = false
         self.opener = nil
         self.inReadLoop = false
         self.outOfBandDrainRequested = false
         self.role = role
         self.context = context
+        self.eventContextSlot = eventContextSlot
+        self.anchor = EventContextAnchor(context: context)
     }
 
     deinit {
-        // Failing to close may lead to `Frame`'s not being finalized (which will trap).
-        self.forceCloseAll(error: nil)
+        precondition(
+            self.isClosed,
+            "QUICStreamTable released before closeAll(error:disconnect:into:) or retireAnchor()"
+        )
+        // A closed table takes no new streams (`open` throws, `attachInboundFlowToTable` declines
+        // the flow), and `closeAll` removes every stream, including any opened during its drain.
+        // So a table reaching `deinit` with live streams never ran `closeAll`: a teardown bug.
+        // Such streams' event managers are still registered and trap (an unretired anchor trips
+        // the precondition above first), and `deinit` has no event context to detach them with.
+        // Fabricating one would hide the bug.
+        //
+        // Streams that never reached the stack (unit tests insert slots directly) hold nothing
+        // registered. Their queued frames still need finalizing: `Frame.deinit` traps otherwise.
+        self.abandonAllLocally()
     }
 
     /// The number of streams in the table.
@@ -98,6 +165,11 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     @inlinable
     var hasPendingWork: Bool {
         !self._ready.isEmpty
+    }
+
+    /// Whether the table has closed: its anchor is retired, and it takes no new streams.
+    var isClosed: Bool {
+        self.anchor.identifier.isNone
     }
 }
 
@@ -174,9 +246,45 @@ extension QUICStreamTable where Consumer: ~Copyable {
         return handle
     }
 
-    /// The reference the `SwiftNetwork` stack routes the given stream's events through.
-    func reference(for handle: QUICStreamHandle) -> ProtocolInstanceReference {
-        ProtocolInstanceReference(custom: self, index: handle.protocolInstanceReferenceIndex)
+    /// Registers a fresh identifier for `handle`'s stream, using that stream's own event
+    /// manager. Also stashes it as the identifier `ExternalInboundStreamLinkage.identifier` will
+    /// report on the very next `BaseInboundStreamLinkage(external: self)` construction — call
+    /// this immediately before that construction, not before.
+    func registerIdentifier(
+        for handle: QUICStreamHandle,
+        in eventContext: inout NetworkContext.EventContext
+    ) -> InstanceIdentifier {
+        guard let transport = self._transportStates.pointer(for: handle) else {
+            preconditionFailure("slot for \(handle) was recycled before it could be registered")
+        }
+        let identifier = InstanceIdentifier(eventManager: &transport.pointee.eventManager, in: &eventContext)
+        self._pendingAttachIdentifier = identifier
+        return identifier
+    }
+
+    /// As ``registerIdentifier(for:in:)``, for use with no event context held: registering then
+    /// acquires the context itself (see `EventContextSlot`).
+    func registerIdentifier(for handle: QUICStreamHandle) -> InstanceIdentifier {
+        guard let transport = self._transportStates.pointer(for: handle) else {
+            preconditionFailure("slot for \(handle) was recycled before it could be registered")
+        }
+        let identifier = InstanceIdentifier(context: self.context, eventManager: &transport.pointee.eventManager)
+        self._pendingAttachIdentifier = identifier
+        return identifier
+    }
+
+    /// Attaches `handle`'s stream to the flow `linkage` leads to, and indexes the stream by that
+    /// flow's identifier, which is what the stack's events for the stream arrive `for`.
+    ///
+    /// Call before connecting the stream: connecting hands over the events the flow buffered.
+    func attach(_ handle: QUICStreamHandle, identifier: InstanceIdentifier, linkage: BaseOutboundStreamLinkage) {
+        guard let transport = self._transportStates.pointer(for: handle) else {
+            preconditionFailure("slot for \(handle) was recycled while its flow was attaching")
+        }
+        transport.pointee.core.attach(identifier: identifier, linkage: linkage)
+        transport.pointee.flowIdentifier = linkage.identifier
+        assert(self._byFlowIdentifier[linkage.identifier] == nil)  // A flow attaches to at most one stream.
+        self._byFlowIdentifier[linkage.identifier] = handle
     }
 
     /// Records the ID the stack assigned, indexes it, and connects the stream's state machine.
@@ -258,16 +366,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
 @available(anyAppleOS 26, *)
 extension QUICStreamTable where Consumer: ~Copyable {
-    /// The slot a handle addresses, or `nil` if it has been recycled since.
-    @inlinable
-    func transportState(
-        for handle: QUICStreamHandle
-    ) -> UnsafeMutablePointer<QUICStreamTransportState>? {
-        self._transportStates.pointer(for: handle)
-    }
-
     /// The stack assigned the stream its ID.
-    func streamConnected(_ handle: QUICStreamHandle) {
+    func streamConnected(_ handle: QUICStreamHandle, in eventContext: inout NetworkContext.EventContext) {
         guard let transport = self._transportStates.pointer(for: handle) else { return }
 
         // Inbound streams have the stream core created with an ID; only consult metadata if the ID
@@ -275,7 +375,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
         let id: QUICStreamID?
         if let known = transport.pointee.core.id {
             id = known
-        } else if let rawID = transport.pointee.core.metadata()?.streamID {
+        } else if let rawID = transport.pointee.core.metadata(in: &eventContext)?.streamID {
             id = QUICStreamID(rawValue: rawID)
         } else {
             id = nil
@@ -310,10 +410,14 @@ extension QUICStreamTable where Consumer: ~Copyable {
     }
 
     /// The peer sent STOP\_SENDING.
-    func peerStoppedSending(_ handle: QUICStreamHandle, code: QUICApplicationErrorCode) {
+    func peerStoppedSending(
+        _ handle: QUICStreamHandle,
+        code: QUICApplicationErrorCode,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
         guard let transport = self._transportStates.pointer(for: handle) else { return }
 
-        transport.pointee.core.receiveStopSending(code: code)
+        transport.pointee.core.receiveStopSending(code: code, in: &eventContext)
         transport.pointee.stopSendingCode = code
 
         self._markReady(handle: handle, transport: transport, events: .stopSending)
@@ -325,7 +429,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
 @available(anyAppleOS 26, *)
 extension QUICStreamTable where Consumer: ~Copyable {
     /// Hand each ready stream to the consumer.
-    @inlinable
+    ///
+    /// Holds no event context while the consumer runs: its stream operations each acquire one.
     func drain(into consumer: inout Consumer) {
         self.outOfBandDrainRequested = false
 
@@ -341,9 +446,15 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
         var iterator = QUICStreamIterator(table: self)
         consumer.processStreams(&iterator)
+        // Finish any visit the consumer didn't pull to completion, so `QUICStreamIterator.deinit`'s
+        // precondition holds once the iterator's scope ends right after this.
+        iterator._finishVisit()
     }
 
-    /// Marks every stream as closed and visits each of them.
+    /// Marks every stream as closed and visits each of them, then retires the table's anchor.
+    ///
+    /// The table's operations can't be used afterwards. May be reached with the event context
+    /// parked, in which case every acquisition here takes the parked one.
     ///
     /// - Parameters:
     ///   - error: Reported to the consumer as the reason each stream closed.
@@ -372,7 +483,13 @@ extension QUICStreamTable where Consumer: ~Copyable {
         }
 
         self.drain(into: &consumer)
-        self.forceCloseAll(error: disconnect)
+        self.withEventContext { eventContext in
+            self.forceCloseAll(error: disconnect, in: &eventContext)
+        }
+        self.retireAnchor()
+        // Closed first, and with nothing held: the states' deinits are consumer code, and an `open`
+        // from one now throws.
+        self._consumerStates.removeAll()
     }
 
     /// Removes and returns the next stream from the ready queue.
@@ -429,10 +546,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
     /// Clears the flags a visit presented and, if that visit was the stream's last, recycles its
     /// slot.
-    @inlinable
+    ///
+    /// Acquires the event context only to recycle the slot.
+    @usableFromInline
     func finishVisit(_ handle: QUICStreamHandle, presented: QUICStreamEvents) {
         if presented.contains(.closed) {
-            self._remove(handle: handle)
+            self.vacateSlot(handle)
         } else if let transport = self._transportStates.pointer(for: handle) {
             // Clear the events which were shown in the last visit.
             transport.pointee.events.subtract(presented)
@@ -454,18 +573,36 @@ extension QUICStreamTable where Consumer: ~Copyable {
 @available(anyAppleOS 26, *)
 extension QUICStreamTable where Consumer: ~Copyable {
     /// Closes and vacates a slot, without a visit.
-    @inlinable
-    func vacateSlot(_ handle: QUICStreamHandle) {
+    func vacateSlot(_ handle: QUICStreamHandle, in eventContext: inout NetworkContext.EventContext) {
         // Note: this is helpful for a stream which never reached the stack, the consumer wasn't
         // told about it so there's nothing to report.
-        self._remove(handle: handle)
+        self._remove(handle: handle, in: &eventContext)
+    }
+
+    /// As ``vacateSlot(_:in:)``, but acquires the event context itself, and releases the consumer's
+    /// state for the stream only once that acquisition has ended: the state's deinit is consumer code.
+    func vacateSlot(_ handle: QUICStreamHandle) {
+        let state = self.takeConsumerState(for: handle)
+        self.withEventContext { eventContext in
+            self._remove(handle: handle, in: &eventContext)
+        }
+        // Only now, with nothing held: the state's deinit is consumer code.
+        _ = consume state
+    }
+
+    /// Moves the consumer's state for `handle`'s stream out of the table, for the caller to release
+    /// once no event context is held: its deinit is consumer code.
+    private func takeConsumerState(for handle: QUICStreamHandle) -> Consumer.StreamState? {
+        if self._transportStates.pointer(for: handle) == nil {
+            return nil
+        }
+        return self._consumerStates.pointer(at: handle.index).pointee.take()
     }
 
     /// Closes a slot's stream core and vacates the slot.
     ///
     /// - Parameter handle: The handle the visit was made with.
-    @usableFromInline
-    func _remove(handle: QUICStreamHandle) {
+    private func _remove(handle: QUICStreamHandle, in eventContext: inout NetworkContext.EventContext) {
         guard let transport = self._transportStates.pointer(for: handle) else { return }
 
         if let id = transport.pointee.core.id {
@@ -473,23 +610,158 @@ extension QUICStreamTable where Consumer: ~Copyable {
             assert(removed == handle)
         }
 
+        let removedFlow = self._byFlowIdentifier.removeValue(forKey: transport.pointee.flowIdentifier)
+        assert(removedFlow == nil || removedFlow == handle)  // nil: the slot never attached.
+
         // Close in case it isn't already (close is idempotent).
         let error = transport.pointee.disconnectError
-        transport.pointee.core.close(error: error)
+        transport.pointee.core.close(error: error, in: &eventContext)
+        self.unregisterEventManager(of: &transport.pointee, in: &eventContext)
 
         self._transportStates.removeValue(for: handle)
         self._consumerStates.removeValue(at: handle.index)
     }
 
-    /// Closes and vacates every remaining slot, without a visit.
-    private func forceCloseAll(error: NetworkError?) {
+    /// Retires the stack's registration of a slot's event manager, which traps on deinit otherwise.
+    /// A no-op for a slot that never registered.
+    ///
+    /// Only a `ProtocolInstance` can unregister an event manager, and a slot isn't one, so the
+    /// manager moves into a `SlotRegistration` to be unregistered.
+    private func unregisterEventManager(
+        of transport: inout QUICStreamTransportState,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        var registration = SlotRegistration(
+            context: self.context,
+            identifier: InstanceIdentifier(),
+            eventManager: exchange(&transport.eventManager, with: ProtocolEventManager())
+        )
+        registration.unregisterEventManager(in: &eventContext)
+    }
+
+    /// Vacates every remaining slot, running `perSlot` on each slot just before it's dropped.
+    /// Shared by `forceCloseAll(error:in:)` (detaches from the stack) and `abandonAllLocally()`
+    /// (doesn't) so a future field added to one of these bulk-teardown paths isn't forgotten in
+    /// the other. Consumer states are the caller's to release.
+    private func removeAllSlots(perSlot: (inout QUICStreamTransportState) -> Void) {
+        // First, so no witness resolves a stream while `removeAll` has the slots: closing a stream
+        // can deliver its events synchronously.
+        self._byFlowIdentifier.removeAll()
         self._transportStates.removeAll { transport in
             var transport = consume transport
-            transport.core.close(error: error)
+            perSlot(&transport)
         }
-        self._consumerStates.removeAll()
         self._ready.removeAll(keepingCapacity: true)
         self._needsState.removeAll(keepingCapacity: true)
         self._byID.removeAll()
     }
+
+    /// Closes and vacates every remaining slot, without a visit.
+    private func forceCloseAll(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
+        self.removeAllSlots { transport in
+            transport.core.close(error: error, in: &eventContext)
+            self.unregisterEventManager(of: &transport, in: &eventContext)
+        }
+    }
+
+    /// Vacates every remaining slot without touching the stack.
+    ///
+    /// Used only from `deinit` — see the note there for why this doesn't call
+    /// `core.close(error:in:)` the way `forceCloseAll(error:in:)` does.
+    private func abandonAllLocally() {
+        self.removeAllSlots { transport in
+            transport.core.abandonLocally()
+        }
+    }
+}
+
+// MARK: - Event context
+
+@available(anyAppleOS 26, *)
+extension QUICStreamTable where Consumer: ~Copyable {
+    /// Runs `body` with the connection's event context, entering the stack as the table's anchor.
+    ///
+    /// Takes the parked context if a caller up the stack parked one, otherwise acquires it. The
+    /// anchor is never a callee. The operations here call QUIC stream flows, whose parent, the
+    /// `QUICConnection`, is idle wherever consumer code runs.
+    func withEventContext<R, E: Error>(
+        _ body: (inout NetworkContext.EventContext) throws(E) -> R
+    ) throws(E) -> R {
+        precondition(!self.isClosed, "stream table used after it was closed")
+        return try self.eventContextSlot.withEventContext(entering: self.anchor, body)
+    }
+
+    /// Retires the table's anchor, after which its operations can't acquire the event context.
+    /// Idempotent.
+    func retireAnchor() {
+        self.anchor.retire(through: self.eventContextSlot)
+    }
+}
+
+// MARK: - Stream operations
+
+/// `QUICStream`'s operations that reach the stack. Each acquires the event context only while it
+/// needs the stack: `read` for each pull from it, the others for the whole call.
+///
+/// Their signatures don't mention SwiftNetwork's SPI types, so `QUICStream`'s `@inlinable` methods
+/// can call them.
+@available(anyAppleOS 26, *)
+extension QUICStreamTable where Consumer: ~Copyable {
+    /// Reads from the stream `transport` belongs to.
+    ///
+    /// Acquires the event context only for each pull from the stack, so `body` runs with nothing
+    /// held, or with the context still parked if a caller up the stack parked it.
+    @usableFromInline
+    func read(
+        _ transport: UnsafeMutablePointer<QUICStreamTransportState>,
+        minContiguous: Int,
+        _ body: (_ span: borrowing RawSpan) -> Int
+    ) -> QUICStreamReadOutcome {
+        transport.pointee.core.read(
+            minContiguous: minContiguous,
+            withEventContext: { pull in self.withEventContext(pull) },
+            body
+        )
+    }
+
+    /// How many bytes the stream `transport` belongs to will accept right now.
+    @usableFromInline
+    func writableBytes(_ transport: UnsafeMutablePointer<QUICStreamTransportState>) -> Int {
+        self.withEventContext { eventContext in
+            transport.pointee.core.writableBytes(in: &eventContext)
+        }
+    }
+
+    /// Writes the queued data of the stream `transport` belongs to.
+    @usableFromInline
+    func flush(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, fin: Bool) throws {
+        try self.withEventContext { eventContext in
+            try transport.pointee.core.flush(fin: fin, in: &eventContext)
+        }
+    }
+
+    /// Resets the send side of the stream `transport` belongs to.
+    @usableFromInline
+    func sendResetStream(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
+        self.withEventContext { eventContext in
+            transport.pointee.core.sendResetStream(code: code, in: &eventContext)
+        }
+    }
+
+    /// Closes the receive side of the stream `transport` belongs to.
+    @usableFromInline
+    func sendStopSending(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
+        self.withEventContext { eventContext in
+            transport.pointee.core.sendStopSending(code: code, in: &eventContext)
+        }
+    }
+}
+
+/// A slot's event manager, moved out of the slot to be unregistered: see
+/// `QUICStreamTable.unregisterEventManager(of:in:)`.
+@available(anyAppleOS 26, *)
+private struct SlotRegistration: ProtocolInstance, ~Copyable {
+    let context: NetworkContext
+    var identifier: InstanceIdentifier
+    var eventManager: ProtocolEventManager
 }

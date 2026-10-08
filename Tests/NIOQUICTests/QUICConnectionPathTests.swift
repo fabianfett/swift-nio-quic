@@ -22,87 +22,116 @@ import Testing
 @testable import NIOQUIC
 
 struct QUICConnectionPathTests {
+    /// Runs `body` with a new path and the slot to enter the stack through.
+    ///
+    /// The path registers as it's created. Nothing above it releases it, as a QUIC instance would,
+    /// so this unregisters it afterwards: its event manager traps on deinit otherwise.
     @available(anyAppleOS 26, *)
-    private func makePath(
+    private func withPath(
         isValidated: Bool = false,
-        remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000)
-    ) -> QUICConnectionPath<QUICStreamChannels> {
+        remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000),
+        _ body: (QUICConnectionPath<QUICStreamChannels>, EventContextSlot) throws -> Void
+    ) rethrows {
         let eventLoop = EmbeddedEventLoop()
         let context = NetworkContext(
             identifier: "test-context",
             externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
         )
-        return QUICConnectionPath(
-            role: .server,
-            remoteAddress: remoteAddress,
-            context: context,
-            framePool: .makePool(forGSO: false),
-            isValidated: isValidated,
-            maxSegments: 1,
-            bufferPoolCapacity: 8,
-            logger: Logger(label: "test")
-        )
+        let slot = EventContextSlot(context: context)
+        let anchor = EventContextAnchor(context: context)
+        defer { anchor.retire(through: slot) }
+        let path = slot.withEventContext(entering: anchor) { eventContext in
+            QUICConnectionPath<QUICStreamChannels>(
+                role: .server,
+                remoteAddress: remoteAddress,
+                context: context,
+                framePool: .makePool(forGSO: false),
+                isValidated: isValidated,
+                maxSegments: 1,
+                bufferPoolCapacity: 8,
+                logger: Logger(label: "test"),
+                in: &eventContext
+            )
+        }
+        defer {
+            slot.withEventContext(entering: path) { eventContext in
+                path.teardown(in: &eventContext)
+            }
+        }
+        try body(path, slot)
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func freshPathHasNoQueuedData() {
-        let path = self.makePath()
-        #expect(!path.hasQueuedInboundPackets)
-        #expect(!path.hasQueuedOutboundData)
+        self.withPath { path, _ in
+            #expect(!path.hasQueuedInboundPackets)
+            #expect(!path.hasQueuedOutboundData)
+        }
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func enqueueInboundPacketTracksQueue() {
-        let path = self.makePath()
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 100))
-        #expect(path.hasQueuedInboundPackets)
+        self.withPath { path, _ in
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 100))
+            #expect(path.hasQueuedInboundPackets)
+        }
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func drainInboundFramesEmptiesQueue() {
-        let path = self.makePath()
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
-        var drained = path.drainInboundFrames(maximumDatagramCount: 10)
-        if drained == nil {
-            Issue.record("Expected non-nil drained frames")
-        } else {
-            drained!.finalizeAllFramesAsFailed()
+        self.withPath { path, _ in
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
+            var drained = path.drainInboundFrames(maximumDatagramCount: 10)
+            if drained == nil {
+                Issue.record("Expected non-nil drained frames")
+            } else {
+                drained!.finalizeAllFramesAsFailed()
+            }
+            #expect(!path.hasQueuedInboundPackets)
         }
-        #expect(!path.hasQueuedInboundPackets)
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func drainInboundFramesReturnsNilWhenEmpty() {
-        let path = self.makePath()
-        let result = path.drainInboundFrames(maximumDatagramCount: 10)
-        if result != nil {
-            Issue.record("Expected nil when draining empty queue")
+        self.withPath { path, _ in
+            let result = path.drainInboundFrames(maximumDatagramCount: 10)
+            if result != nil {
+                Issue.record("Expected nil when draining empty queue")
+            }
         }
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func idlePathDropsOutboundDatagrams() throws {
-        let path = self.makePath()
-
-        if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 2, minimumDatagramSize: 100) {
-            try path.sendDatagrams(.init(), datagrams: datagrams)
+        try self.withPath { path, slot in
+            try slot.withEventContext(entering: path) { eventContext in
+                if let datagrams = try path.getDatagramsToSend(
+                    maximumDatagramCount: 2,
+                    minimumDatagramSize: 100,
+                    for: InstanceIdentifier(),
+                    in: &eventContext
+                ) {
+                    try path.sendDatagrams(datagrams, from: InstanceIdentifier(), in: &eventContext)
+                }
+            }
+            #expect(!path.hasQueuedOutboundData)
         }
-        #expect(!path.hasQueuedOutboundData)
     }
 
     @available(anyAppleOS 26, *)
     @Test
     func detachedPathDropsInboundPackets() {
-        let path = self.makePath()
-        path.detach()
+        self.withPath { path, _ in
+            path.detach()
 
-        path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
-        #expect(!path.hasQueuedInboundPackets)
+            path.enqueueInboundPacket(ByteBuffer(repeating: 0xAA, count: 50))
+            #expect(!path.hasQueuedInboundPackets)
+        }
     }
 
     @available(anyAppleOS 26, *)

@@ -111,6 +111,21 @@ struct QUICStatelessResetTokenGeneratorTests {
 
     @Test
     @available(anyAppleOS 26, *)
+    func noResetPacketAsLargeAsItsTrigger() {
+        let generator = QUICStatelessResetToken.HMACSHA256Generator(key: Self.key)
+
+        // SwiftNetwork's default reset is 38 bytes, so a 38-byte trigger is the boundary: the
+        // reset has to shrink, or not be sent at all.
+        let packet = generator.statelessResetPacket(
+            for: self.makeConnectionID(1),
+            triggeringPacketLength: 38,
+            allocator: ByteBufferAllocator()
+        )
+        #expect((packet?.readableBytes ?? 0) < 38)
+    }
+
+    @Test
+    @available(anyAppleOS 26, *)
     func noResetPacketWhenTheTriggerIsTooSmall() {
         let generator = QUICStatelessResetToken.HMACSHA256Generator(key: Self.key)
 

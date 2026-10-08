@@ -104,9 +104,7 @@ extension QUICStatelessResetToken.Generator {
             token: token.token,
             triggeringPacketLength: triggeringPacketLength
         )
-        // For 38 byte packets `createStatelessResetPacket` creates 38 bytes responses.
-        // This can lead to a loop of endless back and forth. Double checking to be sure.
-        guard let bytes, bytes.count < triggeringPacketLength else {
+        guard let bytes else {
             return nil
         }
         assert(!bytes.isEmpty)
