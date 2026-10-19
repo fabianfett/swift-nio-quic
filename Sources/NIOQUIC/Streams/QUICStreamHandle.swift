@@ -19,12 +19,6 @@ public struct QUICStreamHandle: Hashable, Sendable {
     @usableFromInline
     var _generation: Generation
 
-    @inlinable
-    var rawValue: UInt {
-        let indexBits = UInt(self._index._rawValue)
-        return indexBits | UInt(self._generation.rawValue) << UIntHalf.bitWidth
-    }
-
     /// The index of the slot the stream occupies in the connection's stream table.
     @inlinable
     var index: Index {
@@ -42,14 +36,6 @@ public struct QUICStreamHandle: Hashable, Sendable {
     init(index: Index, generation: Generation) {
         self._index = index
         self._generation = generation
-    }
-
-    /// Rebuilds a handle which was flattened to its raw bits.
-    @inlinable
-    init(rawValue: UInt) {
-        self._index = Index(UIntHalf(truncatingIfNeeded: rawValue))
-        let generationBits = rawValue >> UIntHalf.bitWidth
-        self._generation = Generation(UIntHalf(truncatingIfNeeded: generationBits))
     }
 }
 
@@ -89,11 +75,6 @@ extension QUICStreamHandle {
         /// The slot the stream occupies, as a subscript into storage which is addressed by `Int`.
         @inlinable
         var rawValue: Int { Int(self._rawValue) }
-
-        @inlinable
-        init(_ rawValue: UIntHalf) {
-            self._rawValue = rawValue
-        }
 
         @inlinable
         init(_ rawValue: Int) {

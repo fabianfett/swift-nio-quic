@@ -32,20 +32,4 @@ struct QUICStreamHandleTests {
         let rhs = QUICStreamHandle(index: index, generation: .init(2))
         #expect(lhs != rhs)
     }
-
-    @Test
-    func rawValueRoundTrips() {
-        let maxIndex = QUICStreamHandle.Index(UIntHalf.max)
-        let maxGeneration = QUICStreamHandle.Generation(UIntHalf.max)
-
-        for handle in [
-            QUICStreamHandle(index: .first, generation: .first),
-            QUICStreamHandle(index: QUICStreamHandle.Index(3), generation: .init(7)),
-            QUICStreamHandle(index: maxIndex, generation: maxGeneration),
-            QUICStreamHandle(index: maxIndex, generation: .first),
-            QUICStreamHandle(index: .first, generation: maxGeneration),
-        ] {
-            #expect(QUICStreamHandle(rawValue: handle.rawValue) == handle)
-        }
-    }
 }
