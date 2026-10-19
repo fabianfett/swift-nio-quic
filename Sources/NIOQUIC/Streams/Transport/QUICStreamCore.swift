@@ -757,8 +757,7 @@ extension QUICStreamCore {
             ()
         }
 
-        self.pendingWrites.finalizeAllFramesAsFailed()
-        self.undeliveredReads.finalizeAllFramesAsFailed()
+        self.abandonLocally()
         self.finPending = false
         self.coalescedBytes = []
         // Detached: nothing is sent from this stream any more.
@@ -767,11 +766,12 @@ extension QUICStreamCore {
 
     /// Finalizes whatever is still queued locally, without touching the stack.
     ///
-    /// Used only from `QUICStreamTable.deinit`, which has no event context to detach with. Only a
-    /// stream that never reached the stack is expected there. One still attached means the table
-    /// was never closed, a teardown bug: its registered event manager traps when it's released
-    /// (see `QUICStreamTable.deinit`). Finalizing the queued frames is not optional: an
-    /// un-finalized `Frame` traps in its own `deinit`.
+    /// `close(error:in:)` ends with it, once the stream has detached. `QUICStreamTable.deinit` calls
+    /// it on its own, because it has no event context to detach with: only a stream that never
+    /// reached the stack is expected there. One still attached means the table was never closed, a
+    /// teardown bug: its registered event manager traps when it's released (see
+    /// `QUICStreamTable.deinit`). Finalizing the queued frames is not optional: an un-finalized
+    /// `Frame` traps in its own `deinit`.
     mutating func abandonLocally() {
         self.pendingWrites.finalizeAllFramesAsFailed()
         self.undeliveredReads.finalizeAllFramesAsFailed()
