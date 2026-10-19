@@ -43,7 +43,6 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
     internal var eventManager = ProtocolEventManager()
     internal var context: SwiftNetwork.NetworkContext
     private var upperProtocol: UpperProtocol = .init()
-    private var isUpperAttached = false
 
     private enum State {
         /// Not attached to a connection yet.
@@ -194,8 +193,12 @@ extension QUICConnectionPath: ProtocolInstance where Consumer: ~Copyable {}
 
 @available(anyAppleOS 26, *)
 extension QUICConnectionPath where Consumer: ~Copyable {
+    // The framework's answer for its own lower protocols: connected once this path delivered its
+    // connected event, and no longer once it delivered its disconnected event or was released. So QUIC
+    // connects its first path like every later one, and counts neither a path it hasn't connected yet
+    // nor one it destroyed.
     func protocolIsConnected(in eventContext: inout NetworkContext.EventContext) -> Bool {
-        self.isUpperAttached
+        self.identifier.isConnected(in: &eventContext)
     }
 
     func getMetrics(
@@ -244,7 +247,6 @@ extension QUICConnectionPath where Consumer: ~Copyable {
     ) throws(SwiftNetwork.NetworkError) {
         log("received attach upper protocol")
         self.upperProtocol = upperProtocol
-        self.isUpperAttached = true
     }
 
     func detach(
