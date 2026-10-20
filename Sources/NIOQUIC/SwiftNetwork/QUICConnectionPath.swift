@@ -60,6 +60,7 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
     private var coalescer: GSOCoalescer
     private var inputPacketQueue: FrameArray
 
+    /// Registers the path with `context`, which acquires the event context: must be called with none held.
     init(
         role: Role,
         remoteAddress: SocketAddress,
@@ -68,8 +69,7 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
         isValidated: Bool,
         maxSegments: Int,
         bufferPoolCapacity: Int,
-        logger: Logger,
-        in eventContext: inout NetworkContext.EventContext
+        logger: Logger
     ) {
         self.remoteAddress = remoteAddress
         self.addressEndpointType = remoteAddress.addressEndpointType
@@ -85,7 +85,7 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
             bufferPoolCapacity: bufferPoolCapacity
         )
         self.inputPacketQueue = FrameArray(capacity: 10)
-        self.identifier = InstanceIdentifier(eventManager: &self.eventManager, in: &eventContext)
+        self.identifier = InstanceIdentifier(context: context, eventManager: &self.eventManager)
     }
 
     deinit {

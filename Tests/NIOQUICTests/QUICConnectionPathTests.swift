@@ -38,21 +38,16 @@ struct QUICConnectionPathTests {
             externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
         )
         let slot = EventContextSlot(context: context)
-        let anchor = EventContextAnchor(context: context)
-        defer { anchor.retire(through: slot) }
-        let path = slot.withEventContext(entering: anchor) { eventContext in
-            QUICConnectionPath<QUICStreamChannels>(
-                role: .server,
-                remoteAddress: remoteAddress,
-                context: context,
-                framePool: .makePool(forGSO: false),
-                isValidated: isValidated,
-                maxSegments: 1,
-                bufferPoolCapacity: 8,
-                logger: Logger(label: "test"),
-                in: &eventContext
-            )
-        }
+        let path = QUICConnectionPath<QUICStreamChannels>(
+            role: .server,
+            remoteAddress: remoteAddress,
+            context: context,
+            framePool: .makePool(forGSO: false),
+            isValidated: isValidated,
+            maxSegments: 1,
+            bufferPoolCapacity: 8,
+            logger: Logger(label: "test")
+        )
         defer {
             slot.withEventContext(entering: path) { eventContext in
                 path.teardown(in: &eventContext)

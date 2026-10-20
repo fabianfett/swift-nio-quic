@@ -496,26 +496,18 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             ()
         }
 
-        // The path only registers. It can't enter the stack as itself before it exists, so this
-        // acquisition enters as the QUIC instance. That is safe only because it makes no `invoke*`
-        // down-call, which requires the callee to be idle.
-        let pathRole = self.role
-        let framePool = self.framePool
-        let maxSegments = self.pathMaxSegments
-        let bufferPoolCapacity = self.pathBufferPoolCapacity
-        self.activePath = eventContextSlot.withEventContext(entering: swiftNetworkQUICConnection) { eventContext in
-            QUICConnectionPath(
-                role: pathRole,
-                remoteAddress: remoteAddress,
-                context: swiftNetworkParameters.context,
-                framePool: framePool,
-                isValidated: true,
-                maxSegments: maxSegments,
-                bufferPoolCapacity: bufferPoolCapacity,
-                logger: logger,
-                in: &eventContext
-            )
-        }
+        // The path registers as it's created, which acquires the event context: nothing may hold it
+        // here either. `start` attaches it.
+        self.activePath = QUICConnectionPath(
+            role: self.role,
+            remoteAddress: remoteAddress,
+            context: swiftNetworkParameters.context,
+            framePool: self.framePool,
+            isValidated: true,
+            maxSegments: self.pathMaxSegments,
+            bufferPoolCapacity: self.pathBufferPoolCapacity,
+            logger: logger
+        )
         self.otherPaths = []
 
         self.inReadLoop = false
