@@ -358,11 +358,11 @@ struct QUICConnectionPathTests {
         try #require(connection._forTesting_getOtherPaths().count == 1)
 
         // The active path keeps flushing its last packets.
-        try connection._forTesting_getActivePath().detach(.init())
+        try connection._forTesting_getActivePath().detachFromStack()
         try #require(connection._forTesting_getOtherPaths().count == 1)
         #expect(connection._forTesting_getActivePath().remoteAddress == Self.pathAddress)
 
-        try connection._forTesting_getOtherPaths()[0].detach(.init())
+        try connection._forTesting_getOtherPaths()[0].detachFromStack()
         #expect(connection._forTesting_getOtherPaths().isEmpty)
     }
 
@@ -373,11 +373,9 @@ struct QUICConnectionPathTests {
         connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
         let path = try #require(connection._forTesting_getOtherPaths().first)
         // The last packet SwiftNetwork sends on the path, e.g. a CONNECTION_CLOSE.
-        if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 1, minimumDatagramSize: 100) {
-            try path.sendDatagrams(.init(), datagrams: datagrams)
-        }
+        try path.sendDatagramsFromStack(maximumDatagramCount: 1, minimumDatagramSize: 100)
 
-        try path.detach(.init())
+        try path.detachFromStack()
         #expect(connection._forTesting_getOtherPaths().map(\.remoteAddress) == [Self.newAddress])
 
         let transport = RecordingTransport()
@@ -408,9 +406,7 @@ struct QUICConnectionPathTests {
         connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
         try #require(connection._forTesting_getOtherPaths().count == 1)
         for path in [connection._forTesting_getOtherPaths()[0], connection._forTesting_getActivePath()] {
-            if let datagrams = try path.getDatagramsToSend(.init(), maximumDatagramCount: 1, minimumDatagramSize: 100) {
-                try path.sendDatagrams(.init(), datagrams: datagrams)
-            }
+            try path.sendDatagramsFromStack(maximumDatagramCount: 1, minimumDatagramSize: 100)
         }
 
         let transport = RecordingTransport()
@@ -516,5 +512,30 @@ struct QUICConnectionPathTests {
             connection._forTesting_markConnected()
         }
         return connection
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension QUICConnectionPath where Consumer: ~Copyable {
+    /// Gets datagrams to send and sends them back, the way the stack does: with the event context
+    /// held, which this fabricates by entering as the path.
+    fileprivate func sendDatagramsFromStack(maximumDatagramCount: Int, minimumDatagramSize: Int) throws {
+        try self.fromExternal { eventContext throws(NetworkError) in
+            if let datagrams = try self.getDatagramsToSend(
+                maximumDatagramCount: maximumDatagramCount,
+                minimumDatagramSize: minimumDatagramSize,
+                for: InstanceIdentifier(),
+                in: &eventContext
+            ) {
+                try self.sendDatagrams(datagrams, from: InstanceIdentifier(), in: &eventContext)
+            }
+        }
+    }
+
+    /// Detaches the path the way the stack does, with the event context held.
+    fileprivate func detachFromStack() throws {
+        try self.fromExternal { eventContext throws(NetworkError) in
+            try self.detach(for: InstanceIdentifier(), in: &eventContext)
+        }
     }
 }

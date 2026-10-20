@@ -120,11 +120,8 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
     }
 
     /// Notify SwiftNetwork that the path is gone.
-    func invokeDisconnected() {
-        let reference = self.reference
-        reference.fromExternal {
-            self.upperProtocol.deliverDisconnectedEvent(reference, error: nil)
-        }
+    func invokeDisconnected(in eventContext: inout NetworkContext.EventContext) {
+        self.upperProtocol.deliverDisconnectedEvent(error: nil, from: self.identifier, in: &eventContext)
     }
 
     // MARK: - Inbound
@@ -183,12 +180,12 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
     /// Detaches the path from its connection and from SwiftNetwork, breaking the cycles with both. A detached path
     /// drops inbound packets and outbound datagrams.
     ///
-    /// The framework releases the path itself from above, through `teardown(in:)`, when it destroys
-    /// the QUIC instance's path.
+    /// The framework releases the path itself from above, through `teardown(in:)`, when the QUIC
+    /// instance destroys its path for it.
     func detach() {
         self.state = .detached
         // SwiftNetwork's path holds this path as its lower protocol, so drop the reference back to it.
-        self.upperProtocol = UpperProtocol(reference: .init())
+        self.upperProtocol = .init()
     }
 }
 

@@ -93,7 +93,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private let protocolStorage: BaseNetworkProtocolStorage
     /// The QUIC instance's stream listener. New outbound streams attach through it.
     private let streamListenerLinkage: BaseStreamListenerLinkage
-    /// Attaches the active path as the QUIC instance's path in `start`.
+    /// Attaches the active path as the QUIC instance's path in `start`, and the paths a server sets up later.
     private let multipathLinkage: BaseDatagramMultipathLinkage
     /// Every entry point in this file acquires the connection's event context through this slot.
     private let eventContextSlot: EventContextSlot
@@ -964,7 +964,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.datagramTransport?.close(in: &eventContext)
         self.datagramTransport = nil
         // Last: once nothing else is attached, its detach releases the QUIC instance, and through
-        // the instance's path, the active path.
+        // the instance's paths, the paths here.
         if let connectionNewFlowHandler = self.connectionNewFlowHandler {
             connectionNewFlowHandler.stop(in: &eventContext)
             connectionNewFlowHandler.teardown(in: &eventContext)
@@ -1154,20 +1154,26 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     func receivePacketsComplete() {
         // Snapshot first: SwiftNetwork may promote one of the other paths while the active one is served.
         let otherPaths = self.otherPaths
-        if self.activePath.hasQueuedInboundPackets {
-            // Destroying the QUIC instance's path releases the active path, after which nothing
-            // consumes the queue.
-            if self.activePath.identifier.isNone {
-                self.activePath.finalizeQueuedInboundFramesAsFailed()
-            } else {
-                // Delivers upward from the active path, which requires it to be mid-call: enter as it.
-                self.eventContextSlot.withEventContext(entering: self.activePath) { eventContext in
-                    self.activePath.invokeInputAvailable(in: &eventContext)
-                }
-            }
+        self.invokeInputAvailable(on: self.activePath)
+        for path in otherPaths {
+            self.invokeInputAvailable(on: path)
         }
-        for path in otherPaths where path.hasQueuedInboundPackets {
-            path.invokeInputAvailable()
+    }
+
+    /// Tells the QUIC stack that `path` has inbound packets queued, if it has.
+    private func invokeInputAvailable(on path: QUICConnectionPath<Consumer>) {
+        if !path.hasQueuedInboundPackets {
+            return
+        }
+        // Destroying a QUIC path releases its path here, after which nothing consumes the queue. Serving one
+        // path can destroy another: a migration destroys the path it leaves.
+        if path.identifier.isNone {
+            path.finalizeQueuedInboundFramesAsFailed()
+            return
+        }
+        // Delivers upward from the path, which requires it to be mid-call: enter as it.
+        self.eventContextSlot.withEventContext(entering: path) { eventContext in
+            path.invokeInputAvailable(in: &eventContext)
         }
     }
 
@@ -1708,7 +1714,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 
     /// The number of paths SwiftNetwork tracks for this connection.
     func _forTesting_getSwiftNetworkPathCount() -> Int {
-        self.swiftNetworkQUICConnection.multiplexingPaths.count
+        self.protocolStorage.quicInstance(for: self.streamListenerLinkage)?.multiplexingPaths.count ?? 0
     }
 
     /// The path considered active.
@@ -1744,11 +1750,19 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 //   tracks at most one unvalidated path, and drops it before it sets up the next one. SwiftNetwork probes the paths
 //   it tracks itself, so it has to be told about the drop (`removePath(_:notifySwiftNetwork:)`). The cost: a client
 //   that probes two new paths at once only gets the newer one validated.
-// * A path becomes the active path once SwiftNetwork validated it. SwiftNetwork doesn't report which path it sends
-//   on, so a peer that validates a path without migrating to it moves the active path too.
+// * A path becomes the active path once SwiftNetwork validated it. The connection doesn't follow SwiftNetwork's
+//   reports of which path it sends on yet (see below), so a peer that validates a path without migrating to it moves
+//   the active path too.
 // * When SwiftNetwork detaches from a path, the path stays until the packets queued on it are flushed.
+// * SwiftNetwork releases paths from above: destroying a QUIC path detaches its path here, then tears it down, which
+//   unregisters it. A server destroys the path it migrated away from, and any unavailable path but its current one,
+//   such as a path it was told is gone. A released path is never entered again.
+// * A path registers as it's created and attaches with nothing held, since both acquire the event context. Packets
+//   arrive from the parent channel's read, which holds nothing.
+// * Path events reach the connection through the new-flow handler while SwiftNetwork holds the event context, so
+//   telling SwiftNetwork about a dropped path from there parks it.
 //
-// TODO: Revisit once we adopt SwiftNetwork 0.5.0. Its events should drive promotion.
+// TODO: Revisit once we adopt SwiftNetwork 0.5.0's `pathCurrent` event. It should drive promotion.
 // * Paths can become active before validation. And validation does not mean that a path becomes the active path.
 
 @available(anyAppleOS 26, *)
@@ -1789,6 +1803,15 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
                 )
                 return nil
             }
+            // Registering and attaching a path both acquire the event context. Nothing holds it while
+            // the parent channel reads; drop the packet rather than trap should that ever change.
+            if self.eventContextSlot.isHeld {
+                self.logger.trace(
+                    "Dropping packet from a new remote address, the event context is held",
+                    metadata: [LoggingKeys.packetRemoteAddress: "\(remoteAddress)"]
+                )
+                return nil
+            }
             // One unvalidated path at a time, dropped before the next one is attached: SwiftNetwork
             // crashes when probing two paths simultaneously.
             if let unvalidatedPath = self.otherPaths.first(where: { !$0.isValidated }) {
@@ -1799,6 +1822,9 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     }
 
     /// Sets up a path to `remoteAddress` and attaches it to SwiftNetwork.
+    ///
+    /// Must be called with no event context held: the path registers as it's created, and attaching it acquires the
+    /// context too.
     ///
     /// - Returns: The new path, or `nil` if SwiftNetwork refused it.
     private func setUpPath(to remoteAddress: SocketAddress) -> QUICConnectionPath<Consumer>? {
@@ -1819,8 +1845,8 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         self.otherPaths.append(path)
 
         do {
-            try self.swiftNetworkQUICConnection.reference.attachLowerDatagramProtocolForNewPath(
-                path.reference,
+            try self.multipathLinkage.invokeAttachLowerProtocolForNewPath(
+                BaseOutboundDatagramLinkage(external: path),
                 remote: remoteAddress.toEndpoint(),
                 local: self.localAddress.toEndpoint(),
                 parameters: self.swiftNetworkParameters,
@@ -1832,6 +1858,10 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
                 metadata: [LoggingKeys.pathRemoteEndpoint: "\(remoteAddress)", "error": "\(error)"]
             )
             self.removePath(path, notifySwiftNetwork: false)
+            // The attach can only fail before QUIC adopts the path, so nothing above will release it.
+            self.eventContextSlot.withEventContext(entering: path) { eventContext in
+                path.unregisterEventManager(in: &eventContext)
+            }
             return nil
         }
 
@@ -1863,8 +1893,14 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             self.otherPaths.removeAll { $0 === path }
         }
 
-        if notifySwiftNetwork {
-            path.invokeDisconnected()
+        // A path SwiftNetwork already released needs no notification, and can't be entered any more.
+        if notifySwiftNetwork, !path.identifier.isNone {
+            // Delivers upward from the path, which requires it to be mid-call: enter as it. In response, a
+            // server's QUIC instance destroys the path, unless it's its current one, and so releases it
+            // before this returns.
+            self.eventContextSlot.withEventContext(entering: path) { eventContext in
+                path.invokeDisconnected(in: &eventContext)
+            }
         }
         path.finalizeQueuedInboundFramesAsFailed()
         path.finalizeQueuedOutboundFramesAsFailed()
@@ -1913,6 +1949,8 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     }
 
     /// SwiftNetwork detached from `path`, e.g. after migrating away from it.
+    ///
+    /// Runs inside the QUIC instance's call that destroys the path: it must not call out.
     private func handleUpperProtocolDetached(from path: QUICConnectionPath<Consumer>) {
         // The packets SwiftNetwork queued on the path still have to get out, e.g. a CONNECTION_CLOSE. The active
         // path stays, and another path is removed by the drain that flushes it.
@@ -2030,8 +2068,11 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             self.connection.handlePathValidated(remote: remote)
         }
 
-        func pathUnreachable(remote: AddressEndpoint) {
-            self.connection.handlePathUnreachable(remote: remote)
+        func pathUnreachable(remote: AddressEndpoint, in eventContext: inout NetworkContext.EventContext) {
+            // Dropping the path enters the stack as the path to tell SwiftNetwork: hand it the context held here.
+            self.connection.eventContextSlot.parking(&eventContext) {
+                self.connection.handlePathUnreachable(remote: remote)
+            }
         }
     }
 

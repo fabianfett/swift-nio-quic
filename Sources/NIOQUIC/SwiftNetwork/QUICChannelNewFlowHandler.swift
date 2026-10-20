@@ -265,7 +265,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                 .maxStreamsLimitBidirectionalUpdated, .maxStreamsLimitUnidirectionalUpdated,
                 .receivedRemoteTransportParameters, .remoteBidirectionalStreamsBlocked,
                 .remoteUnidirectionalStreamsBlocked,
-                // Path events, from QUIC connection migration: nothing here acts on them either.
+                // The connection takes the last validated path as the active one, so it doesn't act on
+                // these path events (yet).
                 .pathCIDAssigned, .pathCurrent:
                 break
             case .pathChanged:
@@ -274,7 +275,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
             case .pathValidated(let info):
                 self.connectionView.pathValidated(remote: info.remote)
             case .pathUnreachable(let info):
-                self.connectionView.pathUnreachable(remote: info.remote)
+                self.connectionView.pathUnreachable(remote: info.remote, in: &eventContext)
             }
         }
     }
