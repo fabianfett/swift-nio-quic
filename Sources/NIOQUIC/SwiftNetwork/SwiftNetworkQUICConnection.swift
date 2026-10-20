@@ -1803,9 +1803,12 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
                 )
                 return nil
             }
-            // Registering and attaching a path both acquire the event context. Nothing holds it while
-            // the parent channel reads; drop the packet rather than trap should that ever change.
+            // Registering and attaching a path both acquire the event context. Nothing holds it while the
+            // parent channel reads, unless its pipeline replays a datagram synchronously from a `read()`
+            // issued inside a QUIC callback. Debug builds trap on that; release builds drop the packet
+            // before any path state changes, and the peer's next packet sets the path up.
             if self.eventContextSlot.isHeld {
+                assertionFailure("A packet from a new remote address arrived while the event context is held")
                 self.logger.trace(
                     "Dropping packet from a new remote address, the event context is held",
                     metadata: [LoggingKeys.packetRemoteAddress: "\(remoteAddress)"]
