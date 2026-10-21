@@ -73,7 +73,9 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
 
     private let role: Role
     private let logger: Logger
-    private let eventContextSlot: EventContextSlot
+    /// The connection's queued callouts: the pipeline events and promise completions the stack's
+    /// events cause are queued there, and delivered once the event context is released.
+    let callouts: QUICCallouts
     internal var identifier: InstanceIdentifier = InstanceIdentifier()
 
     internal var eventManager = ProtocolEventManager()
@@ -118,6 +120,14 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
     /// and it has detached from its flow, which delivers events to it until then.
     private var isCloseCompleted: Bool = false
 
+    /// Whether the pipeline has been closed: its close was delivered, `channelInactive` included if
+    /// it was active. Pipeline events are queued (see `QUICCallouts`), so this trails `isClosed`,
+    /// which is set as soon as the stream closes.
+    private var isPipelineClosed: Bool = false
+
+    /// Whether a `channelRead` of the buffered bytes is queued and not yet delivered.
+    private var isReadQueued: Bool = false
+
     private var originalMetadata: ProtocolMetadata<QUICProtocol>?
     private var connectedEventHandler: ((QUICStreamID?) -> Void)?
     private var disconnectedEventHandler: ((NetworkError?) -> Void)?
@@ -130,14 +140,14 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         remoteAddress: SendableAddress,
         localAddress: SocketAddress?,
         connectionChannel: any Channel,
-        eventContextSlot: EventContextSlot,
+        callouts: QUICCallouts,
         keepAliveInterval: Duration? = nil,
         in eventContext: inout NetworkContext.EventContext
     ) {
         self.role = role
         self.streamID = streamID
         self.logger = logger
-        self.eventContextSlot = eventContextSlot
+        self.callouts = callouts
         self._remoteAddress = remoteAddress
         self._localAddress = localAddress
         self.context = parameters.context
@@ -174,17 +184,19 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         listenerProtocol: BaseStreamListenerLinkage,
         connectionChannel: (any Channel)?,
         eventLoop: any EventLoop,
-        eventContextSlot: EventContextSlot,
+        callouts: QUICCallouts,
         keepAliveInterval: Duration? = nil
     ) {
-        precondition(
-            !eventContextSlot.isHeld,
+        #if DEBUG
+        assert(
+            !callouts.isInsideStack,
             "QUICChannelStreamHandler attaches on construction, which requires that no event context is held"
         )
+        #endif
         self.role = role
         self.streamID = streamID
         self.logger = logger
-        self.eventContextSlot = eventContextSlot
+        self.callouts = callouts
         self._remoteAddress = remoteAddress
         self._localAddress = localAddress
         self.context = parameters.context
@@ -205,23 +217,26 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         self._closePromise = eventLoop.makePromise(of: Void.self)
 
         self.identifier = InstanceIdentifier(context: self.context, eventManager: &self.eventManager)
+        // Before attaching: the calls the attach queues run as it returns, and may reach the pipeline.
+        self._pipeline = ChannelPipeline(channel: self)
 
         do throws(NetworkError) {
-            try listenerProtocol.invokeAttachUpperProtocolToNewFlow(
-                BaseInboundStreamLinkage(external: self),
-                remote: remote,
-                local: local,
-                parameters: parameters,
-                path: path
-            )
+            try callouts.callFramework { () throws(NetworkError) in
+                try listenerProtocol.invokeAttachUpperProtocolToNewFlow(
+                    BaseInboundStreamLinkage(external: self),
+                    remote: remote,
+                    local: local,
+                    parameters: parameters,
+                    path: path
+                )
+            }
         } catch {
             self.log("Error attaching lower protocol: \(error)")
-            self.eventContextSlot.withEventContext(entering: self) { eventContext in
+            self.callouts.enter(as: self) { eventContext in
                 self.unregisterEventManager(in: &eventContext)
             }
             return nil
         }
-        self._pipeline = ChannelPipeline(channel: self)
     }
 
     /// The stream direction based on the stream ID and the local peer's role.
@@ -248,6 +263,9 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
     /// Sets a callback invoked when the stream transitions to the connected state and its stream ID is known.
     ///
     /// Only set this for outbound streams where the confirmed stream ID may not be available immediately.
+    ///
+    /// The handler is called with the event context held, so it must not call into NIO or consumer
+    /// code: the connection's defers its work to the next loop tick.
     ///
     /// - Parameter connectedEventHandler: Called with the confirmed ``QUICStreamID`` once the stream connects.
     func setConnectedEventHandler(_ connectedEventHandler: @escaping (QUICStreamID?) -> Void) {
@@ -413,11 +431,7 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
                 ) {
                 case .sendReset(let error):
                     if self.understandsStopSending {
-                        self.eventContextSlot.parking(&eventContext) {
-                            self.pipeline.fireUserInboundEventTriggered(
-                                NIOQUICHelpers.QUICStopSendingEvent(code: errorCode)
-                            )
-                        }
+                        self.callouts.add(.streamStopSending(self, code: errorCode), in: &eventContext)
                         if self.streamStateMachine.hasReceivedFin {
                             self.closeStream(
                                 mode: .closeOnly,
@@ -698,7 +712,8 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
 
     /// Called when the stream handler receives a disconnected event.
     ///
-    /// Runs the close cascade synchronously
+    /// Queues the close cascade, which runs once the event context is released, before the entry
+    /// that delivered the event returns.
     internal func handleDisconnectedEvent(
         error: NetworkError?,
         for instance: InstanceIdentifier,
@@ -717,8 +732,13 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
             break
         }
 
-        let quicError = error.flatMap { QUICConnectionError(networkError: $0) }
-        self._close(error: quicError ?? error, promise: nil, in: &eventContext)
+        let closeError: (any Error)?
+        if error?.isIdleTimeout == true {
+            closeError = nil
+        } else {
+            closeError = error.flatMap { QUICConnectionError(networkError: $0) } ?? error
+        }
+        self._close(error: closeError, promise: nil, in: &eventContext)
     }
 
     @inline(__always)
@@ -786,17 +806,16 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
 
     /// Issues a `read()` on the pipeline if `autoRead` is enabled and there is no outstanding read request.
     ///
-    /// May re-enter `read0()`; callers holding the context park it first (see `EventContextSlot`).
+    /// May re-enter `read0()`, so it's only called with nothing held.
     func tryToAutoRead() {
         if self.autoRead, !self.pendingRead {
             self.pipeline.read()
         }
     }
 
-    /// Returns `true` if data was actually delivered
-    private func flushBufferedReadData() -> Bool {
-        guard self.bufferedReadData.readableBytes > 0 else {
-            return false
+    private func flushBufferedReadData() {
+        if self.bufferedReadData.readableBytes == 0 {
+            return
         }
         // We will now satisfy a pending read request. Reset the flag.
         self.pendingRead = false
@@ -804,16 +823,13 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         self.log("Read \(bytesRead) bytes from stream")
         self.pipeline.fireChannelRead(self.bufferedReadData)
         self.bufferedReadData.clear()
-        return true
     }
 
     /// Returns `true` if an end-of-stream event was surfaced
     private func surfaceReadCompletion(in eventContext: inout NetworkContext.EventContext) -> Bool {
         switch self.streamStateMachine.completeRead() {
         case .reportFin(let streamFullyClosed):
-            self.eventContextSlot.parking(&eventContext) {
-                self.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
-            }
+            self.callouts.add(.streamInputClosed(self), in: &eventContext)
             if streamFullyClosed {
                 self.log("stream is now fully closed")
                 self.closeStream(mode: .disconnectOnly, error: nil, promise: nil, in: &eventContext)
@@ -822,11 +838,7 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
             return true
 
         case .reportPeerReset(let code):
-            self.eventContextSlot.parking(&eventContext) {
-                self.pipeline.fireErrorCaught(
-                    QUICStreamResetError(code: code)
-                )
-            }
+            self.callouts.add(.streamError(self, QUICStreamResetError(code: code)), in: &eventContext)
             return true
 
         case .nothingToReport:
@@ -840,15 +852,18 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         // Emit channel read complete when:
         // - any read was fired, or
         // - FIN or peer RESET is emitted
-        let flushed = self.eventContextSlot.parking(&eventContext) {
-            self.flushBufferedReadData()
+        let hasReadData = self.bufferedReadData.readableBytes > 0 && !self.isReadQueued
+        if hasReadData {
+            // The read is satisfied now, as it was when delivered right away: the stack reports data
+            // once per frame, and a later frame's report leaves its bytes for the next read.
+            self.pendingRead = false
+            self.isReadQueued = true
+            self.callouts.add(.streamRead(self), in: &eventContext)
         }
         let endOfStream = self.surfaceReadCompletion(in: &eventContext)
 
-        if flushed || endOfStream {
-            self.eventContextSlot.parking(&eventContext) {
-                self.fireChannelReadComplete()
-            }
+        if hasReadData || endOfStream {
+            self.callouts.add(.streamReadComplete(self), in: &eventContext)
         }
     }
 
@@ -869,33 +884,23 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
 
         guard let metadata: ProtocolMetadata<QUICProtocol> = self.getStreamMetadata(in: &eventContext) else {
             self.logger.error("connected stream does not have access to metadata")
-            self.eventContextSlot.parking(&eventContext) {
-                self.connectedEventHandler?(nil)
-            }
+            // Only schedules work for the next tick: no NIO code runs here.
+            self.connectedEventHandler?(nil)
             return
         }
 
-        self._isActive.store(true, ordering: .sequentiallyConsistent)
-        self.eventContextSlot.parking(&eventContext) {
-            self.pipeline.fireChannelRegistered()
-            self.pipeline.fireChannelActive()
-        }
+        self.callouts.add(.streamActive(self), in: &eventContext)
         log("setting up metadata handlers")
-        if let keepAliveTime = self._keepAliveInterval {
+        if let keepAliveTime = self._keepAliveInterval, let connectionMetadata = metadata.connectionMetadata {
             log("setting keepalive interval")
-            // The setter is an external entry point: it acquires the event context itself, which
-            // traps while it's held, parked or not. The connection unsets it when it closes.
-            let connectionMetadata = metadata.connectionMetadata
-            self.eventContextSlot.whenReleased {
-                connectionMetadata?.setKeepalive(keepAlive: keepAliveTime)
-            }
+            // The setter acquires the event context itself, so it runs once the context is released.
+            // The connection unsets it when it closes.
+            self.callouts.add(.setKeepalive(connectionMetadata, seconds: keepAliveTime), in: &eventContext)
         }
 
         guard let rawStreamID = metadata.streamID else {
             self.logger.error("connected stream does not have a stream ID assigned")
-            self.eventContextSlot.parking(&eventContext) {
-                self.connectedEventHandler?(nil)
-            }
+            self.connectedEventHandler?(nil)
             return
         }
 
@@ -920,9 +925,7 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
             return
         }
 
-        self.eventContextSlot.parking(&eventContext) {
-            self.connectedEventHandler?(self.streamID)
-        }
+        self.connectedEventHandler?(self.streamID)
     }
 
     internal func setNewFlowMetadata(_ newMetadata: ProtocolMetadata<QUICProtocol>) {
@@ -1177,9 +1180,7 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
                 in: &eventContext
             )
             if deliverEndOfStream {
-                self.eventContextSlot.parking(&eventContext) {
-                    self.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
-                }
+                self.callouts.add(.streamInputClosed(self), in: &eventContext)
             }
             if streamFullyClosed {
                 self.closeStream(mode: .disconnectOnly, error: nil, promise: nil, in: &eventContext)
@@ -1188,9 +1189,7 @@ final class QUICChannelStreamHandler: ExternalInboundStreamLinkage, @unchecked S
         case .readAlreadyClosed(let deliverEndOfStream):
             self.log("shutdownStream read side already closed")
             if deliverEndOfStream {
-                self.eventContextSlot.parking(&eventContext) {
-                    self.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
-                }
+                self.callouts.add(.streamInputClosed(self), in: &eventContext)
             }
 
         case .readPeerReset:
@@ -1342,7 +1341,16 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
 
     @usableFromInline
     var pipeline: ChannelPipeline {
-        self._pipeline
+        #if DEBUG
+        // Pipeline events from code holding the event context would let handlers re-enter NIOQUIC
+        // with it held: queue them instead (see `QUICCallouts`). Other threads only use the pipeline
+        // to hop onto the event loop.
+        assert(
+            !self.eventLoop.inEventLoop || !self.callouts.isInsideStack,
+            "Stream pipeline used while the event context may be held"
+        )
+        #endif
+        return self._pipeline
     }
 
     @usableFromInline
@@ -1407,8 +1415,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
     func flush0() {
         self.eventLoop.preconditionInEventLoop()
         self.log("ChildChannel flush0")
-        // Reuses the context parked up the stack, if any (see EventContextSlot).
-        let succeeded = self.eventContextSlot.withEventContext(entering: self) { eventContext in
+        let succeeded = self.callouts.enter(as: self) { eventContext in
             self.writeBuffersToStream(bufferedWriteData, fin: false, in: &eventContext)
         }
         if succeeded {
@@ -1424,7 +1431,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
 
         self.pendingRead = true
         // Try to satisfy the read immediately if there is data already buffered in SwiftNetwork.
-        self.eventContextSlot.withEventContext(entering: self) { eventContext in
+        self.callouts.enter(as: self) { eventContext in
             self.deliverInboundDataDownstreamIfDemand(in: &eventContext)
         }
     }
@@ -1436,8 +1443,8 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
     ) {
         self.eventLoop.preconditionInEventLoop()
         if self.isClosed {
-            self.eventContextSlot.parking(&eventContext) {
-                promise?.succeed()
+            if let promise {
+                self.callouts.add(.completePromise(promise, .success(())), in: &eventContext)
             }
             return
         }
@@ -1445,24 +1452,9 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
         self.isClosed = true
 
         // A stream can be closed before it ever became active, e.g. its flow was attached in the
-        // same read batch in which the connection tore down.
-        //
-        // If that happens it must not see 'channelInactive' (it didn't see 'channelActive') but
-        // its close promise must still be completed.
-        let wasActive = self._isActive.exchange(false, ordering: .sequentiallyConsistent)
-
-        self.eventContextSlot.parking(&eventContext) {
-            promise?.succeed()
-
-            if let error {
-                self.pipeline.fireErrorCaught(error)
-            }
-
-            if wasActive {
-                self.pipeline.fireChannelInactive()
-                self.pipeline.fireChannelUnregistered()
-            }
-        }
+        // same read batch in which the connection tore down. Then it doesn't see 'channelInactive'
+        // (it didn't see 'channelActive'), but its close promise is still completed.
+        self.callouts.add(.streamClosed(self, promise: promise, error: error), in: &eventContext)
 
         // Complete the promise on the next loop tick.
         self.eventLoop.assumeIsolated().execute {
@@ -1477,7 +1469,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
             // stream the application closed stays attached until the flow's disconnect, after all
             // ACKs, and unregisters once that detaches it.
             if !self.swiftNetworkStreamHandle.isAttached {
-                self.eventContextSlot.withEventContext(entering: self) { eventContext in
+                self.callouts.enter(as: self) { eventContext in
                     self.unregisterEventManager(in: &eventContext)
                 }
             }
@@ -1509,26 +1501,19 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
         self.eventLoop.preconditionInEventLoop()
         self.log("ChildChannel close0 mode \(mode)")
 
-        // Reuses the context parked up the stack, if any (see EventContextSlot).
-        self.eventContextSlot.withEventContext(entering: self) { eventContext in
+        self.callouts.enter(as: self) { eventContext in
             switch mode {
             case .output:
                 if self.streamStateMachine.canWrite {
                     self.closeOutputSide(in: &eventContext)
-                    self.eventContextSlot.parking(&eventContext) {
-                        promise?.succeed()
-                    }
+                    self.complete(promise, .success(()), in: &eventContext)
                 } else {
-                    self.eventContextSlot.parking(&eventContext) {
-                        promise?.fail(ChannelError.outputClosed)
-                    }
+                    self.complete(promise, .failure(ChannelError.outputClosed), in: &eventContext)
                     return
                 }
             case .input:
                 if self.streamStateMachine.isReceiveClosed {
-                    self.eventContextSlot.parking(&eventContext) {
-                        promise?.fail(ChannelError.inputClosed)
-                    }
+                    self.complete(promise, .failure(ChannelError.inputClosed), in: &eventContext)
                     return
                 }
                 // `shutdownStream` handles the QUIC-level signaling as needed,
@@ -1537,9 +1522,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
                 if self.streamStateMachine.isSendClosed {
                     self.log("Input and output for stream are now closed, stream will be queued up for closure")
                 }
-                self.eventContextSlot.parking(&eventContext) {
-                    promise?.succeed()
-                }
+                self.complete(promise, .success(()), in: &eventContext)
             case .all:
                 // Gracefully shutdown both sides.
                 if self.streamID != nil {
@@ -1582,8 +1565,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
             "ChildChannel triggerUserOutboundEvent0: \(event)"
         )
 
-        // Reuses the context parked up the stack, if any (see EventContextSlot).
-        self.eventContextSlot.withEventContext(entering: self) { eventContext in
+        self.callouts.enter(as: self) { eventContext in
             switch event {
             case let event as NIOQUICHelpers.QUICStopSendingEvent:
                 // Send a STOP_SENDING frame to close the read (input) side
@@ -1596,9 +1578,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
                     // Both sides now closed
                     self.closeStream(mode: .closeOnly, error: nil, promise: promise, in: &eventContext)
                 } else {
-                    self.eventContextSlot.parking(&eventContext) {
-                        promise?.succeed()
-                    }
+                    self.complete(promise, .success(()), in: &eventContext)
                 }
             case let event as NIOQUICHelpers.QUICResetStreamEvent:
                 // Send RESET_STREAM to close the write (output) side
@@ -1609,9 +1589,7 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
                 )
                 switch self.streamStateMachine.completeRead() {
                 case .nothingToReport:
-                    self.eventContextSlot.parking(&eventContext) {
-                        promise?.succeed()
-                    }
+                    self.complete(promise, .success(()), in: &eventContext)
                     break
                 default:
                     break
@@ -1651,6 +1629,82 @@ extension QUICChannelStreamHandler: Channel, ChannelCore {
     @inlinable
     func connect0(to: SocketAddress, promise: EventLoopPromise<Void>?) {
         fatalError("not implemented \(#function)")
+    }
+}
+
+// MARK: - Queued callouts
+//
+// The stack's events reach this handler while the event context is held, so the pipeline events
+// and promise completions they cause are queued (see `QUICCallouts`) and delivered here once it's
+// released. Like NIO's own channels, the pipeline sees nothing after its close, and `isActive`
+// changes as `channelActive` and `channelInactive` are delivered.
+
+@available(anyAppleOS 26, *)
+extension QUICChannelStreamHandler {
+    /// Queues `promise`'s completion, if there is one.
+    private func complete(
+        _ promise: EventLoopPromise<Void>?,
+        _ result: Result<Void, any Error>,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        if let promise {
+            self.callouts.add(.completePromise(promise, result), in: &eventContext)
+        }
+    }
+
+    func deliverActive() {
+        // A channel closed before it became active sees neither event.
+        if self.isPipelineClosed || self.isActive {
+            return
+        }
+        self._isActive.store(true, ordering: .sequentiallyConsistent)
+        self.pipeline.fireChannelRegistered()
+        self.pipeline.fireChannelActive()
+    }
+
+    func deliverRead() {
+        self.isReadQueued = false
+        if self.isPipelineClosed { return }
+        self.flushBufferedReadData()
+    }
+
+    func deliverReadComplete() {
+        if self.isPipelineClosed { return }
+        self.fireChannelReadComplete()
+    }
+
+    func deliverInputClosed() {
+        if self.isPipelineClosed { return }
+        self.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
+    }
+
+    func deliverStopSending(code: NIOQUICHelpers.QUICApplicationErrorCode) {
+        if self.isPipelineClosed { return }
+        self.pipeline.fireUserInboundEventTriggered(NIOQUICHelpers.QUICStopSendingEvent(code: code))
+    }
+
+    func deliverError(_ error: any Error) {
+        if self.isPipelineClosed { return }
+        self.pipeline.fireErrorCaught(error)
+    }
+
+    /// As NIO's channels do: the state first, then the close promise, then the events. A stream closed
+    /// before it ever became active doesn't see `channelInactive`: it didn't see `channelActive`.
+    func deliverClose(promise: EventLoopPromise<Void>?, error: (any Error)?) {
+        if self.isPipelineClosed {
+            promise?.succeed()
+            return
+        }
+        self.isPipelineClosed = true
+        let wasActive = self._isActive.exchange(false, ordering: .sequentiallyConsistent)
+        promise?.succeed()
+        if let error {
+            self.pipeline.fireErrorCaught(error)
+        }
+        if wasActive {
+            self.pipeline.fireChannelInactive()
+            self.pipeline.fireChannelUnregistered()
+        }
     }
 }
 

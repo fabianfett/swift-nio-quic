@@ -22,7 +22,7 @@ import Testing
 @testable import NIOQUIC
 
 struct QUICConnectionPathTests {
-    /// Runs `body` with a new path and the slot to enter the stack through.
+    /// Runs `body` with a new path and the callout queue to enter the stack through.
     ///
     /// The path registers as it's created. Nothing above it releases it, as a QUIC instance would,
     /// so this unregisters it afterwards: its event manager traps on deinit otherwise.
@@ -30,14 +30,14 @@ struct QUICConnectionPathTests {
     private func withPath(
         isValidated: Bool = false,
         remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000),
-        _ body: (QUICConnectionPath<QUICStreamChannels>, EventContextSlot) throws -> Void
+        _ body: (QUICConnectionPath<QUICStreamChannels>, QUICCallouts) throws -> Void
     ) rethrows {
         let eventLoop = EmbeddedEventLoop()
+        let callouts = QUICCallouts()
         let context = NetworkContext(
             identifier: "test-context",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
+            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop, callouts: callouts)
         )
-        let slot = EventContextSlot(context: context)
         let path = QUICConnectionPath<QUICStreamChannels>(
             role: .server,
             remoteAddress: remoteAddress,
@@ -49,11 +49,11 @@ struct QUICConnectionPathTests {
             logger: Logger(label: "test")
         )
         defer {
-            slot.withEventContext(entering: path) { eventContext in
+            callouts.enter(as: path) { eventContext in
                 path.teardown(in: &eventContext)
             }
         }
-        try body(path, slot)
+        try body(path, callouts)
     }
 
     @available(anyAppleOS 26, *)
@@ -103,8 +103,8 @@ struct QUICConnectionPathTests {
     @available(anyAppleOS 26, *)
     @Test
     func idlePathDropsOutboundDatagrams() throws {
-        try self.withPath { path, slot in
-            try slot.withEventContext(entering: path) { eventContext in
+        try self.withPath { path, callouts in
+            try callouts.enter(as: path) { eventContext in
                 if let datagrams = try path.getDatagramsToSend(
                     maximumDatagramCount: 2,
                     minimumDatagramSize: 100,

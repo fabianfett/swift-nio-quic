@@ -95,8 +95,9 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private let streamListenerLinkage: BaseStreamListenerLinkage
     /// Attaches the active path as the QUIC instance's path in `start`, and the paths a server sets up later.
     private let multipathLinkage: BaseDatagramMultipathLinkage
-    /// Every entry point in this file acquires the connection's event context through this slot.
-    private let eventContextSlot: EventContextSlot
+    /// The calls into NIO and consumer code queued while the event context is held. Every entry point
+    /// in this file acquires the context through it.
+    private let callouts: QUICCallouts
     let localAddress: SocketAddress
     // The address of the active path, shared with this connection's channels.
     let remoteAddress: SendableAddress
@@ -188,7 +189,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // batching is disabled again, at which point any queued outbound writes will be emitted.
         // This allows outbound writes to be better packed into datagrams. Any outbound writes are
         // emitted into `handleOutboundDatagramsQueued(on:count:)` soon after batching is disabled.
-        self.eventContextSlot.withEventContext(entering: newFlowHandler) { eventContext in
+        self.callouts.enter(as: newFlowHandler) { eventContext in
             newFlowHandler.outboundBatching(enabled, in: &eventContext)
         }
     }
@@ -358,9 +359,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         var swiftNetworkParameters = SwiftNetwork.Parameters()
         self.eventLoop = eventLoop
+        let callouts = QUICCallouts()
+        self.callouts = callouts
         let networkContext = NetworkContext(
             identifier: "swift-nio-quic-context-\(self.role.description)",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop)
+            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop, callouts: callouts)
         )
         swiftNetworkParameters.context = networkContext
         self.networkContext = networkContext
@@ -417,8 +420,6 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.streamListenerLinkage = streamListenerLinkage
         self.multipathLinkage = multipathLinkage
         self.swiftNetworkParameters = swiftNetworkParameters
-        let eventContextSlot = EventContextSlot(context: networkContext)
-        self.eventContextSlot = eventContextSlot
 
         #if os(Linux) || os(Android)
         self.framePool = FramePool.makePool(forGSO: true)
@@ -454,7 +455,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             role: self.role,
             streamListenerProtocol: streamListenerLinkage,
             datagramListenerProtocol: datagramListenerLinkage,
-            eventContextSlot: eventContextSlot,
+            callouts: callouts,
             // Keep-alive is driven by the connection flow handler on the server, but by the
             // initial client stream on the client (set up below). A client using a stream
             // table has no initial stream, so its flow handler carries it too.
@@ -482,7 +483,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 listenerProtocol: streamListenerLinkage,
                 connectionChannel: nil,
                 eventLoop: self.eventLoop,
-                eventContextSlot: eventContextSlot,
+                callouts: callouts,
                 keepAliveInterval: configuration.keepAliveInterval
             )
 
@@ -518,7 +519,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             let table = QUICStreamTable<Consumer>(
                 role: self.role,
                 context: swiftNetworkParameters.context,
-                eventContextSlot: self.eventContextSlot
+                callouts: self.callouts
             )
 
             // The same references an outbound child-channel stream attaches in
@@ -555,14 +556,16 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.activePath.attach(PathView(self))
 
         // An external entry point that acquires the event context itself: nothing may hold it here.
-        do {
-            try self.multipathLinkage.invokeAttachLowerProtocolForNewPath(
-                BaseOutboundDatagramLinkage(external: self.activePath),
-                remote: remoteEndpoint,
-                local: localEndpoint,
-                parameters: self.swiftNetworkParameters,
-                path: path
-            )
+        do throws(NetworkError) {
+            try self.callouts.callFramework { () throws(NetworkError) in
+                try self.multipathLinkage.invokeAttachLowerProtocolForNewPath(
+                    BaseOutboundDatagramLinkage(external: self.activePath),
+                    remote: remoteEndpoint,
+                    local: localEndpoint,
+                    parameters: self.swiftNetworkParameters,
+                    path: path
+                )
+            }
         } catch {
             fatalError("Could not attach output handler to SwiftNetwork QUIC connection instance")
         }
@@ -572,7 +575,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             streamHandler.setDisconnectedEventHandler { _ in
                 self.streamHandlerHandleDisconnected(streamID: streamID)
             }
-            self.eventContextSlot.withEventContext(entering: streamHandler) { eventContext in
+            self.callouts.enter(as: streamHandler) { eventContext in
                 streamHandler.start(in: &eventContext)
             }
         }
@@ -584,7 +587,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         // This disconnected handler is called at the connection level (when flow: .allFlows),
         // not for individual streams. Connection-level events include: connection close, draining state, and connection errors.
-        self.eventContextSlot.withEventContext(entering: newFlowHandler) { eventContext in
+        self.callouts.enter(as: newFlowHandler) { eventContext in
             newFlowHandler.start(NewFlowView(self), in: &eventContext)
         }
 
@@ -646,7 +649,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             let streamID = pendingInitialClientStream.streamID
         {
             assert(streamID.rawValue == 0, "The stream ID does not match the expected initial stream ID.")
-            if pendingInitialClientStream.streamStateMachine.isConnected {
+            // Connected on the stack isn't enough: the stream's initializer needs its channel to have
+            // seen `channelActive`, which waits in the queued callouts until the event context is
+            // released. A handler that opens a stream as the handshake's callouts run gets a new one.
+            if pendingInitialClientStream.streamStateMachine.isConnected, pendingInitialClientStream.isActive {
                 let streamHandler = pendingInitialClientStream
                 self.pendingInitialClientStream = nil
                 self.finishOutboundStreamSetup(
@@ -702,22 +708,6 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         swiftNetworkParameters.defaultStack.prepend(applicationProtocol: quicOptions)
 
-        // Attaching the stream's flow requires that nothing holds the event context. A handler
-        // opening a stream while reacting to an event (e.g. in `channelRead`) holds it up the
-        // stack, so the open finishes once it's released. Either way the outcome is delivered
-        // through `onStreamReady`.
-        if self.eventContextSlot.isHeld {
-            self.eventContextSlot.whenReleased {
-                self.openOutboundStream(
-                    temporaryID: temporaryID,
-                    parameters: swiftNetworkParameters,
-                    path: swiftNetworkPath,
-                    connectionChannel: connectionChannel,
-                    onStreamReady: onStreamReady
-                )
-            }
-            return
-        }
         self.openOutboundStream(
             temporaryID: temporaryID,
             parameters: swiftNetworkParameters,
@@ -739,12 +729,6 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         onStreamReady:
             @escaping (Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>) -> Void
     ) {
-        // A deferred open can run after the connection tore down.
-        if self.connectionNewFlowHandler == nil {
-            onStreamReady(.failure(ChannelError.ioOnClosedChannel))
-            return
-        }
-
         let localEndpoint = self.localAddress.toEndpoint()
         let remoteEndpoint = self.activePath.remoteAddress.toEndpoint()
 
@@ -762,14 +746,14 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 listenerProtocol: self.streamListenerLinkage,
                 connectionChannel: connectionChannel,
                 eventLoop: connectionChannel.eventLoop,
-                eventContextSlot: self.eventContextSlot
+                callouts: self.callouts
             )
         else {
             fatalError("Could not create a new outbound stream handler")
         }
 
         // The stream handler's own calls: enter as it, as `start` does for the initial client stream.
-        self.eventContextSlot.withEventContext(entering: streamHandler) { eventContext in
+        let connectedStreamID: QUICStreamID? = self.callouts.enter(as: streamHandler) { eventContext in
             streamHandler.start(in: &eventContext)
 
             // Fast path: Check if the metadata is available immediately.
@@ -788,19 +772,19 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                         streamID: streamID
                     )
                 }
-                return
+                return nil
             }
+            return QUICStreamID(rawValue: rawStreamID)
+        }
 
-            let streamID = QUICStreamID(rawValue: rawStreamID)
+        if let connectedStreamID {
             // Runs the user's stream initializer and completes its promise.
-            self.eventContextSlot.parking(&eventContext) {
-                self.finishOutboundStreamSetup(
-                    temporaryID: temporaryID,
-                    streamID: streamID,
-                    streamHandler: streamHandler,
-                    onStreamReady: onStreamReady
-                )
-            }
+            self.finishOutboundStreamSetup(
+                temporaryID: temporaryID,
+                streamID: connectedStreamID,
+                streamHandler: streamHandler,
+                onStreamReady: onStreamReady
+            )
         }
     }
 
@@ -892,7 +876,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             fatalError("Connection flow handler unavailable")
         }
 
-        let handler = self.eventContextSlot.withEventContext(entering: newFlowHandler) { eventContext in
+        let handler = self.callouts.enter(as: newFlowHandler) { eventContext in
             QUICChannelStreamHandler(
                 role: self.role,
                 parameters: self.swiftNetworkParameters,
@@ -901,7 +885,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 remoteAddress: self.remoteAddress,
                 localAddress: self.localAddress,
                 connectionChannel: connectionChannel,
-                eventContextSlot: self.eventContextSlot,
+                callouts: self.callouts,
                 in: &eventContext
             )
         }
@@ -955,9 +939,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         for (_, pendingStreamData) in self.pendingOutboundStreams {
             pendingStreamData.streamHandler.stop(detachFromLowerProtocol: true, in: &eventContext)
             // Fails the user's stream promise.
-            self.eventContextSlot.parking(&eventContext) {
-                pendingStreamData.onStreamReady(.failure(ChannelError.ioOnClosedChannel))
-            }
+            self.callouts.add(
+                .streamReady(pendingStreamData.onStreamReady, .failure(ChannelError.ioOnClosedChannel)),
+                in: &eventContext
+            )
         }
         self.pendingOutboundStreams.removeAll()
         // Break cycle with the datagram transport, which holds this connection as its reader.
@@ -998,7 +983,32 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     ///     - reason: The reason for closing.
     /// - Returns: Action indicating what happened.
     func close(sendApplicationClose: Bool, errorCode: Int64, reason: String) -> CloseAction {
-        guard !self.isTerminating, let newFlowHandler = self.connectionNewFlowHandler else {
+        guard let newFlowHandler = self.connectionNewFlowHandler else {
+            log("close() returning early - already terminating")
+            return .alreadyClosed
+        }
+        return self.callouts.enter(as: newFlowHandler) { eventContext in
+            self.close(
+                sendApplicationClose: sendApplicationClose,
+                errorCode: errorCode,
+                reason: reason,
+                in: &eventContext
+            )
+        }
+    }
+
+    /// As ``close(sendApplicationClose:errorCode:reason:)``, from code that holds the event context.
+    private func close(
+        sendApplicationClose: Bool,
+        errorCode: Int64,
+        reason: String,
+        in eventContext: inout NetworkContext.EventContext
+    ) -> CloseAction {
+        if self.isTerminating {
+            log("close() returning early - already terminating")
+            return .alreadyClosed
+        }
+        guard let newFlowHandler = self.connectionNewFlowHandler else {
             log("close() returning early - already terminating")
             return .alreadyClosed
         }
@@ -1009,8 +1019,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // always say "established" even for a connection that never left `.connecting`.
         let hasEstablishedConnection = self.connectionStateMachine.hasEstablishedConnection
 
-        // Transition state machine to closing state FIRST, before SwiftNetwork cleanup
-        // This is crucial because newFlowHandler.stop() synchronously fires disconnected event
+        // Transition state machine to closing state FIRST, before SwiftNetwork cleanup: the
+        // disconnected event newFlowHandler.stop() leads to finds the connection closing.
         let action = self.connectionStateMachine.initiateClose(
             sendApplicationClose: sendApplicationClose,
             errorCode: errorCode,
@@ -1027,39 +1037,33 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             return .alreadyClosed
         }
 
-        // Now tell SwiftNetwork to send CONNECTION_CLOSE and clean up streams
-        // newFlowHandler.stop() will synchronously trigger handleConnectionDisconnected()
-        // which will see we're in .closing state and transition to .closed
-        //
-        // Also reached re-entrantly (a handler closing the connection from a parked call-out, or
-        // `scheduleConnectionClose`'s deferred block): the slot covers both.
-        self.eventContextSlot.withEventContext(entering: newFlowHandler) { eventContext in
-            let didStop: Bool
-            if sendApplicationClose {
-                newFlowHandler.stop(
-                    error: NetworkError(quicApplicationError: UInt64(errorCode), reason: reason),
-                    in: &eventContext
-                )
+        // Now tell SwiftNetwork to send CONNECTION_CLOSE and clean up streams. The disconnected event
+        // that follows reaches handleConnectionDisconnected(), which sees the .closing state,
+        // transitions to .closed and tears an established connection down.
+        let didStop: Bool
+        if sendApplicationClose {
+            newFlowHandler.stop(
+                error: NetworkError(quicApplicationError: UInt64(errorCode), reason: reason),
+                in: &eventContext
+            )
+            didStop = true
+        } else {
+            if let transportError = QUICTransportError(UInt64(errorCode), reason) {
+                newFlowHandler.stop(error: NetworkError(quicTransportError: transportError), in: &eventContext)
                 didStop = true
             } else {
-                if let transportError = QUICTransportError(UInt64(errorCode), reason) {
-                    newFlowHandler.stop(error: NetworkError(quicTransportError: transportError), in: &eventContext)
-                    didStop = true
-                } else {
-                    didStop = false
-                }
-            }
-            // The channel reference is dropped in 'dropChannelReferences()' once the channel has gone
-            // inactive: it's still needed here to deliver 'connectionClosed' back to the channel.
-            log("close sentApplicationClose: \(sendApplicationClose), errorCode: \(errorCode), reason: \(reason)")
-
-            // For connections that never established (still in idle or early handshake states), or
-            // which weren't stopped above, clean up synchronously: neither gets a disconnected event.
-            if !didStop || !hasEstablishedConnection {
-                self.tearDownConnectionState(in: &eventContext)
+                didStop = false
             }
         }
-        // For established connections, teardown happens via handleConnectionDisconnected (called by newFlowHandler.stop above)
+        // The channel reference is dropped in 'dropChannelReferences()' once the channel has gone
+        // inactive: it's still needed here to deliver 'connectionClosed' back to the channel.
+        log("close sentApplicationClose: \(sendApplicationClose), errorCode: \(errorCode), reason: \(reason)")
+
+        // For connections that never established (still in idle or early handshake states), or
+        // which weren't stopped above, clean up synchronously: neither gets a disconnected event.
+        if !didStop || !hasEstablishedConnection {
+            self.tearDownConnectionState(in: &eventContext)
+        }
         return .closeInitiated
     }
 
@@ -1106,7 +1110,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 continue
             }
             // Until then it's still registered: enter as it.
-            self.eventContextSlot.withEventContext(entering: stream) { eventContext in
+            self.callouts.enter(as: stream) { eventContext in
                 stream.stop(detachFromLowerProtocol: true, in: &eventContext)
                 stream.closeIfNeeded(in: &eventContext)
             }
@@ -1172,7 +1176,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             return
         }
         // Delivers upward from the path, which requires it to be mid-call: enter as it.
-        self.eventContextSlot.withEventContext(entering: path) { eventContext in
+        self.callouts.enter(as: path) { eventContext in
             path.invokeInputAvailable(in: &eventContext)
         }
     }
@@ -1285,12 +1289,12 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         // Add this to our list to avoid repeatedly going to the QUIC handler. Our peers are allowed to send this frame repeatedly.
         self.activeSCIDs.append(extraConnectionID)
 
-        // Propagate the association to the QUIC handler. Fires `QUICSCIDAssociatedEvent`.
-        let associated = self.eventContextSlot.parking(&eventContext) {
-            channelView.associate(extraConnectionID)
-        }
+        // Propagate the association to the QUIC handler. The channel fires `QUICSCIDAssociatedEvent`
+        // once the event context is released.
+        let associated = channelView.associate(extraConnectionID)
 
         if associated {
+            self.callouts.add(.connection(self, .connectionIDAssociated(extraConnectionID)), in: &eventContext)
             // Sometimes connection IDs are retired before new ones are added. Each connection requires at least one ID to refer
             // to its channel. Remove the ID pending deletion now that a new ID is available.
             if let obsoleteSCID = self.scidPendingDeletion {
@@ -1384,12 +1388,11 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         // Remove it first, so repeated calls will exit early.
         self.activeSCIDs.remove(at: index)
 
-        // Fires `QUICSCIDRetiredEvent`.
-        let retired = self.eventContextSlot.parking(&eventContext) {
-            channelView.retire(retiredConnectionID)
-        }
+        // The channel fires `QUICSCIDRetiredEvent` once the event context is released.
+        let retired = channelView.retire(retiredConnectionID)
 
         if retired {
+            self.callouts.add(.connection(self, .connectionIDRetired(retiredConnectionID)), in: &eventContext)
             // It's gone. Save it to check ID reuse. This might not be worth it, but we can save them for now.
             self.rememberRetiredSCID(retiredConnectionID)
             // Generate a replacement CID.
@@ -1458,19 +1461,14 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         }
 
         // Generate additional CIDs for the peer after handshake completes.
-        if let channelView = self.channelView {
+        if self.channelView != nil {
             // The datagram flow was attached in `start`: tell the channel the peer's advertised size.
-            // This completes datagram writes buffered before the handshake and flushes them, which
-            // re-enters `flushDatagrams()`.
+            // This completes datagram writes buffered before the handshake and flushes them.
             let peerMaxDatagramFrameSize = self.peerMaxDatagramFrameSize(in: &eventContext)
-            self.eventContextSlot.parking(&eventContext) {
-                channelView.handshakeCompleted(peerMaxDatagramFrameSize: peerMaxDatagramFrameSize)
-            }
-
-            // That ran channel code, which may have closed the connection: nothing left to announce.
-            if self.isTerminating {
-                return
-            }
+            self.callouts.add(
+                .connection(self, .handshakeCompleted(peerMaxDatagramFrameSize: peerMaxDatagramFrameSize)),
+                in: &eventContext
+            )
 
             // Query the value from Swift QUIC. If the peer did explicitly share a limit,
             // use the RFC minimum.
@@ -1486,14 +1484,12 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             )
             switch action {
             case .closeTransportParameterError(let reason):
-                // `close` acquires the event context itself: hand it the one held here.
-                let action = self.eventContextSlot.parking(&eventContext) {
-                    self.close(
-                        sendApplicationClose: false,
-                        errorCode: QUICTransportErrorCode.transportParameterError.rawValue,
-                        reason: reason
-                    )
-                }
+                let action = self.close(
+                    sendApplicationClose: false,
+                    errorCode: QUICTransportErrorCode.transportParameterError.rawValue,
+                    reason: reason,
+                    in: &eventContext
+                )
 
                 switch action {
                 case .closeInitiated, .alreadyClosed:
@@ -1557,12 +1553,8 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             // Record the close on the channel before tearing down. Stopping a stream fires
             // `channelInactive` on its pipeline, and a handler may react by closing the connection
             // channel: if that lands first the channel commits to a clean close and this error is
-            // never surfaced.
-            //
-            // Fires `errorCaught`/`channelInactive` and closes the streams, re-entering this connection.
-            self.eventContextSlot.parking(&eventContext) {
-                self.channelView?.connectionClosed(error: error)
-            }
+            // never surfaced. The queued calls run in order, so the channel learns of the close first.
+            self.callouts.add(.connection(self, .closed(error)), in: &eventContext)
 
             // Complete draining and tear down.
             // SwiftNetwork manages the draining timeout per RFC 9000 §10.2.2 internally.
@@ -1590,9 +1582,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             // A connection-initiated close (e.g. a protocol violation detected locally) is not
             // otherwise visible to the channel; the `.beginDraining` (peer close) path notifies
             // the channel for the same reason. Idempotent when the channel initiated the close.
-            self.eventContextSlot.parking(&eventContext) {
-                self.channelView?.connectionClosed(error: nil)
-            }
+            self.callouts.add(.connection(self, .closed(nil)), in: &eventContext)
 
         case .alreadyClosing:
             self.logger.trace("Already closing, ignoring disconnected event")
@@ -1637,7 +1627,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             throw QUICError.failedToRetireConnectionID
         }
 
-        self.eventContextSlot.withEventContext(entering: flowHandler) { eventContext in
+        self.callouts.enter(as: flowHandler) { eventContext in
             flowHandler.requestsRetirementOfConnectionID(connectionID, in: &eventContext)
         }
     }
@@ -1653,7 +1643,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             throw QUICError.failedToAssociateConnectionID
         }
 
-        self.eventContextSlot.withEventContext(entering: flowHandler) { eventContext in
+        self.callouts.enter(as: flowHandler) { eventContext in
             flowHandler.requestAssociationOfConnectionID(
                 connectionID,
                 statelessResetToken: self.statelessResetTokenGenerator.token(for: connectionID).token,
@@ -1732,9 +1722,13 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         self.handlePathValidated(remote: remote)
     }
 
-    /// Simulate a path unreachable event for the path to `remote`.
+    /// Simulate a path unreachable event for the path to `remote`, which reaches the connection through
+    /// the new-flow handler.
     func _forTesting_handlePathUnreachable(remote: AddressEndpoint) {
-        self.handlePathUnreachable(remote: remote)
+        guard let newFlowHandler = self.connectionNewFlowHandler else { return }
+        self.callouts.enter(as: newFlowHandler) { eventContext in
+            self.handlePathUnreachable(remote: remote, in: &eventContext)
+        }
     }
     #endif
 }
@@ -1760,7 +1754,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 // * A path registers as it's created and attaches with nothing held, since both acquire the event context. Packets
 //   arrive from the parent channel's read, which holds nothing.
 // * Path events reach the connection through the new-flow handler while SwiftNetwork holds the event context, so
-//   telling SwiftNetwork about a dropped path from there parks it.
+//   telling SwiftNetwork about a dropped path from there enters as the path with the context it holds.
 //
 // TODO: Revisit once we adopt SwiftNetwork 0.5.0's `pathCurrent` event. It should drive promotion.
 // * Paths can become active before validation. And validation does not mean that a path becomes the active path.
@@ -1803,18 +1797,6 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
                 )
                 return nil
             }
-            // Registering and attaching a path both acquire the event context. Nothing holds it while the
-            // parent channel reads, unless its pipeline replays a datagram synchronously from a `read()`
-            // issued inside a QUIC callback. Debug builds trap on that; release builds drop the packet
-            // before any path state changes, and the peer's next packet sets the path up.
-            if self.eventContextSlot.isHeld {
-                assertionFailure("A packet from a new remote address arrived while the event context is held")
-                self.logger.trace(
-                    "Dropping packet from a new remote address, the event context is held",
-                    metadata: [LoggingKeys.packetRemoteAddress: "\(remoteAddress)"]
-                )
-                return nil
-            }
             // One unvalidated path at a time, dropped before the next one is attached: SwiftNetwork
             // crashes when probing two paths simultaneously.
             if let unvalidatedPath = self.otherPaths.first(where: { !$0.isValidated }) {
@@ -1847,14 +1829,16 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         path.attach(PathView(self))
         self.otherPaths.append(path)
 
-        do {
-            try self.multipathLinkage.invokeAttachLowerProtocolForNewPath(
-                BaseOutboundDatagramLinkage(external: path),
-                remote: remoteAddress.toEndpoint(),
-                local: self.localAddress.toEndpoint(),
-                parameters: self.swiftNetworkParameters,
-                path: self.swiftNetworkPath
-            )
+        do throws(NetworkError) {
+            try self.callouts.callFramework { () throws(NetworkError) in
+                try self.multipathLinkage.invokeAttachLowerProtocolForNewPath(
+                    BaseOutboundDatagramLinkage(external: path),
+                    remote: remoteAddress.toEndpoint(),
+                    local: self.localAddress.toEndpoint(),
+                    parameters: self.swiftNetworkParameters,
+                    path: self.swiftNetworkPath
+                )
+            }
         } catch {
             self.logger.error(
                 "Failed to attach a new path",
@@ -1862,7 +1846,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             )
             self.removePath(path, notifySwiftNetwork: false)
             // The attach can only fail before QUIC adopts the path, so nothing above will release it.
-            self.eventContextSlot.withEventContext(entering: path) { eventContext in
+            self.callouts.enter(as: path) { eventContext in
                 path.unregisterEventManager(in: &eventContext)
             }
             return nil
@@ -1883,28 +1867,61 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     /// active path is a safeguard.
     ///
     /// - Parameter notifySwiftNetwork: Whether SwiftNetwork still uses the path and has to be told to drop it.
+    ///   Telling it enters the stack, so then this must be called with no event context held.
     // TODO: The validation requirement will not hold once active path events are available.
     private func removePath(_ path: QUICConnectionPath<Consumer>, notifySwiftNetwork: Bool) {
-        if path === self.activePath {
-            guard let index = self.otherPaths.lastIndex(where: { $0.isValidated }) else {
-                // The logger's metadata already carries the active path's address.
-                self.log("Keeping the active path, no validated path can replace it")
-                return
-            }
-            self.activePath = self.otherPaths.remove(at: index)
-        } else {
-            self.otherPaths.removeAll { $0 === path }
+        if !self.stopTracking(path) {
+            return
         }
-
         // A path SwiftNetwork already released needs no notification, and can't be entered any more.
         if notifySwiftNetwork, !path.identifier.isNone {
             // Delivers upward from the path, which requires it to be mid-call: enter as it. In response, a
             // server's QUIC instance destroys the path, unless it's its current one, and so releases it
             // before this returns.
-            self.eventContextSlot.withEventContext(entering: path) { eventContext in
+            self.callouts.enter(as: path) { eventContext in
                 path.invokeDisconnected(in: &eventContext)
             }
         }
+        self.discard(path)
+    }
+
+    /// As ``removePath(_:notifySwiftNetwork:)``, telling SwiftNetwork, from code that holds the event
+    /// context.
+    private func removePath(
+        _ path: QUICConnectionPath<Consumer>,
+        notifyingSwiftNetworkIn eventContext: inout NetworkContext.EventContext
+    ) {
+        if !self.stopTracking(path) {
+            return
+        }
+        if !path.identifier.isNone {
+            // As above, entering as the path with the context held here.
+            path.identifier.fromExternal(in: &eventContext) { eventContext in
+                path.invokeDisconnected(in: &eventContext)
+            }
+        }
+        self.discard(path)
+    }
+
+    /// Removes `path` from the tracked paths, promoting another path if it's the active one.
+    ///
+    /// - Returns: Whether the path was removed: the active path stays if no validated path can replace it.
+    private func stopTracking(_ path: QUICConnectionPath<Consumer>) -> Bool {
+        if path === self.activePath {
+            guard let index = self.otherPaths.lastIndex(where: { $0.isValidated }) else {
+                // The logger's metadata already carries the active path's address.
+                self.log("Keeping the active path, no validated path can replace it")
+                return false
+            }
+            self.activePath = self.otherPaths.remove(at: index)
+        } else {
+            self.otherPaths.removeAll { $0 === path }
+        }
+        return true
+    }
+
+    /// Fails what's queued on a removed path, and detaches it.
+    private func discard(_ path: QUICConnectionPath<Consumer>) {
         path.finalizeQueuedInboundFramesAsFailed()
         path.finalizeQueuedOutboundFramesAsFailed()
         // Last: detaching drops the path's link to SwiftNetwork, which the notification goes through.
@@ -1939,7 +1956,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     }
 
     /// SwiftNetwork gave up on the path to `remote`.
-    private func handlePathUnreachable(remote: AddressEndpoint) {
+    private func handlePathUnreachable(remote: AddressEndpoint, in eventContext: inout NetworkContext.EventContext) {
         guard let path = self.trackedPath(remote.type) else {
             self.log(
                 "Ignoring untracked unreachable path",
@@ -1948,7 +1965,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             return
         }
         // SwiftNetwork keeps unreachable paths around until it is told to drop them.
-        self.removePath(path, notifySwiftNetwork: true)
+        self.removePath(path, notifyingSwiftNetworkIn: &eventContext)
     }
 
     /// SwiftNetwork detached from `path`, e.g. after migrating away from it.
@@ -2072,10 +2089,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         }
 
         func pathUnreachable(remote: AddressEndpoint, in eventContext: inout NetworkContext.EventContext) {
-            // Dropping the path enters the stack as the path to tell SwiftNetwork: hand it the context held here.
-            self.connection.eventContextSlot.parking(&eventContext) {
-                self.connection.handlePathUnreachable(remote: remote)
-            }
+            self.connection.handlePathUnreachable(remote: remote, in: &eventContext)
         }
     }
 
@@ -2106,7 +2120,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     func setDatagramTransport(_ transport: DatagramTransport) {
         switch self.datagramTransport {
         case .live(let replaced)?:
-            self.eventContextSlot.withEventContext(entering: replaced) { eventContext in
+            self.callouts.enter(as: replaced) { eventContext in
                 replaced.close(in: &eventContext)
             }
         case .test?, .none:
@@ -2117,21 +2131,27 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
     }
 }
 
-// MARK: - Inbound datagrams
+// MARK: - Queued callouts
 
 @available(anyAppleOS 26, *)
-extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
-    /// A datagram arrived on the connection's datagram flow: hand it to the channel, which fires it
-    /// as a `channelRead`.
-    ///
-    /// - Precondition: The datagram must adhere to the frame size limits advertised by this peer.
-    func read(datagram: ByteBuffer) {
-        self.channelView?.datagramRead(datagram)
-    }
-
-    /// The datagram flow failed: hand the error to the channel, which fires it as an `errorCaught`.
-    func error(_ error: any Error) {
-        self.channelView?.datagramError(error)
+extension SwiftNetworkQUICConnection: QUICConnectionCalloutTarget where Consumer: ~Copyable {
+    /// Hands a call queued while the event context was held to the channel.
+    func run(_ callout: QUICConnectionCallout) {
+        switch callout {
+        case .handshakeCompleted(let peerMaxDatagramFrameSize):
+            self.channelView?.handshakeCompleted(peerMaxDatagramFrameSize: peerMaxDatagramFrameSize)
+        case .closed(let error):
+            self.channelView?.connectionClosed(error: error)
+        case .connectionIDAssociated(let connectionID):
+            self.channelView?.connectionIDAssociated(connectionID)
+        case .connectionIDRetired(let connectionID):
+            self.channelView?.connectionIDRetired(connectionID)
+        case .datagramRead(let datagram):
+            // The datagram adheres to the frame size limits advertised by this peer.
+            self.channelView?.datagramRead(datagram)
+        case .datagramError(let error):
+            self.channelView?.datagramError(error)
+        }
     }
 }
 
@@ -2170,14 +2190,14 @@ extension SwiftNetworkQUICConnection: QUICConnectionProtocol where Consumer: ~Co
     func flushDatagrams() {
         switch self.datagramTransport {
         case .live(let transport)?:
-            self.eventContextSlot.withEventContext(entering: transport) { eventContext in
+            self.callouts.enter(as: transport) { eventContext in
                 transport.flush(in: &eventContext)
             }
         case .test(let transport)?:
             // A test double is no protocol instance and makes no stack calls: enter as the flow
             // handler, which stays registered while a transport is installed.
             guard let newFlowHandler = self.connectionNewFlowHandler else { return }
-            self.eventContextSlot.withEventContext(entering: newFlowHandler) { eventContext in
+            self.callouts.enter(as: newFlowHandler) { eventContext in
                 transport.flush(in: &eventContext)
             }
         case .none:

@@ -34,19 +34,19 @@ final class QUICDatagramTransport<Consumer: QUICStreamConsumer & ~Copyable>: Ext
 
     private var bufferedDatagrams: TinyArray<ByteBuffer> = []
     private var reader: SwiftNetworkQUICConnection<Consumer>?
-    private let eventContextSlot: EventContextSlot
+    private let callouts: QUICCallouts
 
     init(
         role: Role,
         logger: Logger,
         context: NetworkContext,
-        eventContextSlot: EventContextSlot,
+        callouts: QUICCallouts,
         in eventContext: inout NetworkContext.EventContext
     ) {
         self.logPrefix = "[\(role.description)][DatagramTransport]"
         self.logger = logger
         self.context = context
-        self.eventContextSlot = eventContextSlot
+        self.callouts = callouts
         self.identifier = InstanceIdentifier(eventManager: &self.eventManager, in: &eventContext)
     }
 
@@ -88,8 +88,8 @@ extension QUICDatagramTransport: QUICDatagramProtocol where Consumer: ~Copyable 
             self.bufferedDatagrams.removeAll(where: { _ in true })
         } catch {
             self.logger.error("QUIC send datagrams: \(error)")
-            self.eventContextSlot.parking(&eventContext) {
-                self.reader?.error(error)
+            if let reader = self.reader {
+                self.callouts.add(.connection(reader, .datagramError(error)), in: &eventContext)
             }
         }
     }
@@ -138,9 +138,7 @@ extension QUICDatagramTransport where Consumer: ~Copyable {
                             buffer.copyMemory(from: UnsafeRawBufferPointer(spanBuffer))
                             return spanBuffer.count
                         }
-                        self.eventContextSlot.parking(&eventContext) {
-                            reader.read(datagram: datagram)
-                        }
+                        self.callouts.add(.connection(reader, .datagramRead(datagram)), in: &eventContext)
                     }
                     frame.finalize(success: true)
                     return true

@@ -228,10 +228,14 @@ struct QUICConnectionChannelTests {
 
             let view = channel.connectionView
             #expect(view.associate(id1))
+            // Updating the routing table fires nothing: the connection reports a successful
+            // association once the event context is released.
+            #expect(recorder.events.isEmpty)
+            view.connectionIDAssociated(id1)
             #expect(view.retire(id1))
+            view.connectionIDRetired(id1)
 
             #expect(registrar.events == [.associated(id1), .retired(id1)])
-            // Both succeeded, so both are reported to the pipeline.
             #expect(recorder.events == [.associated(id1), .retired(id1)])
         }
 

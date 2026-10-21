@@ -269,7 +269,7 @@ extension QUICConnectionPath where Consumer: ~Copyable {
     func teardown(in eventContext: inout NetworkContext.EventContext) {
         // Nothing to release beyond what `detach` deliberately keeps. This path still owns its
         // event manager's registration, though, and nothing below it retires that on its behalf:
-        // unregister, or the event manager traps when it's released (see `EventContextSlot`).
+        // unregister, or the event manager traps when it's released.
         self.unregisterEventManager(in: &eventContext)
     }
 

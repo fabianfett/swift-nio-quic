@@ -715,14 +715,14 @@ struct DatagramTests {
         try await serverChannel.close()
     }
 
-    /// A datagram's `channelRead` runs while the connection holds its event context, and attaching
-    /// a stream's flow needs none held: the stream opens once the context is released.
+    /// Attaching a stream's flow needs no event context held, and a datagram's `channelRead` runs
+    /// once the connection has released it: a stream opened from there opens right away.
     ///
     /// Unidirectional, because the first bidirectional stream a client opens reuses the stream the
     /// connection created up front, which attaches no new flow.
     @available(anyAppleOS 26, *)
     @Test
-    func streamOpenedFromADatagramReadOpensOnceTheContextIsReleased() async throws {
+    func streamOpenedFromADatagramReadOpens() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"

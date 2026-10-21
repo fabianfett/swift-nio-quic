@@ -454,14 +454,15 @@ final class DatagramTestTransport: QUICDatagramProtocol {
         self.reader = connection
     }
 
-    /// Test-only: simulate an inbound datagram arriving from the peer.
+    /// Test-only: simulate an inbound datagram arriving from the peer, as the production transport
+    /// hands it to the connection once the event context is released.
     func deliverInbound(_ datagram: ByteBuffer) {
-        self.reader?.read(datagram: datagram)
+        self.reader?.run(.datagramRead(datagram))
     }
 
     /// Test-only: simulate the transport reporting an error.
     func deliverError(_ error: any Error) {
-        self.reader?.error(error)
+        self.reader?.run(.datagramError(error))
     }
 }
 

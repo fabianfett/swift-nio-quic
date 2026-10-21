@@ -109,8 +109,8 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// Context for the `SwiftNetwork` stack.
     let context: NetworkContext
 
-    /// The connection's event context slot. The table's operations acquire the context through it.
-    let eventContextSlot: EventContextSlot
+    /// The connection's queued callouts. The table's operations acquire the context through it.
+    let callouts: QUICCallouts
 
     /// The instance the table's operations enter the stack as.
     ///
@@ -119,7 +119,7 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     let anchor: EventContextAnchor
 
     /// Creates a table. Must be called with no event context held: it registers the table's anchor.
-    init(role: Role, context: NetworkContext, eventContextSlot: EventContextSlot) {
+    init(role: Role, context: NetworkContext, callouts: QUICCallouts) {
         self._transportStates = QUICStreamSlots()
         self._consumerStates = QUICStreamConsumerStates()
         self._ready = []
@@ -134,7 +134,7 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         self.outOfBandDrainRequested = false
         self.role = role
         self.context = context
-        self.eventContextSlot = eventContextSlot
+        self.callouts = callouts
         self.anchor = EventContextAnchor(context: context)
     }
 
@@ -263,7 +263,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
     }
 
     /// As ``registerIdentifier(for:in:)``, for use with no event context held: registering then
-    /// acquires the context itself (see `EventContextSlot`).
+    /// acquires the context itself.
     func registerIdentifier(for handle: QUICStreamHandle) -> InstanceIdentifier {
         guard let transport = self._transportStates.pointer(for: handle) else {
             preconditionFailure("slot for \(handle) was recycled before it could be registered")
@@ -453,8 +453,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
     /// Marks every stream as closed and visits each of them, then retires the table's anchor.
     ///
-    /// The table's operations can't be used afterwards. May be reached with the event context
-    /// parked, in which case every acquisition here takes the parked one.
+    /// The table's operations can't be used afterwards.
     ///
     /// - Parameters:
     ///   - error: Reported to the consumer as the reason each stream closed.
@@ -681,20 +680,19 @@ extension QUICStreamTable where Consumer: ~Copyable {
 extension QUICStreamTable where Consumer: ~Copyable {
     /// Runs `body` with the connection's event context, entering the stack as the table's anchor.
     ///
-    /// Takes the parked context if a caller up the stack parked one, otherwise acquires it. The
-    /// anchor is never a callee. The operations here call QUIC stream flows, whose parent, the
+    /// The anchor is never a callee. The operations here call QUIC stream flows, whose parent, the
     /// `QUICConnection`, is idle wherever consumer code runs.
     func withEventContext<R, E: Error>(
         _ body: (inout NetworkContext.EventContext) throws(E) -> R
     ) throws(E) -> R {
         precondition(!self.isClosed, "stream table used after it was closed")
-        return try self.eventContextSlot.withEventContext(entering: self.anchor, body)
+        return try self.callouts.enter(as: self.anchor, body)
     }
 
     /// Retires the table's anchor, after which its operations can't acquire the event context.
     /// Idempotent.
     func retireAnchor() {
-        self.anchor.retire(through: self.eventContextSlot)
+        self.anchor.retire(through: self.callouts)
     }
 }
 
@@ -710,7 +708,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Reads from the stream `transport` belongs to.
     ///
     /// Acquires the event context only for each pull from the stack, so `body` runs with nothing
-    /// held, or with the context still parked if a caller up the stack parked it.
+    /// held.
     @usableFromInline
     func read(
         _ transport: UnsafeMutablePointer<QUICStreamTransportState>,

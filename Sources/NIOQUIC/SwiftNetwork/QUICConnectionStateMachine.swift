@@ -444,7 +444,7 @@ struct QUICConnectionStateMachine: ~Copyable {
         // Inspect and convert the error
         if let error = error {
             // Idle timeout from SwiftNetwork
-            if error == .posix(ETIMEDOUT) {
+            if error.isIdleTimeout {
                 isIdleTimeout = true
                 // No error actions for timeout
             }
@@ -649,5 +649,14 @@ struct QUICConnectionStateMachine: ~Copyable {
             self = .init(state: .closed(closed))
             return .unexpectedRequest
         }
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension NetworkError {
+    /// Whether this is SwiftNetwork's idle timeout. That closes a connection silently (RFC 9000,
+    /// Section 10.1), so the connection and its streams treat it as a clean close.
+    var isIdleTimeout: Bool {
+        self == .posix(ETIMEDOUT)
     }
 }

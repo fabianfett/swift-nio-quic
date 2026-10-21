@@ -551,33 +551,6 @@ struct QUICStreamTableTests {
 
     @available(anyAppleOS 26, *)
     @Test
-    func openWhileAnEventContextIsHeldThrowsAndAddsNothing() {
-        let table = Self.makeRecordingTable(role: .client)
-        defer { table.retireAnchor() }
-        table.opener = .unreachable(context: table.context)
-
-        table.withEventContext { eventContext in
-            // Held by this acquisition.
-            #expect(table.eventContextSlot.isHeld)
-            #expect(throws: QUICError.invalidStreamState) {
-                _ = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
-            }
-            // Parked around a call-out, as for a handler reacting to an event.
-            table.eventContextSlot.parking(&eventContext) {
-                #expect(table.eventContextSlot.isHeld)
-                #expect(throws: QUICError.invalidStreamState) {
-                    _ = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 2))
-                }
-            }
-        }
-
-        #expect(table.count == 0)
-        // Registering a stream would have made this its identifier.
-        #expect(table._pendingAttachIdentifier.isNone)
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test
     func openAfterCloseAllThrowsAndAddsNothing() {
         let table = Self.makeRecordingTable(role: .client)
         table.opener = .unreachable(context: table.context)
@@ -622,11 +595,12 @@ extension QUICStreamTable {
     /// Builds a table on an event-loop-backed context: acquiring the default scheduler's context
     /// traps off its queue. Its anchor must be retired, or the table closed, before it's released.
     convenience init(role: Role) {
+        let callouts = QUICCallouts()
         let context = NetworkContext(
             identifier: "QUICStreamTableTests",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop())
+            externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop(), callouts: callouts)
         )
-        self.init(role: role, context: context, eventContextSlot: EventContextSlot(context: context))
+        self.init(role: role, context: context, callouts: callouts)
     }
 }
 

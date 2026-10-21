@@ -28,9 +28,6 @@ public struct QUICStreams<Consumer: QUICStreamConsumer & ~Copyable>: ~Copyable, 
 
     /// Opens a stream.
     ///
-    /// Throws if called from inside a callback that delivers a connection event, such as a datagram
-    /// `channelRead`: opening attaches a flow, which needs no event context held.
-    ///
     /// - Parameters:
     ///   - type: The type of stream to open.
     ///   - state: The consumer's state for the new stream.

@@ -19,18 +19,15 @@ import NIOQUICHelpers
 extension QUICStreamTable where Consumer: ~Copyable {
     /// Opens a stream, attaching it to the stack and connecting it.
     ///
-    /// Attaching a new flow acquires the event context itself, so it can't happen while one is
-    /// held (see `EventContextSlot`). This therefore refuses to open a stream while NIOQUIC holds
-    /// the context, for example from inside a callback that delivers an event, such as a datagram
-    /// `channelRead`.
+    /// Attaching a new flow acquires the event context itself, so this must be called with none
+    /// held, as it is wherever consumer code runs.
     ///
     /// - Parameters:
     ///   - type: The type of stream to open.
     ///   - state: The consumer's state for the new stream.
     /// - Returns: The handle for the new stream.
     /// - Throws: If the type is not one this endpoint may initiate, the table is closed, the table
-    ///   has no opener, an event context is held, or the stack refused the flow, in which case
-    ///   `state` is destroyed.
+    ///   has no opener, or the stack refused the flow, in which case `state` is destroyed.
     func open(_ type: QUICStreamType, state: consuming Consumer.StreamState) throws -> QUICStreamHandle {
         if type.isClientInitiated && self.role == .server {
             throw QUICError.invalidStreamTypeForRole
@@ -41,16 +38,17 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
         if self.isClosed { throw QUICError.invalidStreamState }
         guard let opener = self.opener else { throw QUICError.invalidStreamState }
-        if self.eventContextSlot.isHeld { throw QUICError.invalidStreamState }
 
         let handle = self.insertSlot(id: nil, state: consume state)
         let identifier = self.registerIdentifier(for: handle)
 
         do throws(NetworkError) {
-            try opener.attach(
-                isUnidirectional: type.isUnidirectional,
-                upperProtocol: BaseInboundStreamLinkage(external: self)
-            )
+            try self.callouts.callFramework { () throws(NetworkError) in
+                try opener.attach(
+                    isUnidirectional: type.isUnidirectional,
+                    upperProtocol: BaseInboundStreamLinkage(external: self)
+                )
+            }
         } catch {
             self.vacateSlot(handle)
             throw QUICError.invalidStreamState

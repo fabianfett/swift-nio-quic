@@ -51,7 +51,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     let logger: Logger
     let remoteAddress: SendableAddress
     let localAddress: SocketAddress
-    private let eventContextSlot: EventContextSlot
+    private let callouts: QUICCallouts
 
     /// The connection channel which is the parent of inbound stream channels created by this handler.
     /// Set via ``setConnectionChannel(_:)`` once the connection channel has been created.
@@ -78,13 +78,15 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         role: Role,
         streamListenerProtocol: BaseStreamListenerLinkage,
         datagramListenerProtocol: BaseDatagramListenerLinkage,
-        eventContextSlot: EventContextSlot,
+        callouts: QUICCallouts,
         keepAliveInterval: Duration? = nil
     ) {
-        precondition(
-            !eventContextSlot.isHeld,
+        #if DEBUG
+        assert(
+            !callouts.isInsideStack,
             "QUICChannelNewFlowHandler attaches on construction, which requires that no event context is held"
         )
+        #endif
         self.local = local
         self.remote = remote
         self.parameters = parameters
@@ -97,18 +99,20 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         self.logPrefix = "[\(self.role.description)][NewFlowHandler]"
         self.localAddress = localAddress
         self.datagramListener = datagramListenerProtocol
-        self.eventContextSlot = eventContextSlot
+        self.callouts = callouts
         self.identifier = InstanceIdentifier(context: self.context, eventManager: &self.eventManager)
         do throws(NetworkError) {
-            try streamListenerProtocol.invokeAttachUpperProtocol(
-                BaseInboundStreamFlowLinkage(external: self),
-                remote: remote,
-                local: local,
-                parameters: parameters,
-                path: path
-            )
+            try callouts.callFramework { () throws(NetworkError) in
+                try streamListenerProtocol.invokeAttachUpperProtocol(
+                    BaseInboundStreamFlowLinkage(external: self),
+                    remote: remote,
+                    local: local,
+                    parameters: parameters,
+                    path: path
+                )
+            }
         } catch {
-            self.eventContextSlot.withEventContext(entering: self) { eventContext in
+            self.callouts.enter(as: self) { eventContext in
                 self.unregisterEventManager(in: &eventContext)
             }
             return nil
@@ -322,7 +326,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                 remoteAddress: self.remoteAddress,
                 localAddress: self.localAddress,
                 connectionChannel: connectionChannel,
-                eventContextSlot: self.eventContextSlot,
+                callouts: self.callouts,
                 keepAliveInterval: keepAliveInterval,
                 in: &eventContext
             )
@@ -394,8 +398,7 @@ extension QUICChannelNewFlowHandler: ProtocolInstance where Consumer: ~Copyable 
 extension QUICChannelNewFlowHandler where Consumer: ~Copyable {
     /// Attaches the connection's datagram flow.
     ///
-    /// Must be called with no event context held: attaching a new flow acquires the context itself
-    /// (see `EventContextSlot`).
+    /// Must be called with no event context held: attaching a new flow acquires the context itself.
     ///
     /// The connection calls this from its `start`, after starting this handler and before any packet
     /// is processed, so that no early DATAGRAM frame finds no flow: QUIC would give that frame an
@@ -407,13 +410,15 @@ extension QUICChannelNewFlowHandler where Consumer: ~Copyable {
     ///
     /// - Returns: The transport for the attached flow, or `nil` if it could not be attached.
     func attachDatagramFlow() -> QUICDatagramTransport<Consumer>? {
-        precondition(!self.eventContextSlot.isHeld, "Attaching a new flow requires that no event context is held")
-        let transport = self.eventContextSlot.withEventContext(entering: self) { eventContext in
+        #if DEBUG
+        assert(!self.callouts.isInsideStack, "Attaching a new flow requires that no event context is held")
+        #endif
+        let transport = self.callouts.enter(as: self) { eventContext in
             QUICDatagramTransport<Consumer>(
                 role: self.role,
                 logger: self.logger,
                 context: self.context,
-                eventContextSlot: self.eventContextSlot,
+                callouts: self.callouts,
                 in: &eventContext
             )
         }
@@ -430,23 +435,25 @@ extension QUICChannelNewFlowHandler where Consumer: ~Copyable {
             quicOptions.setProtocolInstance(self.datagramListener.identifier)
             swiftNetworkParameters.defaultStack.prepend(applicationProtocol: quicOptions)
 
-            try self.datagramListener.invokeAttachUpperProtocolToNewFlow(
-                BaseInboundDatagramLinkage(external: transport),
-                remote: nil,
-                local: nil,
-                parameters: swiftNetworkParameters,
-                path: swiftNetworkPath
-            )
+            try self.callouts.callFramework { () throws(NetworkError) in
+                try self.datagramListener.invokeAttachUpperProtocolToNewFlow(
+                    BaseInboundDatagramLinkage(external: transport),
+                    remote: nil,
+                    local: nil,
+                    parameters: swiftNetworkParameters,
+                    path: swiftNetworkPath
+                )
+            }
         } catch {
             self.logger.error("\(self.logPrefix) Failed to attach QUIC datagram flow: \(error)")
-            // Registered but never attached: nothing else will unregister it (see `EventContextSlot`).
-            self.eventContextSlot.withEventContext(entering: transport) { eventContext in
+            // Registered but never attached: nothing else will unregister it.
+            self.callouts.enter(as: transport) { eventContext in
                 transport.unregisterEventManager(in: &eventContext)
             }
             return nil
         }
 
-        self.eventContextSlot.withEventContext(entering: transport) { eventContext in
+        self.callouts.enter(as: transport) { eventContext in
             transport.lower.invokeConnect(for: transport.identifier, in: &eventContext)
         }
         return transport
