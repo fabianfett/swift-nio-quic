@@ -51,7 +51,7 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.1")),
         .package(
             url: "https://github.com/fabianfett/swift-network-evolution.git",
-            revision: "55a518f3234fed05c964b8f85ad8eb78d9fe0549",
+            revision: "d070959f1dbf6d96c484fcde6e6fd317412915fd",
             traits: swiftNetworkTraits
         ),
         .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.1.0")),

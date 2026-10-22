@@ -50,6 +50,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// Locally opened streams waiting for the peer to allow more streams.
     private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
 
+    /// Whether a drain of the connection's output is scheduled for the next loop tick.
+    private var drainScheduled = false
+
     /// Whether the channel was told the handshake completed.
     private var reportedHandshake = false
     /// Whether the channel was told the connection closed.
@@ -348,7 +351,16 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     // MARK: Output
 
+    /// Makes sure output produced outside a read loop, such as a stream write from application code,
+    /// is sent: the read loop drains on its own when it ends.
+    private func outputProduced() {
+        guard !self.inReadLoop, !self.drainScheduled, let channelView = self.channelView else { return }
+        self.drainScheduled = true
+        channelView.drainOutbound()
+    }
+
     func drainPacketsToSend(to transport: some QUICTransport) {
+        self.drainScheduled = false
         // Stream operations since the last drain may have produced events.
         self.processEvents()
         self.openPendingStreams()
@@ -413,6 +425,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         if let id = self.core.openStream(bidirectional: bidirectional) {
             self.streamTable?.assignID(NIOQUICHelpers.QUICStreamID(rawValue: id), to: handle)
             self.streamTable?.markReady(handle: handle, events: .opened)
+            self.outputProduced()
         } else {
             self.pendingOpens.append((handle, bidirectional))
         }
@@ -436,7 +449,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         _ streamID: QUICStreamID,
         _ body: (RawSpan, _ isFinished: Bool) -> (consumed: Int, result: Result)
     ) -> Result? {
-        self.core.read(from: streamID.rawValue, body)
+        let result = self.core.read(from: streamID.rawValue, body)
+        self.outputProduced()
+        return result
     }
 
     func writableBytes(_ streamID: QUICStreamID) -> Int {
@@ -446,19 +461,23 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     @discardableResult
     func write(_ bytes: RawSpan, to streamID: QUICStreamID, fin: Bool) -> Int {
         let written = self.core.write(bytes, to: streamID.rawValue, fin: fin)
+        self.outputProduced()
         return written
     }
 
     func finish(_ streamID: QUICStreamID) {
         self.core.finish(streamID.rawValue)
+        self.outputProduced()
     }
 
     func resetStream(_ streamID: QUICStreamID, code: QUICApplicationErrorCode) {
         self.core.resetStream(streamID.rawValue, errorCode: code.rawValue)
+        self.outputProduced()
     }
 
     func stopSending(_ streamID: QUICStreamID, code: QUICApplicationErrorCode) {
         self.core.stopSending(streamID.rawValue, errorCode: code.rawValue)
+        self.outputProduced()
     }
 
     func hasStream(_ streamID: QUICStreamID) -> Bool {
