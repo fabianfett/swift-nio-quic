@@ -307,6 +307,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private func connectionClosed(_ reason: QUICConnectionCore.CloseReason) {
         self.timer?.cancel()
         self.timer = nil
+        self.timerDeadline = nil
         guard !self.reportedClose else { return }
         self.reportedClose = true
         let error: (any Error)?
@@ -327,12 +328,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     private func rescheduleTimer() {
         guard let deadline = self.core.nextDeadline else {
-            self.timer?.cancel()
-            self.timer = nil
-            self.timerDeadline = nil
+            // Nothing is due; a timer still armed fires as a no-op.
             return
         }
-        if let current = self.timerDeadline, current == deadline, self.timer != nil {
+        // Rescheduling a NIO task is expensive. Keep an armed timer that fires no later than
+        // needed: if it fires early, `timerFired` re-arms it for the real deadline.
+        if let current = self.timerDeadline, self.timer != nil, current <= deadline {
             return
         }
         self.timer?.cancel()
