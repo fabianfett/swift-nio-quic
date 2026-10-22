@@ -170,6 +170,8 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         switch connection {
         case .live(let connection):
             connection.setDriver(self)
+        case .stateMachine(let connection):
+            connection.setDriver(self)
         case .test:
             ()
         }
@@ -1007,7 +1009,14 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
         }
 
         // Done producing data: exit read loop (which also flushes outbound data.)
-        self._connection.withLiveOnly { $0.exitReadLoop() }
+        switch self._connection {
+        case .live(let connection):
+            connection.exitReadLoop()
+        case .stateMachine(let connection):
+            connection.exitReadLoop()
+        case .test:
+            ()
+        }
         // Stream initializers may produce output; reconcile any pending events again.
         self.drainAndReconcileLifecycle()
     }
@@ -1069,7 +1078,8 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
                 promise.fail(error)
             }
 
-        case .test:
+        case .stateMachine, .test:
+            // A state machine driven connection serves streams through its stream table only.
             promise.fail(ChannelError.operationUnsupported)
         }
 

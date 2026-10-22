@@ -804,6 +804,241 @@ extension QUICStreamCore {
     }
 }
 
+// MARK: - State machine backed operations
+
+/// The stream operations for a stream a ``StateMachineQUICConnection`` drives. They make the same
+/// state transitions as the `SwiftNetwork` ones; only the calls into the stack differ.
+@available(anyAppleOS 26, *)
+extension QUICStreamCore {
+    /// Hands the stream's readable bytes to `body`. See ``read(minContiguous:withEventContext:_:)``.
+    mutating func read<Consumer: QUICStreamConsumer & ~Copyable>(
+        minContiguous: Int,
+        from stateMachine: StateMachineQUICConnection<Consumer>,
+        id: QUICStreamID,
+        _ body: (_ span: borrowing RawSpan) -> Int
+    ) -> QUICStreamReadOutcome {
+        self._needsReadVisit = false
+
+        switch self.state.attemptRead() {
+        case .proceedWithRead:
+            break
+        case .doNotRead:
+            // Receive side closed: the stack holds nothing more for the consumer.
+            if self.state.hasReceivedFin {
+                self.consumeEndOfStream()
+                return .endOfStream(0)
+            }
+            return .nothingAvailable
+        }
+
+        let contiguous = max(minContiguous, 1)
+        var delivered = 0
+        var leftOver = false
+        var reachedEnd = false
+        _ = stateMachine.read(id) { bytes, isFinished in
+            let available = bytes.byteCount
+            var consumed = 0
+            if available > 0 && (available >= contiguous || isFinished) {
+                let wanted = body(bytes)
+                assert(wanted >= 0, "body(_:) claimed to read negative bytes")
+                assert(wanted <= available, "body(_:) claimed to read more bytes than available")
+                consumed = min(max(wanted, 0), available)
+            }
+            delivered = consumed
+            leftOver = consumed < available
+            reachedEnd = isFinished && !leftOver
+            return (consumed, ())
+        }
+
+        if delivered > 0 {
+            _ = try? self.state.receiveData()
+        }
+        if reachedEnd {
+            self.finPending = true
+            self.confirmFin()
+            self.consumeEndOfStream()
+            return .endOfStream(delivered)
+        }
+        if delivered > 0 {
+            if leftOver {
+                self._needsReadVisit = true
+            }
+            return .read(delivered)
+        }
+        return .nothingAvailable
+    }
+
+    /// How many bytes the stream will accept right now. See ``writableBytes(in:)``.
+    func writableBytes<Consumer: QUICStreamConsumer & ~Copyable>(
+        on stateMachine: StateMachineQUICConnection<Consumer>
+    ) -> Int {
+        guard let id = self.id, !self.state.isSendFinished else { return 0 }
+        return stateMachine.writableBytes(id)
+    }
+
+    /// Hands queued writes to the state machine. See ``flush(fin:in:)``.
+    mutating func flush<Consumer: QUICStreamConsumer & ~Copyable>(
+        fin: Bool,
+        to stateMachine: StateMachineQUICConnection<Consumer>
+    ) throws {
+        if self.pendingWrites.isEmpty && !fin { return }
+
+        var dropWritesOnRefusal = true
+        var refusalReason: String?
+
+        do {
+            switch try self.state.writeData() {
+            case .sendData:
+                ()
+            case .doNotWrite(.streamFinished):
+                refusalReason = "a FIN has already been sent"
+            case .doNotWrite(.streamReset):
+                refusalReason = "RESET_STREAM has already been sent"
+            }
+        } catch {
+            switch error {
+            case .notConnected:
+                refusalReason = "the stack hasn't assigned the stream an ID yet"
+                dropWritesOnRefusal = false
+            case .wrongDirection:
+                refusalReason = "the stream has no send side"
+            }
+        }
+
+        var carriesFin = false
+
+        if fin && refusalReason == nil {
+            do {
+                switch try self.state.sendFin() {
+                case .sendFin:
+                    carriesFin = true
+                case .ignore(.alreadyFinished):
+                    refusalReason = "a FIN has already been sent"
+                case .ignore(.streamReset):
+                    refusalReason = "RESET_STREAM has already been sent"
+                }
+            } catch {
+                assert(self.pendingWrites.isEmpty)
+                throw NetworkError(streamStateViolation: "\(error)", operation: "sendFin")
+            }
+        }
+
+        if let refusalReason {
+            if dropWritesOnRefusal {
+                self.pendingWrites.finalizeAllFramesAsFailed()
+            }
+            throw NetworkError(streamStateViolation: refusalReason, operation: "flush")
+        }
+
+        guard let id = self.id else {
+            self.pendingWrites.finalizeAllFramesAsFailed()
+            throw NetworkError(streamStateViolation: "the stream has no ID", operation: "flush")
+        }
+
+        var outgoing = self.pendingWrites.drainArray()
+        outgoing.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+            if let bytes = frame.bytes {
+                stateMachine.write(bytes, to: id, fin: false)
+            }
+            frame.finalize(success: true)
+            return .removeFrameAndContinue
+        }
+        if carriesFin {
+            stateMachine.finish(id)
+        }
+    }
+
+    /// Resets the send side. See ``sendResetStream(code:in:)``.
+    mutating func sendResetStream<Consumer: QUICStreamConsumer & ~Copyable>(
+        code: QUICApplicationErrorCode,
+        on stateMachine: StateMachineQUICConnection<Consumer>
+    ) {
+        let action: QUICStreamStateMachine.LocalResetAction
+        do {
+            action = try self.state.localReset(applicationErrorCode: code)
+        } catch {
+            return
+        }
+        switch action {
+        case .sendReset:
+            self.pendingWrites.finalizeAllFramesAsFailed()
+            if let id = self.id {
+                stateMachine.resetStream(id, code: code)
+            }
+        case .ignore(.alreadyFinished):
+            ()
+        case .ignore(.alreadyReset):
+            ()
+        }
+    }
+
+    /// Closes the receive side. See ``sendStopSending(code:in:)``.
+    mutating func sendStopSending<Consumer: QUICStreamConsumer & ~Copyable>(
+        code: QUICApplicationErrorCode,
+        on stateMachine: StateMachineQUICConnection<Consumer>
+    ) {
+        let action: QUICStreamStateMachine.CloseReadSideAction
+        do {
+            action = try self.state.closeReadSide()
+        } catch {
+            return
+        }
+        switch action {
+        case .markReadClosed:
+            self.undeliveredReads.finalizeAllFramesAsFailed()
+            self.finPending = false
+            if let id = self.id {
+                stateMachine.stopSending(id, code: code)
+            }
+        case .ignoreAlreadyClosed:
+            ()
+        case .deliverPeerResetError:
+            ()
+        }
+    }
+
+    /// Records the peer's STOP\_SENDING for a stream whose stack already answered it with
+    /// RESET\_STREAM.
+    mutating func receiveStopSendingAnsweredByStack(code: QUICApplicationErrorCode) {
+        do {
+            switch try self.state.receiveStopSending(applicationErrorCode: code) {
+            case .sendReset:
+                self.pendingWrites.finalizeAllFramesAsFailed()
+            case .sendResetAndCloseStream:
+                self.pendingWrites.finalizeAllFramesAsFailed()
+            case .ignore:
+                ()
+            }
+        } catch {
+            ()
+        }
+    }
+
+    /// Tears the stream down. Whatever direction is still open is aborted in the state machine.
+    mutating func close<Consumer: QUICStreamConsumer & ~Copyable>(
+        on stateMachine: StateMachineQUICConnection<Consumer>,
+        id: QUICStreamID
+    ) {
+        let sendOpen = !self.state.isSendFinished
+        let receiveOpen = !self.state.isReceiveClosed
+        switch self.state.close(reason: .clean) {
+        case .close:
+            ()
+        case .ignoreAlreadyClosed:
+            ()
+        }
+        if sendOpen {
+            stateMachine.resetStream(id, code: QUICApplicationErrorCode(0)!)
+        }
+        if receiveOpen {
+            stateMachine.stopSending(id, code: QUICApplicationErrorCode(0)!)
+        }
+        self.abandonLocally()
+        self.finPending = false
+        self.coalescedBytes = []
+    }
+}
+
 #if DEBUG
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {

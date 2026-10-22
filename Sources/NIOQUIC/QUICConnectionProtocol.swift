@@ -93,6 +93,7 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     /// (statically dispatched) or an existential test conformance.
     enum Connection {
         case live(SwiftNetworkQUICConnection<Consumer>)
+        case stateMachine(StateMachineQUICConnection<Consumer>)
         case test(any QUICConnectionProtocol)
 
         func withLiveOnly(
@@ -107,7 +108,7 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
                 } catch {
                     promise?.fail(error)
                 }
-            case .test:
+            case .stateMachine, .test:
                 promise?.fail(ChannelError.operationUnsupported)
             }
         }
@@ -120,6 +121,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.localAddress
+        case .stateMachine(let connection):
+            connection.localAddress
         case .test(let connection):
             connection.localAddress
         }
@@ -128,6 +131,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     var remoteAddress: SendableAddress {
         switch self {
         case .live(let connection):
+            connection.remoteAddress
+        case .stateMachine(let connection):
             connection.remoteAddress
         case .test(let connection):
             connection.remoteAddress
@@ -139,6 +144,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.receivePacket(envelope)
+        case .stateMachine(let connection):
+            connection.receivePacket(envelope)
         case .test(let connection):
             connection.receivePacket(envelope)
         }
@@ -147,6 +154,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     func receivePacketsComplete() {
         switch self {
         case .live(let connection):
+            connection.receivePacketsComplete()
+        case .stateMachine(let connection):
             connection.receivePacketsComplete()
         case .test(let connection):
             connection.receivePacketsComplete()
@@ -157,6 +166,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.drainPacketsToSend(to: transport)
+        case .stateMachine(let connection):
+            connection.drainPacketsToSend(to: transport)
         case .test(let connection):
             connection.drainPacketsToSend(to: transport)
         }
@@ -165,6 +176,12 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     func close(isApplicationClose: Bool, errorCode: Int64, reason: String) -> Bool {
         switch self {
         case .live(let connection):
+            return connection.close(
+                isApplicationClose: isApplicationClose,
+                errorCode: errorCode,
+                reason: reason
+            )
+        case .stateMachine(let connection):
             return connection.close(
                 isApplicationClose: isApplicationClose,
                 errorCode: errorCode,
@@ -183,6 +200,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.closeAllStreams()
+        case .stateMachine(let connection):
+            connection.closeAllStreams()
         case .test(let connection):
             connection.closeAllStreams()
         }
@@ -191,6 +210,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     func writeDatagram(_ datagram: ByteBuffer) -> Bool {
         switch self {
         case .live(let connection):
+            connection.writeDatagram(datagram)
+        case .stateMachine(let connection):
             connection.writeDatagram(datagram)
         case .test(let connection):
             connection.writeDatagram(datagram)
@@ -201,6 +222,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.flushDatagrams()
+        case .stateMachine(let connection):
+            connection.flushDatagrams()
         case .test(let connection):
             connection.flushDatagrams()
         }
@@ -210,6 +233,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         switch self {
         case .live(let connection):
             connection.quiesceStreams()
+        case .stateMachine(let connection):
+            connection.quiesceStreams()
         case .test(let connection):
             connection.quiesceStreams()
         }
@@ -218,6 +243,8 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     func dropChannelReferences() {
         switch self {
         case .live(let connection):
+            connection.dropChannelReferences()
+        case .stateMachine(let connection):
             connection.dropChannelReferences()
         case .test:
             ()  // Test connections don't retain the channel.
