@@ -63,6 +63,11 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
     /// The underlying SwiftNetwork-backed QUIC connection.
     private let _connection: Connection
 
+    /// The implementation that drives the connection. Safe from any thread: `_connection` is immutable.
+    var driver: QUICConnectionDriver? {
+        self._connection.driver
+    }
+
     /// A registrar for connection IDs.
     private let _registrar: ConnectionIDRegistrar
 

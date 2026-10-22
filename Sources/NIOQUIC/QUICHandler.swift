@@ -132,6 +132,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private var authenticator: Authenticator?
     /// Makes a consumer for a given connection, `nil` if stream channels are used.
     private let makeConsumer: ((QUICStreamConnection<Consumer>) -> Consumer)?
+    /// The implementation that drives new consumer connections. Set it before the first
+    /// connection is created.
+    var connectionDriver: QUICConnectionDriver
 
     private func nextConnectionHandle() -> ConnectionHandle {
         let handle = self.connectionHandle
@@ -175,6 +178,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.connectionHandle = .initial
         self.connectionRegistry = ConnectionRegistry()
         self.makeConsumer = makeConsumer
+        self.connectionDriver = .default(for: quicConfiguration.role)
         self.connectionAdmissionController = makeConnectionAdmissionController(
             for: connectionLimits,
             logger: logger,
@@ -260,7 +264,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             }()
             let handle = self.nextConnectionHandle()
             let channel: QUICConnectionChannel<Consumer>
-            if self.makeConsumer != nil && QUICDriverSelection.usesStateMachine {
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine {
                 let connection = try StateMachineQUICConnection<Consumer>.client(
                     configuration: self.quicConfiguration,
                     sourceConnectionID: sourceConnectionID,
@@ -983,7 +987,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         )
         let quicConnection: AcceptedConnection
         do {
-            if self.makeConsumer != nil && QUICDriverSelection.usesStateMachine {
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine {
                 quicConnection = .stateMachine(
                     try StateMachineQUICConnection<Consumer>.server(
                         configuration: configuration,
@@ -1410,14 +1414,33 @@ private func makeConnectionAdmissionController(
     }
 }
 
-/// Selects how connections are driven.
+/// The implementation that drives a connection.
 @available(anyAppleOS 26, *)
-enum QUICDriverSelection {
-    /// Whether connections that serve a stream consumer are driven by SwiftNetwork's
-    /// `QUICConnectionCore` directly, instead of the SwiftNetwork framework. Enabled by setting the
-    /// `NIOQUIC_DRIVER` environment variable to `state-machine`.
-    static let usesStateMachine: Bool = {
-        guard let value = getenv("NIOQUIC_DRIVER") else { return false }
-        return String(cString: value) == "state-machine"
+enum QUICConnectionDriver: Hashable, Sendable {
+    /// The SwiftNetwork framework's `QUICConnection`.
+    case swiftNetwork
+    /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections that serve a stream
+    /// consumer can use it; the others fall back to ``swiftNetwork``.
+    case stateMachine
+
+    /// The default for a role, from the `NIOQUIC_DRIVER` environment variable: `state-machine`
+    /// selects ``stateMachine`` for both roles, `state-machine-server` and `state-machine-client`
+    /// for one role only.
+    static func `default`(for role: Role) -> Self {
+        switch Self.setting {
+        case "state-machine":
+            return .stateMachine
+        case "state-machine-server":
+            return role == .server ? .stateMachine : .swiftNetwork
+        case "state-machine-client":
+            return role == .client ? .stateMachine : .swiftNetwork
+        default:
+            return .swiftNetwork
+        }
+    }
+
+    private static let setting: String? = {
+        guard let value = getenv("NIOQUIC_DRIVER") else { return nil }
+        return String(cString: value)
     }()
 }

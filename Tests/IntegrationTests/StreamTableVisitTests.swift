@@ -19,7 +19,7 @@ import Testing
 
 @testable import NIOQUIC
 
-@Suite(.timeLimit(.minutes(5)))
+@Suite(.timeLimit(.minutes(1)))
 struct StreamTableVisitTests {
     @available(anyAppleOS 26, *)
     struct SkipFirstDrainConsumer: QUICStreamConsumer {
@@ -53,13 +53,14 @@ struct StreamTableVisitTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func unpulledStreamIsPresentedAgainWithItsEvents() async throws {
+    @Test(arguments: Drivers.all)
+    func unpulledStreamIsPresentedAgainWithItsEvents(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
         let skipped = makePromise(of: Void.self, timeout: .seconds(5))
 
         try await withConsumerPair(
+            drivers: drivers,
             client: SkipFirstDrainConsumer(recording: recording, skipped: skipped),
             server: EchoConsumer(failures: failures)
         ) { pair in
@@ -93,12 +94,13 @@ struct StreamTableVisitTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func finishHandsBackTheStateAndInvalidatesTheHandle() async throws {
+    @Test(arguments: Drivers.all)
+    func finishHandsBackTheStateAndInvalidatesTheHandle(drivers: Drivers) async throws {
         let statePromise = makePromise(of: (ByteBuffer, QUICStreamHandle).self, timeout: .seconds(5))
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: CallbackConsumer(makeState: { ByteBuffer() }) { visit in
                 var visit = visit
 
@@ -145,12 +147,13 @@ struct StreamTableVisitTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func streamCanBeOpenedFromInsideAVisit() async throws {
+    @Test(arguments: Drivers.all)
+    func streamCanBeOpenedFromInsideAVisit(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: OpeningConsumer(
                 type: .clientInitiatedBidirectional,
                 payload: ByteBuffer(string: "opened from inside a visit"),
@@ -177,12 +180,13 @@ struct StreamTableVisitTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func writingFromOffTheEventLoopReachesThePeer() async throws {
+    @Test(arguments: Drivers.all)
+    func writingFromOffTheEventLoopReachesThePeer(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(failures: failures)
         ) { pair in

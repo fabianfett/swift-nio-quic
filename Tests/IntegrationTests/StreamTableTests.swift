@@ -19,11 +19,11 @@ import Testing
 
 @testable import NIOQUIC
 
-@Suite(.timeLimit(.minutes(5)))
+@Suite(.timeLimit(.minutes(1)))
 struct StreamTableTests {
     @available(anyAppleOS 26, *)
-    @Test
-    func testHTTP09Requests() async throws {
+    @Test(arguments: Drivers.all)
+    func testHTTP09Requests(drivers: Drivers) async throws {
         let requestCount = 8
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
@@ -31,6 +31,7 @@ struct StreamTableTests {
         let payloads = (0..<requestCount).map { ByteBuffer(string: "GET /quic-\($0)") }
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(failures: failures)
         ) { pair in
@@ -56,14 +57,56 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testManyHTTP09RequestStreams() async throws {
+    @Test(arguments: Drivers.all)
+    func testWriterResumesWhenThePeerRaisesItsFlowControlLimit(drivers: Drivers) async throws {
+        // The SwiftNetwork driver never reports `.writable` to a consumer, so a writer that honours
+        // `writableBytes` stalls until the idle timeout.
+        try await withKnownIssue("SwiftNetwork-driven consumers never see .writable") {
+            try await self.writerResumesWhenThePeerRaisesItsFlowControlLimit(drivers: drivers)
+        } when: {
+            drivers.server == .swiftNetwork
+        }
+    }
+
+    @available(anyAppleOS 26, *)
+    private func writerResumesWhenThePeerRaisesItsFlowControlLimit(drivers: Drivers) async throws {
+        // Ten windows' worth, so the server must wait for credit several times.
+        let window = 16 * 1024
+        let size = 10 * window
+        let resumed = NIOLockedValueBox(0)
+        let failures = NIOLockedValueBox<[String]>([])
+        let recording = StreamRecording()
+
+        try await withConsumerPair(
+            drivers: drivers,
+            maxIdleTimeout: .seconds(2),
+            initialMaxStreamData: window,
+            client: RecordConsumer(recording: recording),
+            server: WindowedSenderConsumer(size: size, resumedAfterBlocking: resumed, failures: failures)
+        ) { pair in
+            let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /big"), fin: true)
+            let visits = await recording.visits(untilClosedStreams: 1)
+            let response = visits.filter { $0.handle == handle }.last?.bytesReadSoFar ?? ByteBuffer()
+
+            #expect(response.readableBytes == size)
+            let expected = (0..<size).map(WindowedSenderConsumer.byte(at:))
+            #expect(response.readableBytesView.elementsEqual(expected))
+        }
+
+        #expect(failures.withLockedValue { $0 }.isEmpty)
+        #expect(resumed.withLockedValue { $0 } > 0, "the server never had to wait for credit")
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test(arguments: Drivers.all)
+    func testManyHTTP09RequestStreams(drivers: Drivers) async throws {
         let streamCount = 2000
         let request = ByteBuffer(string: "GET /quic")
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RequestOnOpenConsumer(request: request, recording: recording, failures: failures),
             server: EchoConsumer(failures: failures)
         ) { pair in
@@ -84,8 +127,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testHTTP09Streaming() async throws {
+    @Test(arguments: Drivers.all)
+    func testHTTP09Streaming(drivers: Drivers) async throws {
         let requestCount = 4
         let chunkSize = 1024 * 1024 / 10
         let chunkCount = 10
@@ -95,6 +138,7 @@ struct StreamTableTests {
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: StreamingConsumer(chunkSize: chunkSize, chunkCount: chunkCount, failures: failures)
         ) { pair in
@@ -113,8 +157,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testHTTP09ManyStreamsStreaming() async throws {
+    @Test(arguments: Drivers.all)
+    func testHTTP09ManyStreamsStreaming(drivers: Drivers) async throws {
         let requestCount = 2000
         let chunkSize = 32
         let chunkCount = 5
@@ -124,6 +168,7 @@ struct StreamTableTests {
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             initialMaxStreamsBidi: requestCount,
             client: RecordConsumer(recording: recording),
             server: StreamingConsumer(chunkSize: chunkSize, chunkCount: chunkCount, failures: failures)
@@ -143,8 +188,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testConnectionError() async throws {
+    @Test(arguments: Drivers.all)
+    func testConnectionError(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
         let captureConnection: @Sendable (QUICStreamConnection<EchoConsumer>) -> Void = { connection in
@@ -152,6 +197,7 @@ struct StreamTableTests {
         }
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(),
             onServerConnection: captureConnection
@@ -181,12 +227,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testResetStream() async throws {
+    @Test(arguments: Drivers.all)
+    func testResetStream(drivers: Drivers) async throws {
         let code = QUICApplicationErrorCode(42)!
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -209,11 +256,12 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testResetStreamRaceCondition() async throws {
+    @Test(arguments: Drivers.all)
+    func testResetStreamRaceCondition(drivers: Drivers) async throws {
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -237,12 +285,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testStopSending() async throws {
+    @Test(arguments: Drivers.all)
+    func testStopSending(drivers: Drivers) async throws {
         let code = QUICApplicationErrorCode(10)!
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -265,12 +314,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testClientInitiatedUnidirectionalStreamStopSending() async throws {
+    @Test(arguments: Drivers.all)
+    func testClientInitiatedUnidirectionalStreamStopSending(drivers: Drivers) async throws {
         let code = QUICApplicationErrorCode(10)!
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -294,13 +344,14 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testServerInitiatedUnidirectionalStreamStopSending() async throws {
+    @Test(arguments: Drivers.all)
+    func testServerInitiatedUnidirectionalStreamStopSending(drivers: Drivers) async throws {
         let code = QUICApplicationErrorCode(10)!
         let serverRecording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
                 visit.withStream { stream, hasStopped in
@@ -336,8 +387,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testStopSendingOnlyHalfClosesInput() async throws {
+    @Test(arguments: Drivers.all)
+    func testStopSendingOnlyHalfClosesInput(drivers: Drivers) async throws {
         let serverRecording = StreamRecording()
 
         var buffer = ByteBuffer(string: "GET /quic")
@@ -345,6 +396,7 @@ struct StreamTableTests {
         let expected = buffer
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: StreamRecording()),
             server: RecordConsumer(recording: serverRecording)
         ) { pair in
@@ -369,12 +421,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testResetStreamOnlyHalfClosesOutput() async throws {
+    @Test(arguments: Drivers.all)
+    func testResetStreamOnlyHalfClosesOutput(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -409,12 +462,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testReceivedStopSendingHalfClosesOutput() async throws {
+    @Test(arguments: Drivers.all)
+    func testReceivedStopSendingHalfClosesOutput(drivers: Drivers) async throws {
         let code = QUICApplicationErrorCode(10)!
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: CallbackConsumer(makeState: { false }) { visit in
                 var visit = visit
@@ -441,8 +495,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testShutdownForcefully() async throws {
+    @Test(arguments: Drivers.all)
+    func testShutdownForcefully(drivers: Drivers) async throws {
         final class CountedState {
             let counter: Counter
 
@@ -460,6 +514,7 @@ struct StreamTableTests {
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: CallbackConsumer(makeState: { CountedState(counter: counter) }) { visit in
                 var visit = visit
                 recording.record(StreamRecording.Visit(&visit))
@@ -500,8 +555,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func testCloseInput() async throws {
+    @Test(arguments: Drivers.all)
+    func testCloseInput(drivers: Drivers) async throws {
         /// The server's per-stream state: the request so far, and whether it has responded.
         struct Request {
             var bytes = ByteBuffer()
@@ -516,6 +571,7 @@ struct StreamTableTests {
         let serverSawFIN = NIOLockedValueBox(false)
 
         try await withConsumerPair(
+            drivers: drivers,
             // Reads the response, then closes its output: the server only finishes after that FIN.
             client: CallbackConsumer(makeState: { ByteBuffer() }) { visit in
                 var visit = visit
@@ -591,8 +647,8 @@ struct StreamTableTests {
     // MARK: - Table specific tests
 
     @available(anyAppleOS 26, *)
-    @Test
-    func manyConcurrentStreamsKeepTheirOwnState() async throws {
+    @Test(arguments: Drivers.all)
+    func manyConcurrentStreamsKeepTheirOwnState(drivers: Drivers) async throws {
         let streamCount = 2000
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
@@ -600,6 +656,7 @@ struct StreamTableTests {
         let payloads = (0..<streamCount).map { ByteBuffer(string: "request-\($0)") }
 
         try await withConsumerPair(
+            drivers: drivers,
             initialMaxStreamsBidi: streamCount,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(failures: failures)
@@ -618,12 +675,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func inboundStreamReachesTheConsumer() async throws {
+    @Test(arguments: Drivers.all)
+    func inboundStreamReachesTheConsumer(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: OpeningConsumer(
                 type: .serverInitiatedBidirectional,
@@ -656,12 +714,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func unidirectionalStreamIsSendOnlyAtTheOpener() async throws {
+    @Test(arguments: Drivers.all)
+    func unidirectionalStreamIsSendOnlyAtTheOpener(drivers: Drivers) async throws {
         let clientRecording = StreamRecording()
         let serverRecording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: clientRecording),
             server: RecordConsumer(recording: serverRecording)
         ) { pair in
@@ -688,9 +747,10 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func clientCannotOpenAServerInitiatedStream() async throws {
+    @Test(arguments: Drivers.all)
+    func clientCannotOpenAServerInitiatedStream(drivers: Drivers) async throws {
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: StreamRecording()),
             server: EchoConsumer()
         ) { pair in
@@ -709,12 +769,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func largePayloadArrives() async throws {
+    @Test(arguments: Drivers.all)
+    func largePayloadArrives(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(failures: failures)
         ) { pair in
@@ -732,9 +793,10 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func closedConnectionCannotOpenStreams() async throws {
+    @Test(arguments: Drivers.all)
+    func closedConnectionCannotOpenStreams(drivers: Drivers) async throws {
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: StreamRecording()),
             server: EchoConsumer()
         ) { pair in
@@ -755,11 +817,12 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func forceCloseClosesEveryStream() async throws {
+    @Test(arguments: Drivers.all)
+    func forceCloseClosesEveryStream(drivers: Drivers) async throws {
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer()
         ) { pair in
@@ -791,12 +854,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func creditBlockedStreamIsOpenedOnlyOnceItHasAnID() async throws {
+    @Test(arguments: Drivers.all)
+    func creditBlockedStreamIsOpenedOnlyOnceItHasAnID(drivers: Drivers) async throws {
         let recording = StreamRecording()
         let failures = NIOLockedValueBox<[String]>([])
 
         try await withConsumerPair(
+            drivers: drivers,
             initialMaxStreamsBidi: 2,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(failures: failures)
@@ -857,12 +921,13 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func idleTimeoutClosesEveryStream() async throws {
+    @Test(arguments: Drivers.all)
+    func idleTimeoutClosesEveryStream(drivers: Drivers) async throws {
         let streamCount = 2
         let recording = StreamRecording()
 
         try await withConsumerPair(
+            drivers: drivers,
             maxIdleTimeout: .seconds(1),
             client: RecordConsumer(recording: recording),
             server: EchoConsumer()
@@ -884,8 +949,8 @@ struct StreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func localConnectionCloseReachesThePeersConsumer() async throws {
+    @Test(arguments: Drivers.all)
+    func localConnectionCloseReachesThePeersConsumer(drivers: Drivers) async throws {
         /// Records every visit and reports the one which reads the request.
         struct RequestSignallingConsumer: QUICStreamConsumer {
             typealias StreamState = ByteBuffer
@@ -916,6 +981,7 @@ struct StreamTableTests {
         let serverReadRequest = makePromise(of: Void.self, timeout: .seconds(10))
 
         try await withConsumerPair(
+            drivers: drivers,
             client: RecordConsumer(recording: StreamRecording()),
             server: RequestSignallingConsumer(
                 request: request,

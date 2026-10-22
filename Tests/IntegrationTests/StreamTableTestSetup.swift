@@ -22,6 +22,45 @@ import Testing
 
 @testable import NIOQUIC
 
+// MARK: - Drivers
+
+/// The implementations driving the client and the server connection of a pair.
+///
+/// Every stream table test runs against each combination, so the state machine driver is tested
+/// against itself and against the SwiftNetwork framework, in both roles.
+struct Drivers: Sendable, CustomTestStringConvertible {
+    enum Driver: Sendable {
+        case swiftNetwork
+        case stateMachine
+    }
+
+    var client: Driver
+    var server: Driver
+
+    static let all: [Drivers] = [
+        Drivers(client: .swiftNetwork, server: .swiftNetwork),
+        Drivers(client: .stateMachine, server: .stateMachine),
+        Drivers(client: .stateMachine, server: .swiftNetwork),
+        Drivers(client: .swiftNetwork, server: .stateMachine),
+    ]
+
+    var testDescription: String {
+        "client: \(self.client), server: \(self.server)"
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension QUICConnectionDriver {
+    init(_ driver: Drivers.Driver) {
+        switch driver {
+        case .swiftNetwork:
+            self = .swiftNetwork
+        case .stateMachine:
+            self = .stateMachine
+        }
+    }
+}
+
 // MARK: - Pair
 
 @available(anyAppleOS 26, *)
@@ -29,8 +68,19 @@ struct ConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>: Sen
     var clientConnection: QUICStreamConnection<Client>
     var clientChannel: any Channel
     var serverChannel: any Channel
+    var drivers: Drivers
+    /// The drivers of the server connections accepted so far.
+    var serverConnectionDrivers: NIOLockedValueBox<[QUICConnectionDriver?]>
 
     func close() async throws {
+        // A test that passes on the wrong driver proves nothing about the one it was meant for.
+        #expect(self.clientConnection.driver == QUICConnectionDriver(self.drivers.client))
+        #expect(
+            self.serverConnectionDrivers.withLockedValue { $0 }.allSatisfy {
+                $0 == QUICConnectionDriver(self.drivers.server)
+            }
+        )
+
         do {
             try await self.serverChannel.close()
         } catch {
@@ -104,22 +154,26 @@ func withConsumerPair<
     Server: QUICStreamConsumer & Sendable,
     Result
 >(
+    drivers: Drivers,
     eventLoopGroup: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
     host: String = "127.0.0.1",
     maxIdleTimeout: Duration = .seconds(30),
     initialMaxStreamsBidi: Int = 8,
     initialMaxStreamsUni: Int = 8,
+    initialMaxStreamData: Int? = nil,
     client: Client,
     server: Server,
     onServerConnection: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Void = { _ in },
     _ body: (_ pair: ConsumerPair<Client, Server>) async throws -> Result
 ) async throws -> Result {
     let pair = try await makeConsumerPair(
+        drivers: drivers,
         eventLoopGroup: eventLoopGroup,
         host: host,
         maxIdleTimeout: maxIdleTimeout,
         initialMaxStreamsBidi: initialMaxStreamsBidi,
         initialMaxStreamsUni: initialMaxStreamsUni,
+        initialMaxStreamData: initialMaxStreamData,
         makeClientConsumer: { _ in client },
         makeServerConsumer: { connection in
             onServerConnection(connection)
@@ -139,14 +193,17 @@ func withConsumerPair<
 
 @available(anyAppleOS 26, *)
 func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
+    drivers: Drivers,
     eventLoopGroup: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
     host: String = "127.0.0.1",
     maxIdleTimeout: Duration = .seconds(30),
     initialMaxStreamsBidi: Int = 8,
     initialMaxStreamsUni: Int = 8,
+    initialMaxStreamData: Int? = nil,
     makeClientConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Client>) -> Client,
     makeServerConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Server
 ) async throws -> ConsumerPair<Client, Server> {
+    let serverConnectionDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
     let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
     let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
 
@@ -162,6 +219,11 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
         configuration.maxIdleTimeout = maxIdleTimeout
         configuration.initialMaxStreamsBidi = initialMaxStreamsBidi
         configuration.initialMaxStreamsUni = initialMaxStreamsUni
+        if let initialMaxStreamData {
+            configuration.initialMaxStreamDataBidiLocal = initialMaxStreamData
+            configuration.initialMaxStreamDataBidiRemote = initialMaxStreamData
+            configuration.initialMaxStreamDataUni = initialMaxStreamData
+        }
         return configuration
     }()
 
@@ -173,6 +235,11 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
         configuration.maxIdleTimeout = maxIdleTimeout
         configuration.initialMaxStreamsBidi = initialMaxStreamsBidi
         configuration.initialMaxStreamsUni = initialMaxStreamsUni
+        if let initialMaxStreamData {
+            configuration.initialMaxStreamDataBidiLocal = initialMaxStreamData
+            configuration.initialMaxStreamDataBidiRemote = initialMaxStreamData
+            configuration.initialMaxStreamDataUni = initialMaxStreamData
+        }
         return configuration
     }()
 
@@ -186,8 +253,12 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
                 asyncVerifier: nil,
                 authenticator: nil,
                 logger: Logger(label: "Server"),
-                makeConsumer: makeServerConsumer
+                makeConsumer: { connection in
+                    serverConnectionDrivers.withLockedValue { $0.append(connection.driver) }
+                    return makeServerConsumer(connection)
+                }
             )
+            handler.connectionDriver = QUICConnectionDriver(drivers.server)
             try channel.pipeline.syncOperations.addHandler(handler)
             return channel
         }
@@ -210,6 +281,7 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
                     logger: Logger(label: "Client"),
                     makeConsumer: makeClientConsumer
                 )
+                handler.connectionDriver = QUICConnectionDriver(drivers.client)
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -232,7 +304,9 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
         return ConsumerPair(
             clientConnection: clientConnection,
             clientChannel: clientChannel,
-            serverChannel: serverChannel
+            serverChannel: serverChannel,
+            drivers: drivers,
+            serverConnectionDrivers: serverConnectionDrivers
         )
     } catch {
         try? await serverChannel.close()
@@ -657,3 +731,69 @@ struct CallbackConsumer<State>: QUICStreamConsumer, Sendable {
         }
     }
 }
+
+/// Answers a request with `size` bytes, never writing past ``QUICStream/writableBytes``. Once the
+/// peer's flow control window is used up it has to wait for ``QUICStreamEvents/writable``.
+@available(anyAppleOS 26, *)
+struct WindowedSenderConsumer: QUICStreamConsumer {
+    struct StreamState {
+        var request = ByteBuffer()
+        var responding = false
+        var sent = 0
+    }
+
+    let size: Int
+    /// How often a visit resumed writing after `writableBytes` had dropped to zero.
+    let resumedAfterBlocking: NIOLockedValueBox<Int>
+    let failures: NIOLockedValueBox<[String]>
+
+    static func byte(at offset: Int) -> UInt8 {
+        UInt8(truncatingIfNeeded: offset &* 7 &+ offset >> 9)
+    }
+
+    func makeStreamState(_ stream: inout QUICStream<Self>) -> StreamState {
+        StreamState()
+    }
+
+    mutating func processStreams(_ streams: inout QUICStreamIterator<Self>) {
+        let size = self.size
+        let resumedAfterBlocking = self.resumedAfterBlocking
+        let failures = self.failures
+
+        while var visit = streams.next() {
+            let events = visit.events
+            visit.withStream { stream, state in
+                if events.contains(.readable) {
+                    reading: while true {
+                        switch stream.read(into: &state.request) {
+                        case .read:
+                            ()
+                        case .nothingAvailable:
+                            break reading
+                        case .endOfStream:
+                            state.responding = true
+                            break reading
+                        }
+                    }
+                }
+                guard state.responding, state.sent < size, stream.isSendOpen else { return }
+                let writable = stream.writableBytes
+                guard writable > 0 else { return }
+                if events.contains(.writable) && state.sent > 0 {
+                    resumedAfterBlocking.withLockedValue { $0 += 1 }
+                }
+                let count = min(writable, size - state.sent)
+                var chunk = ByteBuffer()
+                chunk.writeBytes((state.sent..<(state.sent + count)).lazy.map(Self.byte(at:)))
+                stream.write(chunk)
+                state.sent += count
+                do {
+                    try stream.flush(fin: state.sent == size)
+                } catch {
+                    failures.withLockedValue { $0.append("flush failed: \(error)") }
+                }
+            }
+        }
+    }
+}
+

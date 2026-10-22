@@ -96,6 +96,18 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
         case stateMachine(StateMachineQUICConnection<Consumer>)
         case test(any QUICConnectionProtocol)
 
+        /// The implementation that drives the connection, `nil` for a test conformance.
+        var driver: QUICConnectionDriver? {
+            switch self {
+            case .live:
+                return .swiftNetwork
+            case .stateMachine:
+                return .stateMachine
+            case .test:
+                return nil
+            }
+        }
+
         func withLiveOnly(
             promise: EventLoopPromise<Void>? = nil,
             execute body: (SwiftNetworkQUICConnection<Consumer>) throws -> Void
