@@ -50,8 +50,8 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.0"),
         .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.1")),
         .package(
-            url: "https://github.com/apple/swift-network-evolution",
-            .upToNextMinor(from: "0.5.0"),
+            url: "https://github.com/fabianfett/swift-network-evolution.git",
+            revision: "cd6339a4b29b9770e294327f0ebbf59180885012",
             traits: swiftNetworkTraits
         ),
         .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.1.0")),
