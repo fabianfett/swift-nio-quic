@@ -561,7 +561,6 @@ struct QUICStreamTableTests {
             _ = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
         }
         #expect(table.count == 0)
-        #expect(table._pendingAttachIdentifier.isNone)
     }
 
     // MARK: - Stack events
@@ -573,12 +572,13 @@ struct QUICStreamTableTests {
         var consumer = RecordingConsumer()
         let handle = table.insertSlot(id: 0, state: nil)
 
-        // The stack resolves a stream's events by the identifier of its flow. There's no flow here,
-        // so key the stream's own registered identifier in its place.
+        // The stack delivers a stream's events to the linkage the stream attached with. There's no
+        // flow here, so attach the stream to an empty linkage, which ignores the stream's calls.
         let identifier = table.registerIdentifier(for: handle)
-        table._byFlowIdentifier[identifier] = handle
+        table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage())
+        let upperLinkage = QUICStreamUpperLinkage(table: table, handle: handle, identifier: identifier)
         table.withEventContext { eventContext in
-            table.handleOutboundRoomAvailableEvent(for: identifier, in: &eventContext)
+            upperLinkage.handleOutboundRoomAvailableEvent(for: InstanceIdentifier(), in: &eventContext)
         }
 
         table.drain(into: &consumer)
@@ -587,6 +587,155 @@ struct QUICStreamTableTests {
 
         // The slot registered with the stack, so it must be removed before the table is released.
         table.closeAll(error: nil, disconnect: nil, into: &consumer)
+    }
+
+    /// A stream's linkage outlives its slot: the stack holds it until the flow detaches and its
+    /// queued events run. An event through it must then not reach the stream that took the slot over.
+    @available(anyAppleOS 26, *)
+    @Test
+    func eventsThroughAStaleLinkageAreDropped() {
+        let table = Self.makeRecordingTable()
+        var consumer = RecordingConsumer()
+        let stale = table.insertSlot(id: 0, state: nil)
+        let staleIdentifier = table.registerIdentifier(for: stale)
+        table.attach(stale, identifier: staleIdentifier, linkage: BaseOutboundStreamLinkage())
+        let staleLinkage = QUICStreamUpperLinkage(table: table, handle: stale, identifier: staleIdentifier)
+        table.vacateSlot(stale)
+
+        let live = table.insertSlot(id: 4, state: nil)
+        #expect(stale.index == live.index)
+        let liveIdentifier = table.registerIdentifier(for: live)
+        table.attach(live, identifier: liveIdentifier, linkage: BaseOutboundStreamLinkage())
+
+        table.withEventContext { eventContext in
+            staleLinkage.handleOutboundRoomAvailableEvent(for: InstanceIdentifier(), in: &eventContext)
+        }
+        #expect(table.events(for: live) == [])
+        #expect(!table.hasPendingWork)
+
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+    }
+
+    /// Closing a stream disconnects it from its flow, and the stack can deliver the stream's events
+    /// before that call returns. While the table vacates the stream's slot, they must find nothing.
+    @available(anyAppleOS 26, *)
+    @Test
+    func eventsDeliveredWhileAStreamIsVacatedAreDropped() {
+        let table = Self.makeRecordingTable()
+        var consumer = RecordingConsumer()
+        let handle = table.insertSlot(id: 0, state: nil)
+        let identifier = table.registerIdentifier(for: handle)
+        let lowerLinkage = DisconnectReportingLinkage(context: table.context)
+        table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage(external: lowerLinkage))
+        lowerLinkage.upper = QUICStreamUpperLinkage(table: table, handle: handle, identifier: identifier)
+
+        table.vacateSlot(handle)
+        #expect(lowerLinkage.reportedDisconnect)
+        #expect(!table.hasPendingWork)
+
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+    }
+}
+
+/// A stream's lower linkage that reports the stream's disconnect back up before the disconnect call
+/// returns, the way the stack can.
+@available(anyAppleOS 26, *)
+private final class DisconnectReportingLinkage: ExternalOutboundStreamLinkage, ProtocolInstance {
+    let context: NetworkContext
+    var identifier: InstanceIdentifier
+    var eventManager: ProtocolEventManager
+
+    /// The stream's upper linkage, until the stack tears this linkage down.
+    var upper: QUICStreamUpperLinkage<RecordingConsumer>?
+
+    private(set) var reportedDisconnect: Bool
+
+    /// Registers with `context`, which acquires the event context: must be called with none held.
+    init(context: NetworkContext) {
+        self.context = context
+        var eventManager = ProtocolEventManager()
+        self.identifier = InstanceIdentifier(context: context, eventManager: &eventManager)
+        self.eventManager = eventManager
+        self.upper = nil
+        self.reportedDisconnect = false
+    }
+
+    func disconnect(
+        error: NetworkError?,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {
+        self.reportedDisconnect = true
+        self.upper?.handleDisconnectedEvent(error: error, for: self.identifier, in: &eventContext)
+    }
+
+    func teardown(in eventContext: inout NetworkContext.EventContext) {
+        self.upper = nil
+        self.unregisterEventManager(in: &eventContext)
+    }
+
+    func protocolIsConnected(in eventContext: inout NetworkContext.EventContext) -> Bool {
+        true
+    }
+
+    func connect(for instance: InstanceIdentifier, in eventContext: inout NetworkContext.EventContext) {}
+
+    func detach(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) throws(NetworkError) {}
+
+    func handleApplicationEvent(
+        event: ApplicationEvent,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) {}
+
+    func getMetadata<P: NetworkProtocol>(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) -> ProtocolMetadata<P>? {
+        nil
+    }
+
+    func getMetrics(
+        requestedNetworkMetric: RequestedNetworkMetrics,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) -> NetworkMetrics? {
+        nil
+    }
+
+    func invokeAttachUpperProtocol(
+        _ upperProtocol: BaseInboundStreamLinkage,
+        remote: Endpoint?,
+        local: Endpoint?,
+        parameters: Parameters?,
+        path: PathProperties?
+    ) throws(NetworkError) {}
+
+    func receiveStreamData(
+        minimumBytes: Int,
+        maximumBytes: Int,
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) throws(NetworkError) -> FrameArray? {
+        nil
+    }
+
+    func getOutboundStreamDataRoomAvailable(
+        for instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) throws(NetworkError) -> Int {
+        0
+    }
+
+    func sendStreamData(
+        _ streamData: consuming FrameArray,
+        from instance: InstanceIdentifier,
+        in eventContext: inout NetworkContext.EventContext
+    ) throws(NetworkError) {
+        streamData.finalizeAllFramesAsFailed()
     }
 }
 
