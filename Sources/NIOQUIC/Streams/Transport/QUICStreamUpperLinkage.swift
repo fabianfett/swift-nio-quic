@@ -25,6 +25,9 @@ import NIOQUICHelpers
 /// run, so an event can arrive after its stream left the table: the table drops it then.
 @available(anyAppleOS 26, *)
 final class QUICStreamUpperLinkage<Consumer: QUICStreamConsumer & ~Copyable> {
+    /// Held strongly. The cycle through the stack ends with the stream: the stack lets go of this
+    /// linkage once the stream's flow detaches, which closing the stream does, and its queued
+    /// events have run.
     let table: QUICStreamTable<Consumer>
 
     /// The stream's slot in the table.

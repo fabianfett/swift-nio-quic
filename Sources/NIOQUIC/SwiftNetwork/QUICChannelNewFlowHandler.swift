@@ -222,8 +222,8 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
     /// Unused: nothing calls this witness on this type, so it only throws `ENOTSUP`.
     ///
     /// `init` attaches this handler to the stream listener with `invokeAttachUpperProtocol`, which
-    /// calls nothing back, and keeps the listener as `lowerProtocol` itself. The stream table, the
-    /// datagram transport and outbound stream handlers attach with
+    /// calls nothing back, and keeps the listener as `lowerProtocol` itself. The stream table's
+    /// linkages, the datagram transport and outbound stream handlers attach with
     /// `invokeAttachUpperProtocolToNewFlow` instead, which hands them the new flow through this
     /// witness, and theirs complete the attach.
     func invokeAttachLowerProtocol(

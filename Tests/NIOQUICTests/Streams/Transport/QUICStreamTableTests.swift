@@ -635,6 +635,25 @@ struct QUICStreamTableTests {
 
         table.closeAll(error: nil, disconnect: nil, into: &consumer)
     }
+
+    /// A consumer may stop pulling, so `closeAll` tears the streams it didn't pull down all at once.
+    /// Events the stack delivers meanwhile must find nothing.
+    @available(anyAppleOS 26, *)
+    @Test
+    func eventsDeliveredWhileAllSlotsAreTornDownAreDropped() {
+        let table = Self.makeRecordingTable()
+        var consumer = RecordingConsumer(pullLimit: 0)
+        let handle = table.insertSlot(id: 0, state: nil)
+        let identifier = table.registerIdentifier(for: handle)
+        let lowerLinkage = DisconnectReportingLinkage(context: table.context)
+        table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage(external: lowerLinkage))
+        lowerLinkage.upper = QUICStreamUpperLinkage(table: table, handle: handle, identifier: identifier)
+
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+        #expect(lowerLinkage.reportedDisconnect)
+        #expect(consumer.sightings.isEmpty)
+        #expect(table.count == 0)
+    }
 }
 
 /// A stream's lower linkage that reports the stream's disconnect back up before the disconnect call

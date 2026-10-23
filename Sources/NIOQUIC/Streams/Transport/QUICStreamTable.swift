@@ -44,8 +44,10 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// Whether the stack's events find no stream any more, because the table is tearing all its
     /// slots down.
     ///
-    /// Set first thing in `removeAllSlots`: `removeAll` has the slots, and closing a stream can
-    /// deliver its events synchronously.
+    /// Set first thing in `removeAllSlots`. Closing a stream there can deliver its events
+    /// synchronously, and resolving one would read `_transportStates` while `removeAll` modifies it,
+    /// an exclusivity violation. Never cleared, so for teardown only: `closeAll` retires the anchor
+    /// right after, and `deinit` is the only other caller.
     private var _ignoresStackEvents: Bool
 
     /// The lower linkage for the stream `open` is currently attaching to the stack.
@@ -56,10 +58,7 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// callback stashes the linkage here once its attach has succeeded, and `open` takes it as soon
     /// as that call returns, so this is `nil` outside an `open`.
     ///
-    /// `@usableFromInline` rather than `private`: it's written from `QUICStreamUpperLinkage.swift`,
-    /// a different file.
-    @usableFromInline
-    @_spi(Essentials) @_spi(ProtocolProvider)
+    /// Not `private`: `QUICStreamUpperLinkage` writes it.
     var _pendingAttachLinkage: BaseOutboundStreamLinkage?
 
     /// Whether there is any pending output that needs to be drained by the connection.
@@ -354,8 +353,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
 /// What the stack's events for a stream do, reported by the stream's `QUICStreamUpperLinkage`.
 ///
-/// Each drops an event that no longer finds its stream attached: the stream left the table, its
-/// slot holds another stream, or the table is tearing all its slots down.
+/// Each drops an event that doesn't find its stream attached: the stream hasn't attached yet or
+/// has left the table, its slot holds another stream, or the table is tearing all its slots down.
 @available(anyAppleOS 26, *)
 extension QUICStreamTable where Consumer: ~Copyable {
     /// The transport state of `handle`'s stream, if the stack's events for it are handled.
