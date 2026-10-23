@@ -941,4 +941,75 @@ struct StreamTableTests {
             #expect(error.isApplication)
         }
     }
+
+    /// Each stream's linkage holds its table, and the stack holds the linkages: closing the
+    /// connections must still release both tables. One stream finishes before the close, and one
+    /// is still open at it.
+    @available(anyAppleOS 26, *)
+    @Test
+    func closingTheConnectionsReleasesTheirStreamTables() async throws {
+        let recording = StreamRecording()
+        let clientTable = ReleaseProbe()
+        let serverTable = ReleaseProbe()
+        let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
+        let captureConnection: @Sendable (QUICStreamConnection<EchoConsumer>) -> Void = { connection in
+            serverConnection.withLockedValue { $0 = connection }
+        }
+
+        try await withConsumerPair(
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer(),
+            onServerConnection: captureConnection
+        ) { pair in
+            _ = try await pair.openClientStream(writing: ByteBuffer(string: "GET /finished"), fin: true)
+            _ = await recording.visits(untilClosedStreams: 1)
+            _ = try await pair.openClientStream(writing: ByteBuffer(string: "GET /open"), fin: false)
+
+            _ = try await pair.clientConnection.withStreams { streams in
+                clientTable.observe(streams._table)
+            }.get()
+            // Taken, so this test doesn't keep the server's connection alive.
+            let server = try #require(serverConnection.withLockedValue { $0.take() })
+            _ = try await server.withStreams { streams in
+                serverTable.observe(streams._table)
+            }.get()
+        }
+
+        // The last references go on later event loop ticks.
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !(clientTable.isReleased && serverTable.isReleased), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(clientTable.isReleased)
+        #expect(serverTable.isReleased)
+    }
+}
+
+/// Tells whether an object has been released, without keeping it alive.
+///
+/// `@unchecked Sendable`: its state is only read and written under `lock`, so the event loop that
+/// observes the object and the test's task that checks on it don't race. The reference is weak on
+/// purpose: a probe that held the object would keep it alive.
+private final class ReleaseProbe: @unchecked Sendable {
+    private let lock: NIOLock
+    private weak var object: AnyObject?
+    private var hasObserved: Bool
+
+    init() {
+        self.lock = NIOLock()
+        self.object = nil
+        self.hasObserved = false
+    }
+
+    func observe(_ object: AnyObject) {
+        self.lock.withLock {
+            self.object = object
+            self.hasObserved = true
+        }
+    }
+
+    /// Whether the observed object has been released: `false` until something was observed.
+    var isReleased: Bool {
+        self.lock.withLock { self.hasObserved && self.object == nil }
+    }
 }
