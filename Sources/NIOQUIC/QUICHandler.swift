@@ -264,7 +264,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             }()
             let handle = self.nextConnectionHandle()
             let channel: QUICConnectionChannel<Consumer>
-            if self.makeConsumer != nil && self.connectionDriver == .stateMachine {
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
+                && QUICConnectionDriver.stateMachineSupports(self.quicConfiguration)
+            {
                 let connection = try StateMachineQUICConnection<Consumer>.client(
                     configuration: self.quicConfiguration,
                     sourceConnectionID: sourceConnectionID,
@@ -987,7 +989,9 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         )
         let quicConnection: AcceptedConnection
         do {
-            if self.makeConsumer != nil && self.connectionDriver == .stateMachine {
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
+                && QUICConnectionDriver.stateMachineSupports(configuration)
+            {
                 quicConnection = .stateMachine(
                     try StateMachineQUICConnection<Consumer>.server(
                         configuration: configuration,
@@ -1420,23 +1424,32 @@ enum QUICConnectionDriver: Hashable, Sendable {
     /// The SwiftNetwork framework's `QUICConnection`.
     case swiftNetwork
     /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections that serve a stream
-    /// consumer can use it; the others fall back to ``swiftNetwork``.
+    /// consumer, with a configuration it ``supports(_:)``, can use it; the others fall back to
+    /// ``swiftNetwork``.
     case stateMachine
 
-    /// The default for a role, from the `NIOQUIC_DRIVER` environment variable: `state-machine`
-    /// selects ``stateMachine`` for both roles, `state-machine-server` and `state-machine-client`
-    /// for one role only.
+    /// The default for a role: ``stateMachine``, unless the `NIOQUIC_DRIVER` environment variable
+    /// says otherwise. `swift-network` selects ``swiftNetwork`` for both roles,
+    /// `state-machine-server` and `state-machine-client` keep the state machine for one role only.
     static func `default`(for role: Role) -> Self {
         switch Self.setting {
-        case "state-machine":
-            return .stateMachine
+        case "swift-network":
+            return .swiftNetwork
         case "state-machine-server":
             return role == .server ? .stateMachine : .swiftNetwork
         case "state-machine-client":
             return role == .client ? .stateMachine : .swiftNetwork
         default:
-            return .swiftNetwork
+            return .stateMachine
         }
+    }
+
+    /// Whether the state machine driver implements everything `configuration` asks for. It doesn't
+    /// send keepalives, Retry or Version Negotiation yet, and writes no key log or qlog.
+    static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
+        configuration.keepAliveInterval == nil && configuration.keyLogPath == nil
+            && configuration.qLogConfiguration == nil && !configuration.sendRetry
+            && !configuration.forceVersionNegotiation
     }
 
     private static let setting: String? = {
