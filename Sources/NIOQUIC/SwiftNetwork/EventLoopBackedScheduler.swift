@@ -56,9 +56,12 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
     /// The connection's queued callouts. The stack acquires the event context itself only inside the
     /// tasks it schedules here, so they run after each one.
     private let callouts: QUICCallouts
+    // The factory for nanoseconds is not inlinable and will not be specialized.
+    // Reduce the cost to the initial initialization.
+    private let oneNanosecond = NetworkDuration.nanoseconds(1)
 
     var now: NetworkClock.Instant {
-        .zero + .nanoseconds(self.eventLoop.now.uptimeNanoseconds)
+        .zero + self.oneNanosecond * Int(self.eventLoop.now.uptimeNanoseconds)
     }
 
     /// NIO has a single clock, so there is no offset between the continuous and absolute clocks.
