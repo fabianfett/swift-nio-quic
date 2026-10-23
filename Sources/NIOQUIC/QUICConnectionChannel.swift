@@ -777,6 +777,14 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         // Avoid re-entering this function.
         self.withoutEnteringDrainOutput {
+            // The live connection and transport directly: going through the two enums looks up their
+            // generic metadata on every drain.
+            if case .live(let connection) = self._connection, case .live(let transport) = self._transport {
+                connection.drainPacketsToSend(to: transport)
+                transport.flush()
+                return
+            }
+
             // Unwrap the transport once so the connection writes every packet to the concrete view.
             switch self._transport {
             case .live(let transport):
