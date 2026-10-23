@@ -183,7 +183,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     private func installAsyncContinuationHandler() {
-        #if canImport(SwiftTLS) && SWIFTTLS_CERTIFICATE_VERIFICATION
+        #if canImport(SwiftTLS)
         let eventLoop = self.eventLoop
         let loopBound = NIOLoopBound(self, eventLoop: eventLoop)
         self.core.setAsyncContinuationHandler { result in
@@ -308,6 +308,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.timer?.cancel()
         self.timer = nil
         self.timerDeadline = nil
+        self.logger.debug("Connection closed", metadata: ["quic.close.reason": "\(reason)"])
         guard !self.reportedClose else { return }
         self.reportedClose = true
         let error: (any Error)?
@@ -384,6 +385,13 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     func close(isApplicationClose: Bool, errorCode: Int64, reason: String) -> Bool {
         guard !self.core.isTerminating else { return false }
+        self.logger.debug(
+            "Closing connection",
+            metadata: [
+                "quic.close.errorCode": "\(errorCode)", "quic.close.isApplication": "\(isApplicationClose)",
+                "quic.close.reason": "\(reason)",
+            ]
+        )
         self.closedLocally = true
         self.core.close(errorCode: UInt64(errorCode), isApplication: isApplicationClose, reason: reason, now: Self.now)
         self.rescheduleTimer()
