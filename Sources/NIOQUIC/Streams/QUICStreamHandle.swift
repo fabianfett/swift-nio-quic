@@ -43,10 +43,10 @@ extension QUICStreamHandle {
     @usableFromInline
     struct Generation: Hashable, Sendable {
         @usableFromInline
-        var rawValue: UIntHalf
+        var rawValue: UInt32
 
         @inlinable
-        init(_ rawValue: UIntHalf) {
+        init(_ rawValue: UInt32) {
             self.rawValue = rawValue
         }
 
@@ -70,7 +70,7 @@ extension QUICStreamHandle {
     @usableFromInline
     struct Index: Hashable, Comparable, Sendable {
         @usableFromInline
-        var _rawValue: UIntHalf
+        var _rawValue: UInt32
 
         /// The slot the stream occupies, as a subscript into storage which is addressed by `Int`.
         @inlinable
@@ -78,7 +78,7 @@ extension QUICStreamHandle {
 
         @inlinable
         init(_ rawValue: Int) {
-            self._rawValue = UIntHalf(rawValue)
+            self._rawValue = UInt32(rawValue)
         }
 
         /// The first slot a store hands out.
@@ -98,15 +98,3 @@ extension QUICStreamHandle {
         }
     }
 }
-
-#if _pointerBitWidth(_64)
-@usableFromInline
-/// An unsigned integer with half the bytes of a `UInt`.
-typealias UIntHalf = UInt32
-#elseif _pointerBitWidth(_32)
-@usableFromInline
-/// An unsigned integer with half the bytes of a `UInt`.
-typealias UIntHalf = UInt16
-#else
-#error("Unsupported pointer size")
-#endif
