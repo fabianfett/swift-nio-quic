@@ -447,6 +447,47 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             promise: nil
         )
     }
+
+    /// Answers a long header packet in a version this endpoint doesn't support with a Version
+    /// Negotiation packet (RFC 9000 Section 6.1).
+    private func trySendVersionNegotiation(
+        for header: QUICPacketHeader,
+        triggeredBy envelope: AddressedEnvelope<ByteBuffer>
+    ) {
+        self.eventLoop.assertInEventLoop()
+
+        // RFC 9000 Section 6.1: "An endpoint MUST NOT send a Version Negotiation packet in
+        // response to receiving a Version Negotiation packet."
+        guard header.version != .negotiation else {
+            return
+        }
+        // RFC 9000 Section 5.2.2: a server answers a packet only "if the packet is large enough
+        // to initiate a new connection for any supported version", and "Servers MUST drop smaller
+        // packets that specify unsupported versions". A version 1 Initial fills a datagram of at
+        // least 1200 bytes (RFC 9000 Section 14.1). This also keeps the answer smaller than the
+        // packet, so it doesn't amplify.
+        guard envelope.data.readableBytes >= 1200 else {
+            return
+        }
+        guard let versionNegotiation = header.versionNegotiationPacket(allocator: self.udpChannel.allocator) else {
+            return
+        }
+
+        self.logger.debug(
+            "QUICHandler sending version negotiation",
+            metadata: [
+                LoggingKeys.addressRemote: "\(envelope.remoteAddress)",
+                LoggingKeys.packetVersion: "\(String(describing: header.version))",
+                LoggingKeys.connectionDCID: "\(header.destinationConnectionID.description)",
+                LoggingKeys.channelOutboundBytes: "\(versionNegotiation.readableBytes)",
+            ]
+        )
+
+        self.writeDatagram(
+            AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: versionNegotiation),
+            promise: nil
+        )
+    }
 }
 
 @available(*, unavailable)
@@ -847,10 +888,13 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                 if let view = self.connectionRegistry[header.destinationConnectionID] {
                     self.deliverPacket(addressedEnvelope, to: view)
                 } else if self.quicConfiguration.role == .server {
-                    // Only INITIAL packets can create new connections. However, we do need to
-                    // pass packets with unknown versions to Swift QUIC to initiate version
-                    // negotation.
-                    if header.type == .initial || header.type == .versionNegotiation {
+                    if header.type != .short, header.version != .v1 {
+                        // A long header in a version we don't speak starts no connection. Version
+                        // Negotiation is stateless, so the handler answers it for every driver
+                        // (RFC 9000 Section 5.2.2).
+                        self.trySendVersionNegotiation(for: header, triggeredBy: addressedEnvelope)
+                    } else if header.type == .initial {
+                        // Only INITIAL packets can create new connections.
                         switch self.connectionAdmissionController.acceptNewConnection() {
                         case .accept:
                             try self.acceptNewConnection(

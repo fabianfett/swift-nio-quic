@@ -224,11 +224,7 @@ struct ConsumerConnectionConfigurationTests {
             }
         )
         // RFC 9000 Section 6.1: a server answers an Initial in a version it doesn't support with
-        // Version Negotiation. The state machine server's core takes the Initial instead.
-        withKnownIssue("A state machine server sends no Version Negotiation") {
-            #expect(versionNegotiations.withLockedValue { $0 } > 0, "the server sent no Version Negotiation")
-        } when: {
-            drivers.server == .stateMachine
-        }
+        // Version Negotiation.
+        #expect(versionNegotiations.withLockedValue { $0 } > 0, "the server sent no Version Negotiation")
     }
 }

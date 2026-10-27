@@ -308,6 +308,75 @@ final class QUICHandlerTests: XCTestCase {
         XCTAssertNil(outbound)
     }
 
+    // MARK: - Version Negotiation
+
+    /// Fires a long header packet in `version`, `size` bytes long, from new connection IDs, and
+    /// returns the IDs and the handler's answer.
+    private func fireLongHeader(
+        version: [UInt8],
+        size: Int
+    ) throws -> (
+        destinationID: QUICConnectionID, sourceID: QUICConnectionID, answer: AddressedEnvelope<ByteBuffer>?
+    ) {
+        let destinationID = QUICConnectionID.random(using: &self.randomNumberGenerator)
+        let sourceID = QUICConnectionID.random(using: &self.randomNumberGenerator)
+        let header = QUICPackets.versionNegotiation(destinationID: destinationID, sourceID: sourceID, version: version)
+        let packet = QUICPackets.versionNegotiation(
+            destinationID: destinationID,
+            sourceID: sourceID,
+            version: version,
+            payloadLength: size - header.count
+        )
+        let address = try SocketAddress(ipAddress: "127.0.0.0", port: 443)
+        self.channel.pipeline.fireChannelRead(
+            AddressedEnvelope<ByteBuffer>(remoteAddress: address, data: ByteBuffer(bytes: packet))
+        )
+        self.channel.pipeline.fireChannelReadComplete()
+        let answer = try self.channel.readOutbound(as: AddressedEnvelope<ByteBuffer>.self)
+        XCTAssertNil(try self.channel.readOutbound(as: AddressedEnvelope<ByteBuffer>.self))
+        return (destinationID, sourceID, answer)
+    }
+
+    func testChannelRead_whenUnsupportedVersion_sendsVersionNegotiation() throws {
+        let (destinationID, sourceID, answer) = try self.fireLongHeader(version: [0x1a, 0x2a, 0x3a, 0x4a], size: 1200)
+
+        // RFC 9000 Section 17.2.1: a long header with version 0, the IDs swapped, and the
+        // supported versions.
+        var outbound = try XCTUnwrap(answer).data
+        XCTAssertLessThan(outbound.readableBytes, 1200)
+        XCTAssertEqual(try XCTUnwrap(outbound.readInteger(as: UInt8.self)) & 0x80, 0x80)
+        XCTAssertEqual(outbound.readInteger(as: UInt32.self), 0)
+        let destinationLength = try XCTUnwrap(outbound.readInteger(as: UInt8.self))
+        XCTAssertEqual(outbound.readBytes(length: Int(destinationLength)), sourceID.asBytes)
+        let sourceLength = try XCTUnwrap(outbound.readInteger(as: UInt8.self))
+        XCTAssertEqual(outbound.readBytes(length: Int(sourceLength)), destinationID.asBytes)
+        var versions: [UInt32] = []
+        while let version = outbound.readInteger(as: UInt32.self) {
+            versions.append(version)
+        }
+        XCTAssertEqual(outbound.readableBytes, 0)
+        XCTAssertTrue(versions.contains(1), "\(versions)")
+
+        // Version Negotiation is stateless: the packet started no connection.
+        XCTAssertFalse(try self.isRoutable(destinationID, on: self.channel))
+    }
+
+    func testChannelRead_whenUnsupportedVersionInASmallDatagram_sendsNoVersionNegotiation() throws {
+        // RFC 9000 Section 5.2.2: "Servers MUST drop smaller packets that specify unsupported
+        // versions."
+        let (destinationID, _, answer) = try self.fireLongHeader(version: [0x1a, 0x2a, 0x3a, 0x4a], size: 1199)
+        XCTAssertNil(answer)
+        XCTAssertFalse(try self.isRoutable(destinationID, on: self.channel))
+    }
+
+    func testChannelRead_whenVersionNegotiationPacket_sendsNoVersionNegotiation() throws {
+        // RFC 9000 Section 6.1: "An endpoint MUST NOT send a Version Negotiation packet in
+        // response to receiving a Version Negotiation packet."
+        let (destinationID, _, answer) = try self.fireLongHeader(version: [0, 0, 0, 0], size: 1200)
+        XCTAssertNil(answer)
+        XCTAssertFalse(try self.isRoutable(destinationID, on: self.channel))
+    }
+
     // MARK: - Stateless reset
 
     func testChannelRead_whenUnroutableShortHeaderPacket_sendsStatelessReset() throws {
