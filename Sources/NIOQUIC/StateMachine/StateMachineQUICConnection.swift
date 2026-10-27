@@ -47,6 +47,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var timer: Scheduled<Void>?
     private var timerDeadline: NetworkClock.Instant?
 
+    /// A datagram the core built for a later departure, and when it leaves (RFC 9002 Section
+    /// 7.7). The core paces each datagram as it builds it, so the driver holds this one, and
+    /// builds no more, until the timer sends it.
+    private var pacedDatagram: (datagram: ByteBuffer, departure: NetworkClock.Instant)?
+
     /// Locally opened streams waiting for the peer to allow more streams.
     private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
 
@@ -81,6 +86,16 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     deinit {
         self._forTesting_onDeinit?()
+    }
+
+    /// The core's congestion window, in bytes.
+    var _forTesting_congestionWindow: Int {
+        self.core.congestionWindow
+    }
+
+    /// The largest UDP payload the connection sends.
+    var _forTesting_maximumDatagramSize: Int {
+        self.maximumDatagramSize
     }
     #endif
 
@@ -127,6 +142,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Section 3). The SwiftNetwork driver sends at most 65535.
         let maxDatagramFrameSize = UInt16(clamping: configuration.maxDatagramFrameSize)
         coreConfiguration.maxDatagramFrameSize = maxDatagramFrameSize > 0 ? UInt64(maxDatagramFrameSize) : nil
+        // Spread each congestion window over the RTT rather than sending it in one burst (RFC
+        // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
+        coreConfiguration.pacingEnabled = true
         return coreConfiguration
     }
 
@@ -394,6 +412,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 // not after the closing or draining period (RFC 9000 Section 10.2). The core
                 // keeps running on this connection's timer until it reports `.closed`.
                 self.logger.debug("Connection closing", metadata: ["quic.close.reason": "\(reason)"])
+                // The connection sends nothing but CONNECTION_CLOSE from now on.
+                self.pacedDatagram = nil
                 self.reportClose(reason)
             case .closed(let reason):
                 self.coreClosed(reason)
@@ -453,7 +473,17 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     // MARK: Timer
 
     private func rescheduleTimer() {
-        guard let deadline = self.core.nextDeadline else {
+        // The core's deadlines don't include pacing: the paced datagram's departure is the
+        // driver's own.
+        let deadline: NetworkClock.Instant
+        switch (self.core.nextDeadline, self.pacedDatagram?.departure) {
+        case (let coreDeadline?, let departure?):
+            deadline = min(coreDeadline, departure)
+        case (let coreDeadline?, nil):
+            deadline = coreDeadline
+        case (nil, let departure?):
+            deadline = departure
+        case (nil, nil):
             // Nothing is due; a timer still armed fires as a no-op.
             return
         }
@@ -492,7 +522,19 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.processEvents()
         self.openPendingStreams()
         let now = Self.now
+        // `now` has microseconds; a departure within that is due, so a timer fired for it
+        // never finds it early.
+        let dueBy = now.advanced(by: .microseconds(1))
         let remoteAddress = self.remoteAddress.value
+        if let (datagram, departure) = self.pacedDatagram {
+            guard departure < dueBy else {
+                // Still early: the timer drains again at its departure.
+                self.rescheduleTimer()
+                return
+            }
+            self.pacedDatagram = nil
+            transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: datagram), promise: nil)
+        }
         while true {
             var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
             let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
@@ -501,6 +543,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 return self.core.send(into: &span, now: now) ?? 0
             }
             guard written > 0 else { break }
+            if let departure = self.core.departureTime, departure >= dueBy {
+                // The pacer holds this datagram back: keep it for the timer and stop here, as
+                // every later datagram leaves later still.
+                self.pacedDatagram = (buffer, departure)
+                break
+            }
             transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), promise: nil)
         }
         self.rescheduleTimer()
