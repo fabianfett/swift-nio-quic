@@ -1461,6 +1461,19 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             return
         }
 
+        // A connection using a stream table has no stream handler that sets the keep-alive
+        // interval once it connects, so the flow handler carries it (see `init`).
+        if self.streamTable != nil, let newFlowHandler = self.connectionNewFlowHandler,
+            let keepAliveInterval = newFlowHandler.keepAliveInterval.take(),
+            let connectionMetadata = newFlowHandler.getConnectionMetadata(in: &eventContext)?.connectionMetadata
+        {
+            // The setter acquires the event context itself, so it runs once the context is released.
+            self.callouts.add(
+                .setKeepalive(connectionMetadata, seconds: QUICCallout.keepAliveSeconds(for: keepAliveInterval)),
+                in: &eventContext
+            )
+        }
+
         // Generate additional CIDs for the peer after handshake completes.
         if self.channelView != nil {
             // The datagram flow was attached in `start`: tell the channel the peer's advertised size.

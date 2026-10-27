@@ -251,4 +251,21 @@ struct QUICCalloutsTests {
             #expect(anchor.identifier.isNone)
         }
     }
+
+    /// SwiftNetwork takes keep-alive intervals in whole seconds, and reads `0` as off and
+    /// `UInt16.max` as its default: no interval may turn into either.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: [
+        (Duration.zero, UInt16(0)),
+        (.milliseconds(1), 1),
+        (.milliseconds(500), 1),
+        (.milliseconds(1900), 1),
+        (.seconds(15), 15),
+        (.seconds(65534), 65534),
+        (.seconds(65535), 65534),
+        (.seconds(Int64.max), 65534),
+    ])
+    func keepAliveIntervalsRoundToSecondsSwiftNetworkAccepts(interval: Duration, seconds: UInt16) {
+        #expect(QUICCallout.keepAliveSeconds(for: interval) == seconds)
+    }
 }

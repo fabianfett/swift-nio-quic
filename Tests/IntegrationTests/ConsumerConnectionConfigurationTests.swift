@@ -167,15 +167,6 @@ struct ConsumerConnectionConfigurationTests {
     @available(anyAppleOS 26, *)
     @Test(arguments: Drivers.all)
     func testKeepalivesHoldAnIdleConnectionOpen(drivers: Drivers) async throws {
-        try await withKnownIssue("SwiftNetwork-driven consumer clients send no keepalives") {
-            try await self.keepalivesHoldAnIdleConnectionOpen(drivers: drivers)
-        } when: {
-            drivers.client == .swiftNetwork
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    private func keepalivesHoldAnIdleConnectionOpen(drivers: Drivers) async throws {
         let recording = StreamRecording()
 
         try await withConsumerPair(
