@@ -494,6 +494,47 @@ struct StreamTableTests {
         }
     }
 
+    #if DEBUG
+    /// A write the connection can no longer send fails its flush, even before the stream learns
+    /// that the connection is closing (RFC 9000 Section 10.2: a closing endpoint sends no more
+    /// stream data).
+    @available(anyAppleOS 26, *)
+    @Test(arguments: Drivers.all)
+    func testFlushFailsOnceTheConnectionCanNoLongerSend(drivers: Drivers) async throws {
+        let recording = StreamRecording()
+
+        try await withConsumerPair(
+            drivers: drivers,
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer()
+        ) { pair in
+            let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /"), fin: false)
+
+            let outcome = try await pair.clientConnection.withStreams { streams -> (Bool, String?) in
+                let channel = pair.clientConnection.channel as! QUICConnectionChannel<RecordConsumer>
+                channel._forTesting_closeConnectionOnly()
+                var wasSendOpen = false
+                do {
+                    try streams.withStream(handle: handle) { stream, _ in
+                        wasSendOpen = stream.isSendOpen
+                        stream.write(ByteBuffer(string: "quic"))
+                        try stream.flush(fin: true)
+                    }
+                    return (wasSendOpen, nil)
+                } catch {
+                    return (wasSendOpen, "\(error)")
+                }
+            }.get()
+            let (wasSendOpen, flushError) = try #require(outcome)
+
+            // The stream doesn't know yet: the flush gets as far as the connection.
+            #expect(wasSendOpen)
+            // Both drivers throw the stack's "not connected" error.
+            #expect(flushError != nil)
+        }
+    }
+    #endif
+
     @available(anyAppleOS 26, *)
     @Test(arguments: Drivers.all)
     func testShutdownForcefully(drivers: Drivers) async throws {

@@ -74,6 +74,16 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         guard case .stateMachine(let connection) = self._connection else { return nil }
         return connection
     }
+
+    /// Closes the connection behind the channel, as when the connection starts closing on its own
+    /// (for example on the peer's CONNECTION\_CLOSE): the channel and its streams learn about it
+    /// on the next drain, not now.
+    func _forTesting_closeConnectionOnly() {
+        self.eventLoop.assertInEventLoop()
+        self.withoutEnteringDrainOutput {
+            _ = self._connection.close(isApplicationClose: true, errorCode: 0, reason: "")
+        }
+    }
     #endif
 
     /// A registrar for connection IDs.

@@ -16,6 +16,16 @@ import NIOCore
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
+#endif
+
 /// The transport state for a stream.
 @available(anyAppleOS 26, *)
 @usableFromInline
@@ -935,13 +945,21 @@ extension QUICStreamCore {
             throw NetworkError(streamStateViolation: "the stream has no ID", operation: "flush")
         }
 
+        // The core takes all of a write, or none once the stream or the connection can't send any
+        // more: for instance while the connection is closing (RFC 9000 Section 10.2), which the
+        // stream may not know yet. The rest of the queue fails with the refused write.
+        var refused = false
         var outgoing = self.pendingWrites.drainArray()
         outgoing.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
-            if let bytes = frame.bytes {
-                stateMachine.write(bytes, to: id, fin: false)
+            if !refused, let bytes = frame.bytes, bytes.byteCount > 0 {
+                refused = stateMachine.write(bytes, to: id, fin: false) < bytes.byteCount
             }
-            frame.finalize(success: true)
+            frame.finalize(success: !refused)
             return .removeFrameAndContinue
+        }
+        if refused {
+            // What the `SwiftNetwork` stack throws for a stream it can no longer send on.
+            throw NetworkError.posix(ENOTCONN)
         }
         if carriesFin {
             stateMachine.finish(id)
