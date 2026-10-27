@@ -78,23 +78,6 @@ struct StateMachineClosingTests {
         try $0.addHandler(InboundDelay(Self.delay))
     }
 
-    /// Runs `body` with event loops of its own. These tests time the close, and the tests running
-    /// alongside can hold a loop of the shared group for over a second: a SwiftNetwork driver
-    /// connection that retires its 2000 streams does.
-    static func withOwnEventLoops<Result>(
-        _ body: (_ eventLoopGroup: MultiThreadedEventLoopGroup) async throws -> Result
-    ) async throws -> Result {
-        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
-        do {
-            let result = try await body(eventLoopGroup)
-            try await eventLoopGroup.shutdownGracefully()
-            return result
-        } catch {
-            try? await eventLoopGroup.shutdownGracefully()
-            throw error
-        }
-    }
-
     @available(anyAppleOS 26, *)
     @Test(arguments: [
         Drivers(client: .stateMachine, server: .stateMachine),
@@ -107,7 +90,7 @@ struct StateMachineClosingTests {
             serverConnection.withLockedValue { $0 = connection }
         }
 
-        try await Self.withOwnEventLoops { eventLoopGroup in
+        try await withOwnEventLoops { eventLoopGroup in
             try await withConsumerPair(
                 drivers: drivers,
                 eventLoopGroup: eventLoopGroup,
@@ -160,7 +143,7 @@ struct StateMachineClosingTests {
         try Data(wrongKey).write(to: keyURL)
         defer { try? FileManager.default.removeItem(at: keyURL) }
 
-        try await Self.withOwnEventLoops { eventLoopGroup in
+        try await withOwnEventLoops { eventLoopGroup in
             let start = ContinuousClock.now
             await #expect(throws: QUICConnectionError.self) {
                 let pair = try await makeConsumerPair(

@@ -147,6 +147,23 @@ extension ConsumerPair where Client.StreamState == ByteBuffer {
     }
 }
 
+/// Runs `body` with event loops of its own, for tests that time something. The tests running
+/// alongside can hold a loop of the shared group for over a second: a SwiftNetwork driver
+/// connection that retires its 2000 streams does.
+func withOwnEventLoops<Result>(
+    _ body: (_ eventLoopGroup: MultiThreadedEventLoopGroup) async throws -> Result
+) async throws -> Result {
+    let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+    do {
+        let result = try await body(eventLoopGroup)
+        try await eventLoopGroup.shutdownGracefully()
+        return result
+    } catch {
+        try? await eventLoopGroup.shutdownGracefully()
+        throw error
+    }
+}
+
 @available(anyAppleOS 26, *)
 func withConsumerPair<
     Client: QUICStreamConsumer & Sendable,

@@ -169,23 +169,27 @@ struct ConsumerConnectionConfigurationTests {
     func testKeepalivesHoldAnIdleConnectionOpen(drivers: Drivers) async throws {
         let recording = StreamRecording()
 
-        try await withConsumerPair(
-            drivers: drivers,
-            maxIdleTimeout: .seconds(2),
-            // The SwiftNetwork driver counts keepalive intervals in whole seconds.
-            configureClient: { $0.keepAliveInterval = .seconds(1) },
-            client: RecordConsumer(recording: recording),
-            server: EchoConsumer(),
-            { pair in
-                try await Task.sleep(for: .seconds(5))
-                #expect(pair.clientConnection.channel.isActive)
+        // A keepalive has a second to arrive: on the shared loops other tests can delay it that long.
+        try await withOwnEventLoops { eventLoopGroup in
+            try await withConsumerPair(
+                drivers: drivers,
+                eventLoopGroup: eventLoopGroup,
+                maxIdleTimeout: .seconds(2),
+                // The SwiftNetwork driver counts keepalive intervals in whole seconds.
+                configureClient: { $0.keepAliveInterval = .seconds(1) },
+                client: RecordConsumer(recording: recording),
+                server: EchoConsumer(),
+                { pair in
+                    try await Task.sleep(for: .seconds(5))
+                    #expect(pair.clientConnection.channel.isActive)
 
-                let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /"), fin: true)
-                let visits = await recording.visits { $0.handle == handle && $0.events.contains(.closed) }
-                #expect(visits.last?.bytesReadSoFar == ByteBuffer(string: "GET /"))
-                #expect(visits.last?.closeError == nil)
-            }
-        )
+                    let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /"), fin: true)
+                    let visits = await recording.visits { $0.handle == handle && $0.events.contains(.closed) }
+                    #expect(visits.last?.bytesReadSoFar == ByteBuffer(string: "GET /"))
+                    #expect(visits.last?.closeError == nil)
+                }
+            )
+        }
     }
 
     /// A client forcing Version Negotiation (RFC 9000 Section 6) still connects.
