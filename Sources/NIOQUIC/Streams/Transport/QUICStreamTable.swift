@@ -153,6 +153,9 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     }
 
     /// Whether the table has closed: its anchor is retired, and it takes no new streams.
+    ///
+    /// Always inlined: `withEventContext` checks it on every entry into the stack.
+    @inline(__always)
     var isClosed: Bool {
         self.anchor.identifier.isNone
     }
@@ -693,6 +696,11 @@ extension QUICStreamTable where Consumer: ~Copyable {
     ///
     /// The anchor is never a callee. The operations here call QUIC stream flows, whose parent, the
     /// `QUICConnection`, is idle wherever consumer code runs.
+    ///
+    /// Always inlined: the table's code runs unspecialized, and out of line this would stay generic
+    /// over `R` and `E` as well, reading their value witnesses and allocating stack space at run
+    /// time on every entry into the stack.
+    @inline(__always)
     func withEventContext<R, E: Error>(
         _ body: (inout NetworkContext.EventContext) throws(E) -> R
     ) throws(E) -> R {
