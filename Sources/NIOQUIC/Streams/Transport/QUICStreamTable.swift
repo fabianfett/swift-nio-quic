@@ -106,6 +106,10 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The role of the local peer.
     let role: Role
 
+    /// The receive windows the connection advertises, which bound the contiguous bytes a read can
+    /// wait for. Set by the connection.
+    var receiveWindows: ReceiveWindows = .unlimited
+
     /// The `SwiftNetwork` stack the table's streams run on.
     struct SwiftNetworkBacking {
         /// Context for the `SwiftNetwork` stack.
@@ -806,8 +810,13 @@ extension QUICStreamTable where Consumer: ~Copyable {
         minContiguous: Int,
         _ body: (_ span: borrowing RawSpan) -> Int
     ) -> QUICStreamReadOutcome {
+        let id = transport.pointee.core.id
+        let minContiguous =
+            id.map {
+                min(minContiguous, self.receiveWindows.largestMinContiguous(for: $0, role: self.role))
+            } ?? minContiguous
         if let stateMachine = self.stateMachine {
-            guard let id = transport.pointee.core.id else { return .nothingAvailable }
+            guard let id else { return .nothingAvailable }
             return transport.pointee.core.read(minContiguous: minContiguous, from: stateMachine, id: id, body)
         }
         return transport.pointee.core.read(
@@ -872,4 +881,57 @@ private struct SlotRegistration: ProtocolInstance, ~Copyable {
     let context: NetworkContext
     var identifier: InstanceIdentifier
     var eventManager: ProtocolEventManager
+}
+
+/// The flow control windows a connection advertises for what it receives (RFC 9000 Section 4).
+@available(anyAppleOS 26, *)
+struct ReceiveWindows {
+    /// The window of a bidirectional stream the local peer opened.
+    var bidirectionalLocal: Int
+    /// The window of a bidirectional stream the remote peer opened.
+    var bidirectionalRemote: Int
+    /// The window of a unidirectional stream the remote peer opened.
+    var unidirectional: Int
+    /// The window of the whole connection.
+    var connection: Int
+
+    /// No bound.
+    static var unlimited: Self {
+        Self(bidirectionalLocal: .max, bidirectionalRemote: .max, unidirectional: .max, connection: .max)
+    }
+
+    init(bidirectionalLocal: Int, bidirectionalRemote: Int, unidirectional: Int, connection: Int) {
+        self.bidirectionalLocal = bidirectionalLocal
+        self.bidirectionalRemote = bidirectionalRemote
+        self.unidirectional = unidirectional
+        self.connection = connection
+    }
+
+    init(_ configuration: QUICConfiguration) {
+        self.init(
+            bidirectionalLocal: configuration.initialMaxStreamDataBidiLocal,
+            bidirectionalRemote: configuration.initialMaxStreamDataBidiRemote,
+            unidirectional: configuration.initialMaxStreamDataUni,
+            connection: configuration.initialMaxData
+        )
+    }
+
+    /// The most contiguous bytes a read on the stream `id` can wait for.
+    ///
+    /// The peer can't send past a window, and the window only moves once the application consumes
+    /// half of it (RFC 9000 Section 4.2). A read that waits for more than half the window may never
+    /// see it arrive; half of the smaller of the stream's and the connection's windows always can.
+    func largestMinContiguous(for id: QUICStreamID, role: Role) -> Int {
+        let stream: Int
+        switch (QUICStreamType(id), role) {
+        case (.clientInitiatedBidirectional, .client), (.serverInitiatedBidirectional, .server):
+            stream = self.bidirectionalLocal
+        case (.clientInitiatedBidirectional, .server), (.serverInitiatedBidirectional, .client):
+            stream = self.bidirectionalRemote
+        case (.clientInitiatedUnidirectional, _), (.serverInitiatedUnidirectional, _):
+            // The local peer never reads from a stream it opened unidirectionally.
+            stream = self.unidirectional
+        }
+        return max(min(stream, self.connection) / 2, 1)
+    }
 }

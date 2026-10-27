@@ -97,6 +97,32 @@ struct StreamTableTests {
         #expect(resumed.withLockedValue { $0 } > 0, "the server never had to wait for credit")
     }
 
+    /// A reader asking for more contiguous bytes than the stream's receive window can ever hold
+    /// still gets everything: the peer can't send past the window until the reader consumes
+    /// (RFC 9000 Section 4.1), so the stream hands over smaller runs.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: Drivers.all)
+    func testMinContiguousBytesLargerThanTheReceiveWindow(drivers: Drivers) async throws {
+        let window = 4 * 1024
+        let size = 16 * window
+        let received = makePromise(of: Int.self, timeout: .seconds(10))
+        let recording = StreamRecording()
+
+        try await withConsumerPair(
+            drivers: drivers,
+            initialMaxStreamData: window,
+            client: RecordConsumer(recording: recording),
+            server: MinContiguousReader(minContiguousBytes: 4 * window, received: received)
+        ) { pair in
+            _ = try await pair.openClientStream(
+                writing: ByteBuffer(repeating: UInt8(ascii: "q"), count: size),
+                fin: true
+            )
+            let count = try await received.futureResult.get()
+            #expect(count == size)
+        }
+    }
+
     @available(anyAppleOS 26, *)
     @Test(arguments: Drivers.all)
     func testManyHTTP09RequestStreams(drivers: Drivers) async throws {

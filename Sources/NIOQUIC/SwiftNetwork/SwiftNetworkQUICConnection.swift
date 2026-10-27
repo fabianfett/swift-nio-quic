@@ -521,6 +521,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 context: swiftNetworkParameters.context,
                 callouts: self.callouts
             )
+            table.receiveWindows = ReceiveWindows(configuration)
 
             // The same references an outbound child-channel stream attaches in
             // 'addNewOutboundStreamInputHandler'.

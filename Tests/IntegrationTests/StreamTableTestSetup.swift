@@ -795,3 +795,44 @@ struct WindowedSenderConsumer: QUICStreamConsumer {
         }
     }
 }
+
+/// Reads every stream with `minContiguousBytes`, counting the bytes, and succeeds `received` with
+/// the count at the end of the first stream.
+@available(anyAppleOS 26, *)
+struct MinContiguousReader: QUICStreamConsumer {
+    typealias StreamState = Int
+
+    let minContiguousBytes: Int
+    let received: EventLoopPromise<Int>
+
+    func makeStreamState(_ stream: inout QUICStream<Self>) -> Int {
+        0
+    }
+
+    mutating func processStreams(_ streams: inout QUICStreamIterator<Self>) {
+        let minContiguousBytes = self.minContiguousBytes
+        let received = self.received
+
+        while var visit = streams.next() {
+            guard visit.events.contains(.readable) else { continue }
+
+            visit.withStream { stream, count in
+                reading: while true {
+                    let outcome = stream.read(minContiguousBytes: minContiguousBytes) { span in
+                        count += span.byteCount
+                        return span.byteCount
+                    }
+                    switch outcome {
+                    case .read:
+                        ()
+                    case .nothingAvailable:
+                        break reading
+                    case .endOfStream:
+                        received.succeed(count)
+                        break reading
+                    }
+                }
+            }
+        }
+    }
+}

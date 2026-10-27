@@ -138,7 +138,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             eventLoop: eventLoop,
             logger: logger
         )
-        connection.makeStreamTable()
+        connection.makeStreamTable(configuration: configuration)
         connection.installAsyncContinuationHandler()
         return connection
     }
@@ -181,13 +181,16 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             eventLoop: eventLoop,
             logger: logger
         )
-        connection.makeStreamTable()
+        connection.makeStreamTable(configuration: configuration)
         connection.installAsyncContinuationHandler()
         return connection
     }
 
-    private func makeStreamTable() {
+    private func makeStreamTable(configuration: QUICConfiguration) {
         let table = QUICStreamTable<Consumer>(role: self.role, stateMachine: self)
+        // The core grows a stream's window only as the application consumes (CoreStreams'
+        // `updateReceiveLimit`), so reads must not wait for more than it lets in.
+        table.receiveWindows = ReceiveWindows(configuration)
         self.streamTable = table
     }
 
