@@ -61,7 +61,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var closedLocally = false
 
     /// The largest UDP payload sent.
-    private static var maximumDatagramSize: Int { 1350 }
+    private let maximumDatagramSize: Int
+
+    /// The version a client sends its first Initial in to force Version Negotiation: a reserved
+    /// version no server supports (RFC 9000 Section 15).
+    private static var versionNegotiationGreaseVersion: UInt32 { 0x1a2a_3a4a }
 
     #if DEBUG
     /// Runs when the connection is released, so tests can check that nothing keeps it alive.
@@ -74,6 +78,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     private init(
         core: consuming QUICConnectionCore,
+        maximumDatagramSize: Int,
         role: Role,
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
@@ -81,6 +86,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         logger: Logger
     ) {
         self.core = core
+        self.maximumDatagramSize = maximumDatagramSize
         self.role = role
         self.localAddress = localAddress
         self.remoteAddress = SendableAddress(remoteAddress)
@@ -100,9 +106,19 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         coreConfiguration.initialMaxStreamDataUnidirectional = UInt64(configuration.initialMaxStreamDataUni)
         coreConfiguration.initialMaxStreamsBidirectional = UInt64(configuration.initialMaxStreamsBidi)
         coreConfiguration.initialMaxStreamsUnidirectional = UInt64(configuration.initialMaxStreamsUni)
-        let idle = configuration.maxIdleTimeout.components
-        coreConfiguration.maxIdleTimeout = .milliseconds(idle.seconds * 1000 + idle.attoseconds / 1_000_000_000_000_000)
-        coreConfiguration.maxDatagramSize = Self.maximumDatagramSize
+        coreConfiguration.maxIdleTimeout = NetworkDuration(duration: configuration.maxIdleTimeout)
+        // As on the SwiftNetwork driver, keepalives never close the connection: the idle timeout
+        // does once they go unanswered.
+        coreConfiguration.keepAliveInterval = configuration.keepAliveInterval.map(NetworkDuration.init(duration:))
+        // Initial packets are padded to the configured size, and no packet is larger. Every QUIC
+        // path carries 1200 bytes (RFC 9000 Section 14).
+        let packetSize = max(configuration.initialPacketSize.size(forClientInitial: nil), 1200)
+        coreConfiguration.initialDatagramSize = packetSize
+        coreConfiguration.maxDatagramSize = packetSize
+        // A `max_datagram_frame_size` of zero is the same as none: no DATAGRAM frames (RFC 9221
+        // Section 3). The SwiftNetwork driver sends at most 65535.
+        let maxDatagramFrameSize = UInt16(clamping: configuration.maxDatagramFrameSize)
+        coreConfiguration.maxDatagramFrameSize = maxDatagramFrameSize > 0 ? UInt64(maxDatagramFrameSize) : nil
         return coreConfiguration
     }
 
@@ -124,14 +140,21 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             asyncVerifier: asyncVerifier,
             serverName: serverName
         )
+        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
+        if configuration.forceVersionNegotiation {
+            // The server answers with Version Negotiation, and the client starts over in QUIC
+            // version 1 (RFC 9000 Section 6).
+            coreConfiguration.clientInitialVersion = Self.versionNegotiationGreaseVersion
+        }
         let core = QUICConnectionCore(
-            clientWith: Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions),
+            clientWith: coreConfiguration,
             localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
             destinationConnectionID: SwiftNetwork.QUICConnectionID(8),
             now: Self.now
         )
         let connection = StateMachineQUICConnection(
             core: core,
+            maximumDatagramSize: coreConfiguration.maxDatagramSize,
             role: .client,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
@@ -183,6 +206,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         let connection = StateMachineQUICConnection(
             core: core,
+            maximumDatagramSize: coreConfiguration.maxDatagramSize,
             role: .server,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
@@ -302,7 +326,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .connected:
                 if !self.reportedHandshake {
                     self.reportedHandshake = true
-                    self.channelView?.handshakeCompleted(peerMaxDatagramFrameSize: 0)
+                    // As the SwiftNetwork driver does, hand over the peer's advertised frame size;
+                    // the core refuses a payload that doesn't fit a packet.
+                    self.channelView?.handshakeCompleted(
+                        peerMaxDatagramFrameSize: self.core.peerMaxDatagramFrameSize
+                    )
                 }
             case .streamOpened(let id):
                 guard let table = self.streamTable else { continue }
@@ -333,8 +361,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .streamFinishedSending:
                 ()
             case .datagramsReadable:
-                // Stream consumer connections don't read datagrams.
-                ()
+                self.deliverDatagrams()
             case .newLocalConnectionID, .retiredLocalConnectionID, .newPeerConnectionID, .retiredPeerConnectionID:
                 // The core issues no connection IDs on its own, and the peer's aren't routed yet.
                 ()
@@ -352,6 +379,18 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .closed(let reason):
                 self.connectionClosed(reason)
             }
+        }
+    }
+
+    /// Hands the DATAGRAM payloads received (RFC 9221) to the channel.
+    private func deliverDatagrams() {
+        let allocator = self.allocator
+        while let datagram = self.core.readDatagram({ bytes in
+            var buffer = allocator.buffer(capacity: bytes.byteCount)
+            bytes.withUnsafeBytes { buffer.writeBytes($0) }
+            return buffer
+        }) {
+            self.channelView?.datagramRead(datagram)
         }
     }
 
@@ -422,8 +461,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         let now = Self.now
         let remoteAddress = self.remoteAddress.value
         while true {
-            var buffer = self.allocator.buffer(capacity: Self.maximumDatagramSize)
-            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: Self.maximumDatagramSize) {
+            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
+            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
                 pointer in
                 var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
                 return self.core.send(into: &span, now: now) ?? 0
@@ -466,11 +505,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The consumer is told about the connection closing through its stream table.
     func quiesceStreams() {}
 
-    /// Datagrams (RFC 9221) are not supported yet.
+    /// Queues a DATAGRAM frame (RFC 9221). Returns `false` if the core refused it: it doesn't fit a
+    /// packet, or the connection is closing.
     func writeDatagram(_ datagram: ByteBuffer) -> Bool {
-        false
+        datagram.withUnsafeReadableBytes { pointer in
+            self.core.sendDatagram(RawSpan(_unsafeBytes: pointer))
+        }
     }
 
+    /// The channel drains the connection once the flush returns, which sends the queued datagrams.
     func flushDatagrams() {}
 
     func dropChannelReferences() {

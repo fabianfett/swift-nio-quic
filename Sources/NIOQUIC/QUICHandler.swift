@@ -1448,7 +1448,7 @@ enum QUICConnectionDriver: Hashable, Sendable {
     /// The SwiftNetwork framework's `QUICConnection`.
     case swiftNetwork
     /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections that serve a stream
-    /// consumer, with a configuration it ``supports(_:)``, can use it; the others fall back to
+    /// consumer, with a configuration it ``stateMachineSupports(_:)``, can use it; the others fall back to
     /// ``swiftNetwork``.
     case stateMachine
 
@@ -1468,12 +1468,33 @@ enum QUICConnectionDriver: Hashable, Sendable {
         }
     }
 
-    /// Whether the state machine driver implements everything `configuration` asks for. It doesn't
-    /// send keepalives, Retry or Version Negotiation yet, and writes no key log or qlog.
+    /// The ``QUICConfiguration`` properties the state machine driver implements, whatever their
+    /// value. A configuration that sets any other property to something but its default falls back
+    /// to ``swiftNetwork``, see ``stateMachineSupports(_:)``.
+    static let stateMachineProperties: Set<String> = [
+        "role",
+        // TLS: the drivers make the same `SwiftTLSProtocol.Options`.
+        "keyExchangeGroup", "applicationProtocols", "serverName", "authenticationConfiguration",
+        "peerCertificateVerification", "verificationConfiguration",
+        // Transport parameters and the connection's own settings.
+        "initialMaxData", "initialMaxStreamDataBidiLocal", "initialMaxStreamDataBidiRemote",
+        "initialMaxStreamDataUni", "initialMaxStreamsBidi", "initialMaxStreamsUni", "maxIdleTimeout",
+        "keepAliveInterval", "maxDatagramFrameSize", "initialPacketSize", "forceVersionNegotiation",
+    ]
+
+    /// The ``QUICConfiguration`` properties the state machine driver implements only at their
+    /// defaults: it sends no Retry, and writes no key log or qlog. ``stateMachineSupports(_:)``
+    /// checks each.
+    ///
+    /// Together with ``stateMachineProperties`` these are all of the configuration's properties;
+    /// a test checks that a new one is added to either.
+    static let stateMachineDefaultOnlyProperties: Set<String> = ["keyLogPath", "qLogConfiguration", "sendRetry"]
+
+    /// Whether the state machine driver implements everything `configuration` asks for: the
+    /// ``stateMachineProperties`` at any value, and the ``stateMachineDefaultOnlyProperties`` at
+    /// their defaults.
     static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
-        configuration.keepAliveInterval == nil && configuration.keyLogPath == nil
-            && configuration.qLogConfiguration == nil && !configuration.sendRetry
-            && !configuration.forceVersionNegotiation
+        configuration.keyLogPath == nil && configuration.qLogConfiguration == nil && !configuration.sendRetry
     }
 
     private static let setting: String? = {

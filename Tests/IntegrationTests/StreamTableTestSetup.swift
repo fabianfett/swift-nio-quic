@@ -160,6 +160,9 @@ func withConsumerPair<
     initialMaxStreamsBidi: Int = 8,
     initialMaxStreamsUni: Int = 8,
     initialMaxStreamData: Int? = nil,
+    configureClient: @escaping @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
+    configureServer: @escaping @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
+    inspectClientDatagram: (@Sendable (_ datagram: ByteBuffer) -> Void)? = nil,
     client: Client,
     server: Server,
     onServerConnection: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Void = { _ in },
@@ -173,6 +176,9 @@ func withConsumerPair<
         initialMaxStreamsBidi: initialMaxStreamsBidi,
         initialMaxStreamsUni: initialMaxStreamsUni,
         initialMaxStreamData: initialMaxStreamData,
+        configureClient: configureClient,
+        configureServer: configureServer,
+        inspectClientDatagram: inspectClientDatagram,
         makeClientConsumer: { _ in client },
         makeServerConsumer: { connection in
             onServerConnection(connection)
@@ -199,6 +205,9 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
     initialMaxStreamsBidi: Int = 8,
     initialMaxStreamsUni: Int = 8,
     initialMaxStreamData: Int? = nil,
+    configureClient: @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
+    configureServer: @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
+    inspectClientDatagram: (@Sendable (_ datagram: ByteBuffer) -> Void)? = nil,
     makeClientConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Client>) -> Client,
     makeServerConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Server
 ) async throws -> ConsumerPair<Client, Server> {
@@ -223,6 +232,7 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
             configuration.initialMaxStreamDataBidiRemote = initialMaxStreamData
             configuration.initialMaxStreamDataUni = initialMaxStreamData
         }
+        configureServer(&configuration)
         return configuration
     }()
 
@@ -239,6 +249,7 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
             configuration.initialMaxStreamDataBidiRemote = initialMaxStreamData
             configuration.initialMaxStreamDataUni = initialMaxStreamData
         }
+        configureClient(&configuration)
         return configuration
     }()
 
@@ -281,6 +292,9 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
                     makeConsumer: makeClientConsumer
                 )
                 handler.connectionDriver = QUICConnectionDriver(drivers.client)
+                if let inspectClientDatagram {
+                    try channel.pipeline.syncOperations.addHandler(DatagramInspector(inspect: inspectClientDatagram))
+                }
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -834,5 +848,22 @@ struct MinContiguousReader: QUICStreamConsumer {
                 }
             }
         }
+    }
+}
+
+/// Shows every UDP datagram a channel reads to `inspect`, then passes it on.
+final class DatagramInspector: ChannelInboundHandler, Sendable {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+    typealias InboundOut = AddressedEnvelope<ByteBuffer>
+
+    let inspect: @Sendable (_ datagram: ByteBuffer) -> Void
+
+    init(inspect: @escaping @Sendable (_ datagram: ByteBuffer) -> Void) {
+        self.inspect = inspect
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        self.inspect(Self.unwrapInboundIn(data).data)
+        context.fireChannelRead(data)
     }
 }
