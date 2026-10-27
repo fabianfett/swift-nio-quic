@@ -68,6 +68,14 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         self._connection.driver
     }
 
+    #if DEBUG
+    /// The state machine connection behind the channel, if it has one.
+    var _forTesting_stateMachineConnection: StateMachineQUICConnection<Consumer>? {
+        guard case .stateMachine(let connection) = self._connection else { return nil }
+        return connection
+    }
+    #endif
+
     /// A registrar for connection IDs.
     private let _registrar: ConnectionIDRegistrar
 

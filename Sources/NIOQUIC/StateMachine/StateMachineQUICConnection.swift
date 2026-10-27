@@ -63,6 +63,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The largest UDP payload sent.
     private static var maximumDatagramSize: Int { 1350 }
 
+    #if DEBUG
+    /// Runs when the connection is released, so tests can check that nothing keeps it alive.
+    var _forTesting_onDeinit: (() -> Void)?
+
+    deinit {
+        self._forTesting_onDeinit?()
+    }
+    #endif
+
     private init(
         core: consuming QUICConnectionCore,
         role: Role,
@@ -182,13 +191,32 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.streamTable = table
     }
 
+    /// What the async continuation handler resumes.
+    ///
+    /// SwiftTLS keeps copies of the handler, in its handshake state machines, past
+    /// `setAsyncContinuationHandler(nil)`, so the handler reaches the connection through this
+    /// target: `dropChannelReferences()` clears it, which breaks the cycle through the core even
+    /// if the handshake never completes.
+    private final class AsyncContinuationTarget {
+        var connection: StateMachineQUICConnection?
+
+        init(_ connection: StateMachineQUICConnection) {
+            self.connection = connection
+        }
+    }
+
+    private var asyncContinuationTarget: AsyncContinuationTarget?
+
     private func installAsyncContinuationHandler() {
         #if canImport(SwiftTLS)
         let eventLoop = self.eventLoop
-        let loopBound = NIOLoopBound(self, eventLoop: eventLoop)
+        let target = AsyncContinuationTarget(self)
+        self.asyncContinuationTarget = target
+        let loopBound = NIOLoopBound(target, eventLoop: eventLoop)
         self.core.setAsyncContinuationHandler { result in
             eventLoop.execute {
-                let connection = loopBound.value
+                // The connection is gone once its channel was torn down.
+                guard let connection = loopBound.value.connection else { return }
                 connection.core.resumeHandshake(with: result, now: Self.now)
                 connection.afterCoreUpdate()
             }
@@ -293,6 +321,18 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 table.peerStoppedSending(handle, code: QUICApplicationErrorCode(errorCode)!)
             case .streamFinishedSending:
                 ()
+            case .datagramsReadable:
+                // Stream consumer connections don't read datagrams.
+                ()
+            case .newLocalConnectionID, .retiredLocalConnectionID, .newPeerConnectionID, .retiredPeerConnectionID:
+                // The core issues no connection IDs on its own, and the peer's aren't routed yet.
+                ()
+            case .pathValidated, .pathFailed, .activePathChanged:
+                // Everything arrives on and goes out to one path.
+                ()
+            case .earlyDataRejected, .transportParametersForResumption:
+                // Stream consumer connections don't enable 0-RTT.
+                ()
             case .streamClosed(let id):
                 guard let table = self.streamTable,
                     let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
@@ -313,7 +353,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.reportedClose = true
         let error: (any Error)?
         switch reason {
-        case .idleTimeout:
+        case .idleTimeout, .keepAliveTimeout:
             error = nil
         case .local:
             error = nil
@@ -321,6 +361,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             error = code == 0 ? nil : QUICConnectionError(reason: reason, isApplication: isApplication, code: code)
         case .transportError(let code, let reason):
             error = QUICConnectionError(reason: reason, isApplication: false, code: code)
+        case .statelessReset:
+            error = QUICConnectionError(reason: "stateless reset", isApplication: false, code: 0)
         }
         self.channelView?.connectionClosed(error: error)
     }
@@ -425,6 +467,14 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.streamTable?.outOfBandDrain = nil
         self.timer?.cancel()
         self.timer = nil
+        #if canImport(SwiftTLS)
+        // The core releases the handler only once the handshake is confirmed or the connection
+        // closed. A connection closed during its handshake stops its timer here and never gets
+        // there, so break the cycle through the handler now.
+        self.core.setAsyncContinuationHandler(nil)
+        self.asyncContinuationTarget?.connection = nil
+        self.asyncContinuationTarget = nil
+        #endif
     }
 
     // MARK: Streams
