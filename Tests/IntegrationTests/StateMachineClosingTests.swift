@@ -78,6 +78,23 @@ struct StateMachineClosingTests {
         try $0.addHandler(InboundDelay(Self.delay))
     }
 
+    /// Runs `body` with event loops of its own. These tests time the close, and the tests running
+    /// alongside can hold a loop of the shared group for over a second: a SwiftNetwork driver
+    /// connection that retires its 2000 streams does.
+    static func withOwnEventLoops<Result>(
+        _ body: (_ eventLoopGroup: MultiThreadedEventLoopGroup) async throws -> Result
+    ) async throws -> Result {
+        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 2)
+        do {
+            let result = try await body(eventLoopGroup)
+            try await eventLoopGroup.shutdownGracefully()
+            return result
+        } catch {
+            try? await eventLoopGroup.shutdownGracefully()
+            throw error
+        }
+    }
+
     @available(anyAppleOS 26, *)
     @Test(arguments: [
         Drivers(client: .stateMachine, server: .stateMachine),
@@ -90,33 +107,36 @@ struct StateMachineClosingTests {
             serverConnection.withLockedValue { $0 = connection }
         }
 
-        try await withConsumerPair(
-            drivers: drivers,
-            configureClientPipeline: Self.delayClientReads,
-            client: RecordConsumer(recording: recording),
-            server: EchoConsumer(),
-            onServerConnection: captureConnection
-        ) { pair in
-            // The server only echoes once it processed the client's Finished, so its close can't
-            // land in a Handshake packet.
-            _ = try await pair.openClientStream(writing: ByteBuffer(string: "ping"), fin: true)
-            _ = await recording.visits(untilClosedStreams: 1)
-            _ = try await pair.openClientStream(writing: ByteBuffer(string: "GET /quic"), fin: false)
+        try await Self.withOwnEventLoops { eventLoopGroup in
+            try await withConsumerPair(
+                drivers: drivers,
+                eventLoopGroup: eventLoopGroup,
+                configureClientPipeline: Self.delayClientReads,
+                client: RecordConsumer(recording: recording),
+                server: EchoConsumer(),
+                onServerConnection: captureConnection
+            ) { pair in
+                // The server only echoes once it processed the client's Finished, so its close
+                // can't land in a Handshake packet.
+                _ = try await pair.openClientStream(writing: ByteBuffer(string: "ping"), fin: true)
+                _ = await recording.visits(untilClosedStreams: 1)
+                _ = try await pair.openClientStream(writing: ByteBuffer(string: "GET /quic"), fin: false)
 
-            let connection = try #require(serverConnection.withLockedValue { $0 })
-            let start = ContinuousClock.now
-            try await connection.channel.triggerUserOutboundEvent(
-                QUICCloseConnectionEvent(code: QUICApplicationErrorCode(10)!, reasonPhrase: "test")
-            )
-            let visits = await recording.visits { $0.events.contains(.closed) }
-            let elapsed = ContinuousClock.now - start
+                let connection = try #require(serverConnection.withLockedValue { $0 })
+                let start = ContinuousClock.now
+                try await connection.channel.triggerUserOutboundEvent(
+                    QUICCloseConnectionEvent(code: QUICApplicationErrorCode(10)!, reasonPhrase: "test")
+                )
+                let visits = await recording.visits { $0.events.contains(.closed) }
+                let elapsed = ContinuousClock.now - start
 
-            let error = try #require(visits.last?.closeError as? QUICConnectionError)
-            #expect(error.code == 10)
-            #expect(error.isApplication)
-            // The CONNECTION_CLOSE takes the delay to arrive; the draining period would add three
-            // PTOs, at least 975 ms.
-            #expect(elapsed < .milliseconds(700), "the close took \(elapsed)")
+                let error = try #require(visits.last?.closeError as? QUICConnectionError)
+                #expect(error.code == 10)
+                #expect(error.isApplication)
+                // The CONNECTION_CLOSE takes the delay to arrive; the draining period would add
+                // three PTOs, at least 975 ms.
+                #expect(elapsed < .milliseconds(700), "the close took \(elapsed)")
+            }
         }
     }
 
@@ -140,24 +160,28 @@ struct StateMachineClosingTests {
         try Data(wrongKey).write(to: keyURL)
         defer { try? FileManager.default.removeItem(at: keyURL) }
 
-        let start = ContinuousClock.now
-        await #expect(throws: QUICConnectionError.self) {
-            let pair = try await makeConsumerPair(
-                drivers: Drivers(client: .stateMachine, server: .stateMachine),
-                configureClient: { configuration in
-                    configuration.verificationConfiguration = .rawPublicKeys(publicKeyFilePath: keyURL.path)
-                },
-                configureClientPipeline: Self.delayClientReads,
-                makeClientConsumer: { _ in RecordConsumer(recording: StreamRecording()) },
-                makeServerConsumer: { _ in EchoConsumer() }
-            )
-            try? await pair.close()
-        }
-        let elapsed = ContinuousClock.now - start
+        try await Self.withOwnEventLoops { eventLoopGroup in
+            let start = ContinuousClock.now
+            await #expect(throws: QUICConnectionError.self) {
+                let pair = try await makeConsumerPair(
+                    drivers: Drivers(client: .stateMachine, server: .stateMachine),
+                    eventLoopGroup: eventLoopGroup,
+                    configureClient: { configuration in
+                        configuration.verificationConfiguration = .rawPublicKeys(publicKeyFilePath: keyURL.path)
+                    },
+                    configureClientPipeline: Self.delayClientReads,
+                    makeClientConsumer: { _ in RecordConsumer(recording: StreamRecording()) },
+                    makeServerConsumer: { _ in EchoConsumer() }
+                )
+                try? await pair.close()
+            }
+            let elapsed = ContinuousClock.now - start
 
-        // The server's first flight takes the delay to arrive. The closing period would add three
-        // PTOs: with one RTT sample a PTO is three RTTs (RFC 9002 Section 6.2.1), so 2.7 s.
-        #expect(elapsed < .seconds(1), "the failure took \(elapsed)")
+            // The server's first flight takes the delay to arrive. The closing period would add
+            // three PTOs: with one RTT sample a PTO is three RTTs (RFC 9002 Section 6.2.1), so
+            // 2.7 s.
+            #expect(elapsed < .seconds(1), "the failure took \(elapsed)")
+        }
     }
 
     @available(anyAppleOS 26, *)
