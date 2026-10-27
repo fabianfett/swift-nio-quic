@@ -75,7 +75,7 @@ final class SendableAddress: Sendable {
         self.address = Mutex(address)
     }
 
-    fileprivate(set) var value: SocketAddress {
+    var value: SocketAddress {
         get {
             self.address.withLock { $0 }
         }

@@ -321,7 +321,7 @@ struct ConnectionMigrationTests {
 /// leave through `currentSocket`, or the client's own socket while it is `nil`. Datagrams arriving on any
 /// other socket are dropped because that address is gone.
 @available(anyAppleOS 26, *)
-private final class AddressSwitchHandler: ChannelDuplexHandler {
+final class AddressSwitchHandler: ChannelDuplexHandler {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
     typealias OutboundIn = AddressedEnvelope<ByteBuffer>
 
@@ -345,7 +345,7 @@ private final class AddressSwitchHandler: ChannelDuplexHandler {
 /// Installed on a new socket of the client. While the client uses that socket, feeds what arrives there into
 /// the client's pipeline just past the `AddressSwitchHandler`, so the client's `QUICHandler` receives it as before.
 @available(anyAppleOS 26, *)
-private final class RelayHandler: ChannelInboundHandler {
+final class RelayHandler: ChannelInboundHandler {
     typealias InboundIn = AddressedEnvelope<ByteBuffer>
 
     private let clientChannel: any Channel
@@ -377,7 +377,7 @@ private final class RelayHandler: ChannelInboundHandler {
 /// Sits in the client's pipeline and remembers the last short-header packet the client sent, which
 /// carries the server's connection ID.
 @available(anyAppleOS 26, *)
-private final class ShortHeaderRecorder: ChannelOutboundHandler {
+final class ShortHeaderRecorder: ChannelOutboundHandler {
     typealias OutboundIn = AddressedEnvelope<ByteBuffer>
 
     private(set) var lastPacket: ByteBuffer?

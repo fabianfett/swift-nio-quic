@@ -29,6 +29,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var core: QUICConnectionCore
     let role: Role
     let localAddress: SocketAddress
+    /// The address of the active path, which the channel reports.
     let remoteAddress: SendableAddress
     private let eventLoop: any EventLoop
     private let allocator: ByteBufferAllocator
@@ -41,7 +42,17 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private(set) var streamTable: QUICStreamTable<Consumer>?
 
     /// Datagrams received in the current read loop, processed on `receivePacketsComplete`.
-    private var inbound: Deque<ByteBuffer> = []
+    private var inbound: Deque<AddressedEnvelope<ByteBuffer>> = []
+
+    /// The core paths a server knows, by the client address they lead to, in the order they were
+    /// added; the handshake's path first. A client only has the one to the server.
+    private var paths: [(address: SocketAddress, id: CorePathID)]
+    private var nextPathID = CorePathID.initial.rawValue + 1
+
+    /// The most paths a server keeps. Anyone who sees a connection's packets can send copies from
+    /// other addresses, each of which the core takes for a new path (RFC 9000 Section 9.3.2), so
+    /// a new address beyond this replaces the oldest path other than the active one.
+    static var maximumPaths: Int { 4 }
     private var inReadLoop = false
 
     private var timer: Scheduled<Void>?
@@ -50,7 +61,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// A datagram the core built for a later departure, and when it leaves (RFC 9002 Section
     /// 7.7). The core paces each datagram as it builds it, so the driver holds this one, and
     /// builds no more, until the timer sends it.
-    private var pacedDatagram: (datagram: ByteBuffer, departure: NetworkClock.Instant)?
+    private var pacedDatagram: (datagram: AddressedEnvelope<ByteBuffer>, departure: NetworkClock.Instant)?
 
     /// Locally opened streams waiting for the peer to allow more streams.
     private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
@@ -93,6 +104,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.core.congestionWindow
     }
 
+    /// The paths the driver keeps.
+    var _forTesting_pathCount: Int {
+        self.paths.count
+    }
+
     /// The largest UDP payload the connection sends.
     var _forTesting_maximumDatagramSize: Int {
         self.maximumDatagramSize
@@ -113,6 +129,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.role = role
         self.localAddress = localAddress
         self.remoteAddress = SendableAddress(remoteAddress)
+        self.paths = [(remoteAddress, .initial)]
         self.eventLoop = eventLoop
         self.allocator = ByteBufferAllocator()
         self.logger = logger
@@ -145,6 +162,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Spread each congestion window over the RTT rather than sending it in one burst (RFC
         // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
         coreConfiguration.pacingEnabled = true
+        // The driver issues no spare connection IDs and routes none (`.newLocalConnectionID`),
+        // so a peer can't migrate to a new connection ID: it only follows a NAT rebinding,
+        // which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
+        coreConfiguration.disableActiveMigration = true
         return coreConfiguration
     }
 
@@ -316,19 +337,49 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             self.inReadLoop = true
             self.streamTable?.inReadLoop = true
         }
-        self.inbound.append(envelope.data)
+        self.inbound.append(envelope)
         return envelope.data.readableBytes
     }
 
     func receivePacketsComplete() {
         let now = Self.now
-        while var datagram = self.inbound.popFirst() {
-            datagram.withUnsafeMutableReadableBytes { pointer in
+        while var envelope = self.inbound.popFirst() {
+            let path = self.path(for: envelope.remoteAddress)
+            envelope.data.withUnsafeMutableReadableBytes { pointer in
                 var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-                self.core.receive(&span, now: now)
+                self.core.receive(&span, on: path, now: now)
             }
         }
         self.afterCoreUpdate()
+    }
+
+    // MARK: Paths
+
+    /// The core path for a datagram from `address`, added if it is new.
+    ///
+    /// The core moves a server to a path once a non-probing packet arrives there, and validates
+    /// the path (RFC 9000 Section 9.3), which is how a server follows a client's NAT rebinding.
+    private func path(for address: SocketAddress) -> CorePathID {
+        // A client only talks to the server's address; the server doesn't migrate.
+        guard self.role == .server else { return self.core.activePathID }
+        if let path = self.paths.first(where: { $0.address == address }) {
+            return path.id
+        }
+        if self.paths.count >= Self.maximumPaths {
+            let activePath = self.core.activePathID
+            // '!' is fine: there are several paths, and only one is active.
+            let index = self.paths.firstIndex { $0.id != activePath }!
+            self.core.forgetPath(self.paths[index].id)
+            self.paths.remove(at: index)
+        }
+        let path = CorePathID(self.nextPathID)
+        self.nextPathID += 1
+        self.paths.append((address, path))
+        return path
+    }
+
+    private func address(of path: CorePathID) -> SocketAddress? {
+        self.paths.first { $0.id == path }?.address
     }
 
     func exitReadLoop() {
@@ -396,9 +447,20 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .newLocalConnectionID, .retiredLocalConnectionID, .newPeerConnectionID, .retiredPeerConnectionID:
                 // The core issues no connection IDs on its own, and the peer's aren't routed yet.
                 ()
-            case .pathValidated, .pathFailed, .activePathChanged:
-                // Everything arrives on and goes out to one path.
+            case .pathValidated:
                 ()
+            case .pathFailed(let path):
+                // The core went back to a validated path if this one was active (RFC 9000 Section
+                // 9.3.2); forget it unless it still is.
+                if path != self.core.activePathID {
+                    self.core.forgetPath(path)
+                    self.paths.removeAll { $0.id == path }
+                }
+            case .activePathChanged(let path):
+                if let address = self.address(of: path) {
+                    self.logger.debug("Peer moved", metadata: [LoggingKeys.addressRemote: "\(address)"])
+                    self.remoteAddress.value = address
+                }
             case .earlyDataRejected, .transportParametersForResumption:
                 // Stream consumer connections don't enable 0-RTT.
                 ()
@@ -525,7 +587,18 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // `now` has microseconds; a departure within that is due, so a timer fired for it
         // never finds it early.
         let dueBy = now.advanced(by: .microseconds(1))
-        let remoteAddress = self.remoteAddress.value
+        // PATH_CHALLENGE and PATH_RESPONSE for other paths go out first, unpaced (RFC 9000
+        // Section 8.2).
+        while let path = self.core.pathWithProbeToSend, let address = self.address(of: path) {
+            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
+            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
+                pointer in
+                var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
+                return self.core.send(into: &span, on: path, now: now) ?? 0
+            }
+            guard written > 0 else { break }
+            transport.writeDatagram(AddressedEnvelope(remoteAddress: address, data: buffer), promise: nil)
+        }
         if let (datagram, departure) = self.pacedDatagram {
             guard departure < dueBy else {
                 // Still early: the timer drains again at its departure.
@@ -533,8 +606,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 return
             }
             self.pacedDatagram = nil
-            transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: datagram), promise: nil)
+            transport.writeDatagram(datagram, promise: nil)
         }
+        let remoteAddress = self.remoteAddress.value
         while true {
             var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
             let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
@@ -546,7 +620,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             if let departure = self.core.departureTime, departure >= dueBy {
                 // The pacer holds this datagram back: keep it for the timer and stop here, as
                 // every later datagram leaves later still.
-                self.pacedDatagram = (buffer, departure)
+                self.pacedDatagram = (AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), departure)
                 break
             }
             transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), promise: nil)
