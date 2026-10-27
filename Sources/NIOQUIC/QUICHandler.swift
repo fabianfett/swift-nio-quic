@@ -376,6 +376,26 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.connectionRegistry.remove(handle)
     }
 
+    /// Hands a short-header packet that routes to no connection to the connections with its sender.
+    ///
+    /// A stateless reset carries no connection ID of ours: only a connection can recognize it, by
+    /// the token it ends in (RFC 9000 Section 10.3.1). A client has few connections, so it hands
+    /// such a packet to each one with the sender as its peer.
+    ///
+    /// - Returns: Whether a connection got the packet.
+    private func deliverPossibleStatelessReset(_ envelope: AddressedEnvelope<ByteBuffer>) -> Bool {
+        // The shortest stateless reset: a header byte, four unpredictable bytes and the token
+        // (RFC 9000 Section 10.3).
+        guard envelope.data.readableBytes >= 21 else { return false }
+
+        var delivered = false
+        for view in self.connectionRegistry.values where view.remoteAddress == envelope.remoteAddress {
+            self.deliverPacket(envelope, to: view)
+            delivered = true
+        }
+        return delivered
+    }
+
     /// Answers a packet which routes to no connection with a stateless reset (RFC 9000 § 10.3),
     /// telling the peer to give up on a connection this endpoint has no state for.
     ///
@@ -866,6 +886,9 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         )
                         self.trySendStatelessReset(for: header, triggeredBy: addressedEnvelope)
                     }
+                } else if header.type == .short, self.deliverPossibleStatelessReset(addressedEnvelope) {
+                    // A client connection to the sender may recognize it as a stateless reset.
+                    ()
                 } else {
                     self.logger.warning(
                         "QUICHandler dropping packet",
@@ -998,6 +1021,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         sourceConnectionID: newSourceConnectionID,
                         originalDestinationConnectionID: destinationConnectionID,
                         peerConnectionID: sourceConnectionID,
+                        statelessResetTokenGenerator: self.statelessResetTokenGenerator,
                         authenticator: self.authenticator,
                         localAddress: localAddress,
                         remoteAddress: addressedEnvelope.remoteAddress,

@@ -564,6 +564,14 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 }
 
 @available(anyAppleOS 26, *)
+extension QUICConnectionChannel.TransportView where Consumer: ~Copyable {
+    /// The address of the connection's peer.
+    var remoteAddress: SocketAddress? {
+        self.channel.remoteAddress
+    }
+}
+
+@available(anyAppleOS 26, *)
 @available(*, unavailable)
 extension QUICConnectionChannel.TransportView: Sendable where Consumer: ~Copyable {}
 

@@ -148,6 +148,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         sourceConnectionID: QUICConnectionID,
         originalDestinationConnectionID: QUICConnectionID,
         peerConnectionID: QUICConnectionID?,
+        statelessResetTokenGenerator: any QUICStatelessResetToken.Generator,
         authenticator: Authenticator?,
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
@@ -165,8 +166,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             authenticator: authenticator,
             serverName: serverName
         )
+        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
+        // The token for the handshake connection ID, which lets a client recognize the stateless
+        // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
+        // Only a server sends one. Zero-length connection IDs have no token to derive.
+        if sourceConnectionID.length > 0 {
+            coreConfiguration.statelessResetToken = statelessResetTokenGenerator.token(for: sourceConnectionID).token
+        }
         let core = QUICConnectionCore(
-            serverWith: Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions),
+            serverWith: coreConfiguration,
             localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
             originalDestinationConnectionID: SwiftNetwork.QUICConnectionID(originalDestinationConnectionID),
             peerConnectionID: peerConnectionID.map { SwiftNetwork.QUICConnectionID($0) }
