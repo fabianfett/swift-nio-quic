@@ -625,7 +625,7 @@ struct QUICStreamTableTests {
         var consumer = RecordingConsumer()
         let handle = table.insertSlot(id: 0, state: nil)
         let identifier = table.registerIdentifier(for: handle)
-        let lowerLinkage = DisconnectReportingLinkage(context: table.context)
+        let lowerLinkage = TestLowerLinkage(context: table.context)
         table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage(external: lowerLinkage))
         lowerLinkage.upper = QUICStreamUpperLinkage(table: table, handle: handle, identifier: identifier)
 
@@ -645,7 +645,7 @@ struct QUICStreamTableTests {
         var consumer = RecordingConsumer(pullLimit: 0)
         let handle = table.insertSlot(id: 0, state: nil)
         let identifier = table.registerIdentifier(for: handle)
-        let lowerLinkage = DisconnectReportingLinkage(context: table.context)
+        let lowerLinkage = TestLowerLinkage(context: table.context)
         table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage(external: lowerLinkage))
         lowerLinkage.upper = QUICStreamUpperLinkage(table: table, handle: handle, identifier: identifier)
 
@@ -654,12 +654,45 @@ struct QUICStreamTableTests {
         #expect(consumer.sightings.isEmpty)
         #expect(table.count == 0)
     }
+
+    // MARK: - Reading
+
+    /// Each pull enters the stack. Nothing follows a FIN, so a read that brings one pulls once; any
+    /// other read pulls again to find the stack has nothing more.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: [true, false])
+    func readPullsAgainOnlyWithoutTheFin(fin: Bool) {
+        let table = Self.makeRecordingTable()
+        var consumer = RecordingConsumer()
+        let handle = table.insertSlot(id: 0, state: .init(madeAt: 0))
+        let identifier = table.registerIdentifier(for: handle)
+        let lowerLinkage = TestLowerLinkage(context: table.context)
+        table.attach(handle, identifier: identifier, linkage: BaseOutboundStreamLinkage(external: lowerLinkage))
+        table.assignID(0, to: handle)
+
+        var frame = Frame(copyBuffer: Array("hello".utf8))
+        frame.connectionComplete = fin
+        var inbound = FrameArray()
+        inbound.add(frame: frame)
+        lowerLinkage.inbound = consume inbound
+
+        let outcome = table.withStream(handle: handle) { stream, _ in
+            stream.read { bytes in bytes.byteCount }
+        }
+
+        let expected: QUICStreamReadOutcome = fin ? .endOfStream(5) : .read(5)
+        #expect(outcome == expected)
+        #expect(lowerLinkage.receiveCalls == (fin ? 1 : 2))
+
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+    }
 }
 
-/// A stream's lower linkage that reports the stream's disconnect back up before the disconnect call
-/// returns, the way the stack can.
+/// A stream's lower linkage standing in for the stack: it hands over the inbound frames a test
+/// queues, and reports the stream's disconnect back up before the disconnect call returns, the way
+/// the stack can.
 @available(anyAppleOS 26, *)
-private final class DisconnectReportingLinkage: ExternalOutboundStreamLinkage, ProtocolInstance {
+private final class TestLowerLinkage: ExternalOutboundStreamLinkage, ProtocolInstance {
     let context: NetworkContext
     var identifier: InstanceIdentifier
     var eventManager: ProtocolEventManager
@@ -669,6 +702,12 @@ private final class DisconnectReportingLinkage: ExternalOutboundStreamLinkage, P
 
     private(set) var reportedDisconnect: Bool
 
+    /// The frames the next pull hands over.
+    var inbound: FrameArray?
+
+    /// How many times the stream pulled inbound frames.
+    private(set) var receiveCalls: Int
+
     /// Registers with `context`, which acquires the event context: must be called with none held.
     init(context: NetworkContext) {
         self.context = context
@@ -677,6 +716,8 @@ private final class DisconnectReportingLinkage: ExternalOutboundStreamLinkage, P
         self.eventManager = eventManager
         self.upper = nil
         self.reportedDisconnect = false
+        self.inbound = nil
+        self.receiveCalls = 0
     }
 
     func disconnect(
@@ -739,7 +780,8 @@ private final class DisconnectReportingLinkage: ExternalOutboundStreamLinkage, P
         for instance: InstanceIdentifier,
         in eventContext: inout NetworkContext.EventContext
     ) throws(NetworkError) -> FrameArray? {
-        nil
+        self.receiveCalls += 1
+        return self.inbound.take()
     }
 
     func getOutboundStreamDataRoomAvailable(
