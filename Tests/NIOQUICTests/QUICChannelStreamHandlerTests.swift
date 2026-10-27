@@ -357,6 +357,8 @@ struct QUICChannelStreamHandlerTests {
             switch streamChannel.swiftNetworkStreamHandle.invokeDetach() {
             case .proceed:
                 break
+            case .skipNotAttached:
+                Issue.record("Pre-condition: handle should have been attached")
             case .skipAlreadyDetached:
                 Issue.record("Pre-condition: handle should have been attached")
             }
@@ -603,7 +605,7 @@ struct QUICChannelStreamHandlerTests {
             // Extract the linkage from the non-mutating send-data wrapper.
             let linkage: BaseOutboundStreamLinkage
             switch streamChannel.swiftNetworkStreamHandle.invokeSendStreamData() {
-            case .proceed(let extracted):
+            case .proceed(let extracted, _):
                 linkage = extracted
             case .handleViolation:
                 Issue.record("Pre-condition: handle should have been attached")
@@ -617,6 +619,8 @@ struct QUICChannelStreamHandlerTests {
             switch streamChannel.swiftNetworkStreamHandle.invokeDetach() {
             case .proceed:
                 break
+            case .skipNotAttached:
+                Issue.record("Pre-condition: handle should have been attached")
             case .skipAlreadyDetached:
                 Issue.record("Pre-condition: handle should have been attached")
             }

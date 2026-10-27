@@ -902,6 +902,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 in: &eventContext
             )
         }
+        // There is no flow: attach the handler to an empty linkage, which ignores its calls.
+        handler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(
+            linkage: BaseOutboundStreamLinkage(),
+            identifier: handler.identifier
+        )
         switch handler.streamStateMachine.streamConnected(direction: direction) {
         case .activateStream: break
         case .ignoreAlreadyConnected:

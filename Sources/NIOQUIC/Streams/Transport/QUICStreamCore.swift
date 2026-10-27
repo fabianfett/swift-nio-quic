@@ -53,9 +53,6 @@ struct QUICStreamCore: ~Copyable {
     /// The handle used to talk to the SwiftNetwork stack.
     private var handle: SwiftNetworkStreamHandle
 
-    /// The identifier every linkage call is made "from".
-    private var identifier: InstanceIdentifier
-
     #if DEBUG
     /// Whether attach has been called yet.
     private var hasAttached: Bool = false
@@ -73,7 +70,6 @@ struct QUICStreamCore: ~Copyable {
         self.id = id
         self.state = QUICStreamStateMachine()
         self.handle = SwiftNetworkStreamHandle()
-        self.identifier = InstanceIdentifier()
         self.pendingWrites = FrameArray()
         self.undeliveredReads = FrameArray()
         self.finPending = false
@@ -87,15 +83,14 @@ struct QUICStreamCore: ~Copyable {
         assert(!self.hasAttached, "\(#function) called more than once")
         self.hasAttached = true
         #endif
-        self.identifier = identifier
-        self.handle = SwiftNetworkStreamHandle(linkage: linkage)
+        self.handle = SwiftNetworkStreamHandle(linkage: linkage, identifier: identifier)
     }
 
-    /// The stack's metadata for this stream, or `nil` if it is detached.
+    /// The stack's metadata for this stream, or `nil` if it isn't attached.
     func metadata(in eventContext: inout NetworkContext.EventContext) -> ProtocolMetadata<QUICProtocol>? {
         switch self.handle.invokeGetMetadata() {
-        case .proceed(let linkage):
-            return linkage.invokeGetMetadata(for: self.identifier, in: &eventContext) as ProtocolMetadata<QUICProtocol>?
+        case .proceed(let linkage, let identifier):
+            return linkage.invokeGetMetadata(for: identifier, in: &eventContext) as ProtocolMetadata<QUICProtocol>?
         case .ignore:
             return nil
         }
@@ -364,12 +359,12 @@ extension QUICStreamCore {
         let received: FrameArray?
 
         switch self.handle.invokeReceiveStreamData() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             do throws(NetworkError) {
                 received = try linkage.invokeReceiveStreamData(
                     minimumBytes: 1,
                     maximumBytes: .max,
-                    for: self.identifier,
+                    for: identifier,
                     in: &eventContext
                 )
             } catch {
@@ -379,7 +374,7 @@ extension QUICStreamCore {
             }
 
         case .handleViolation:
-            received = nil  // Detached: the stack has finished with this stream.
+            received = nil  // Not attached: the stack has nothing (more) for this stream.
         }
 
         switch consume received {
@@ -511,9 +506,9 @@ extension QUICStreamCore {
     @usableFromInline
     func writableBytes(in eventContext: inout NetworkContext.EventContext) -> Int {
         switch self.handle.invokeSendStreamData() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             do throws(NetworkError) {
-                return try linkage.invokeGetOutboundStreamDataRoomAvailable(for: self.identifier, in: &eventContext)
+                return try linkage.invokeGetOutboundStreamDataRoomAvailable(for: identifier, in: &eventContext)
             } catch {
                 return 0  // Not connected, or the stack has finished with the send side.
             }
@@ -636,9 +631,9 @@ extension QUICStreamCore {
         }
 
         switch self.handle.invokeSendStreamData() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             let outgoing = self.pendingWrites.drainArray()
-            try linkage.invokeSendStreamData(outgoing, from: self.identifier, in: &eventContext)
+            try linkage.invokeSendStreamData(outgoing, from: identifier, in: &eventContext)
 
         case .handleViolation(let reason):
             self.pendingWrites.finalizeAllFramesAsFailed()
@@ -740,19 +735,21 @@ extension QUICStreamCore {
         }
 
         switch self.handle.invokeDisconnect() {
-        case .proceed(let linkage):
-            linkage.invokeDisconnect(error: error, for: self.identifier, in: &eventContext)
+        case .proceed(let linkage, let identifier):
+            linkage.invokeDisconnect(error: error, for: identifier, in: &eventContext)
         case .ignore:
-            ()  // Already detached.
+            ()  // Never attached, or already detached.
         }
 
         switch self.handle.invokeDetach() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             do throws(NetworkError) {
-                try linkage.invokeDetach(for: self.identifier, in: &eventContext)
+                try linkage.invokeDetach(for: identifier, in: &eventContext)
             } catch {
                 ()  // The stack has already let go of its side.
             }
+        case .skipNotAttached:
+            ()  // The stream never reached the stack: its attach failed.
         case .skipAlreadyDetached:
             ()
         }
@@ -760,8 +757,6 @@ extension QUICStreamCore {
         self.abandonLocally()
         self.finPending = false
         self.coalescedBytes = []
-        // Detached: nothing is sent from this stream any more.
-        self.identifier = InstanceIdentifier()
     }
 
     /// Finalizes whatever is still queued locally, without touching the stack.
@@ -779,27 +774,27 @@ extension QUICStreamCore {
 
     private func abortInbound(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
         switch self.handle.invokeAbortInbound() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             do throws(NetworkError) {
-                try linkage.invokeAbortInbound(error: error, for: self.identifier, in: &eventContext)
+                try linkage.invokeAbortInbound(error: error, for: identifier, in: &eventContext)
             } catch {
                 ()  // The stack has already torn the receive side down.
             }
         case .ignore:
-            ()  // Detached: there is nothing to abort.
+            ()  // Not attached: there is nothing to abort.
         }
     }
 
     private func abortOutbound(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
         switch self.handle.invokeAbortOutbound() {
-        case .proceed(let linkage):
+        case .proceed(let linkage, let identifier):
             do throws(NetworkError) {
-                try linkage.invokeAbortOutbound(error: error, for: self.identifier, in: &eventContext)
+                try linkage.invokeAbortOutbound(error: error, for: identifier, in: &eventContext)
             } catch {
                 ()  // The stack has already torn the send side down.
             }
         case .ignore:
-            ()  // Detached: there is nothing to abort.
+            ()  // Not attached: there is nothing to abort.
         }
     }
 }

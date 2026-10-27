@@ -336,7 +336,10 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
                     BaseInboundStreamLinkage(external: streamHandler),
                     existingFlowInstance: flowInstance
                 )
-                streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(linkage: linkage)
+                streamHandler.swiftNetworkStreamHandle = SwiftNetworkStreamHandle(
+                    linkage: linkage,
+                    identifier: streamHandler.identifier
+                )
                 streamHandler.setNewFlowMetadata(metadata)
                 streamHandler.start(fromNewFlowHandler: true, in: &eventContext)
                 self.connectionView.newInboundStream(streamHandler)
