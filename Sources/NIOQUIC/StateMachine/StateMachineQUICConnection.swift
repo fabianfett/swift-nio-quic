@@ -59,6 +59,14 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var reportedClose = false
     /// Whether the close was initiated locally, through `close(...)`.
     private var closedLocally = false
+    /// Whether the core reported `.closed`: it needs no more driving.
+    private(set) var isClosed = false
+
+    /// Where the connection sends once its channel is gone, while the core closes or drains.
+    private var closingTransport: QUICHandler<Consumer>.ChildView?
+    /// Runs when the core closed after the channel went away; the handler stops routing to the
+    /// connection. Holds the handler, which holds the connection, until then.
+    private var onClosedWithoutChannel: (() -> Void)?
 
     /// The largest UDP payload sent.
     private let maximumDatagramSize: Int
@@ -316,7 +324,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.openPendingStreams()
         self.rescheduleTimer()
         if !self.inReadLoop {
-            self.channelView?.drainOutbound()
+            if let channelView = self.channelView {
+                channelView.drainOutbound()
+            } else if let transport = self.closingTransport {
+                self.drainPacketsToSend(to: transport)
+                transport.flush()
+            }
         }
     }
 
@@ -376,8 +389,14 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                     let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
                 else { continue }
                 table.streamDisconnected(handle, error: nil)
+            case .closing(let reason):
+                // The connection carries no more data: tell the channel and its streams now,
+                // not after the closing or draining period (RFC 9000 Section 10.2). The core
+                // keeps running on this connection's timer until it reports `.closed`.
+                self.logger.debug("Connection closing", metadata: ["quic.close.reason": "\(reason)"])
+                self.reportClose(reason)
             case .closed(let reason):
-                self.connectionClosed(reason)
+                self.coreClosed(reason)
             }
         }
     }
@@ -394,11 +413,25 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         }
     }
 
-    private func connectionClosed(_ reason: QUICConnectionCore.CloseReason) {
+    /// The core is closed: nothing is left to drive, and the connection can be released.
+    private func coreClosed(_ reason: QUICConnectionCore.CloseReason) {
         self.timer?.cancel()
         self.timer = nil
         self.timerDeadline = nil
+        self.isClosed = true
         self.logger.debug("Connection closed", metadata: ["quic.close.reason": "\(reason)"])
+        // `.closing` always comes first, so this only reports a close the channel missed.
+        self.reportClose(reason)
+        self.closingTransport = nil
+        if let onClosedWithoutChannel = self.onClosedWithoutChannel {
+            self.onClosedWithoutChannel = nil
+            onClosedWithoutChannel()
+        }
+    }
+
+    /// Tells the channel, once, that the connection closed, which fails its streams with the
+    /// reason.
+    private func reportClose(_ reason: QUICConnectionCore.CloseReason) {
         guard !self.reportedClose else { return }
         self.reportedClose = true
         let error: (any Error)?
@@ -476,7 +509,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     // MARK: Closing
 
     func close(isApplicationClose: Bool, errorCode: Int64, reason: String) -> Bool {
-        guard !self.core.isTerminating else { return false }
+        guard !self.core.isTerminating else {
+            // The connection is already closing on its own: make sure the channel learned why,
+            // rather than pretending it is still alive.
+            self.processEvents()
+            return false
+        }
         self.logger.debug(
             "Closing connection",
             metadata: [
@@ -519,8 +557,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     func dropChannelReferences() {
         self.channelView = nil
         self.streamTable?.outOfBandDrain = nil
-        self.timer?.cancel()
-        self.timer = nil
+        if self.core.isTerminating && !self.isClosed {
+            // The core still closes or drains (RFC 9000 Section 10.2): keep its timer, which
+            // holds the connection until the core reports `.closed`. The handler may route the
+            // peer's packets here meanwhile, see `continueClosing(transport:onClosed:)`.
+        } else {
+            self.timer?.cancel()
+            self.timer = nil
+            self.timerDeadline = nil
+        }
         #if canImport(SwiftTLS)
         // The core releases the handler only once the handshake is confirmed or the connection
         // closed. A connection closed during its handshake stops its timer here and never gets
@@ -529,6 +574,43 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.asyncContinuationTarget?.connection = nil
         self.asyncContinuationTarget = nil
         #endif
+    }
+
+    /// Whether the channel is gone but the core still closes or drains, and wants the peer's
+    /// packets until it is closed.
+    var isClosingWithoutChannel: Bool {
+        self.channelView == nil && self.core.isTerminating && !self.isClosed
+    }
+
+    /// Keeps driving a connection whose channel went away until its core is closed: it answers
+    /// the packets `receiveWhileClosing(_:)` hands it, sending through `transport`, and runs
+    /// `onClosed` when the core is closed (or not at all if `abandonClosing()` runs first).
+    func continueClosing(transport: QUICHandler<Consumer>.ChildView, onClosed: @escaping () -> Void) {
+        precondition(self.isClosingWithoutChannel)
+        self.closingTransport = transport
+        self.onClosedWithoutChannel = onClosed
+    }
+
+    /// Processes a datagram for a connection whose channel went away: while closing, the core
+    /// answers with CONNECTION\_CLOSE (RFC 9000 Section 10.2.1); while draining it ignores it.
+    func receiveWhileClosing(_ envelope: AddressedEnvelope<ByteBuffer>) {
+        guard self.closingTransport != nil else { return }
+        var datagram = envelope.data
+        let now = Self.now
+        datagram.withUnsafeMutableReadableBytes { pointer in
+            var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
+            self.core.receive(&span, now: now)
+        }
+        self.afterCoreUpdate()
+    }
+
+    /// Stops driving a connection whose channel went away: the handler is going away.
+    func abandonClosing() {
+        self.timer?.cancel()
+        self.timer = nil
+        self.timerDeadline = nil
+        self.closingTransport = nil
+        self.onClosedWithoutChannel = nil
     }
 
     // MARK: Streams

@@ -462,8 +462,10 @@ final class CertificateAuthTests: XCTestCase {
             )
             XCTFail("Client should not connect to untrusted server.")
         } catch let error as QUICConnectionError {
-            XCTAssert(error.code == 256)
-            XCTAssert(error.reason == "TLS error")
+            // A TLS alert closes with CRYPTO_ERROR, 0x100 plus the alert: bad_certificate (42)
+            // for a chain the client doesn't trust (RFC 9001 Section 4.8).
+            XCTAssertEqual(error.code, 0x12a)
+            XCTAssertEqual(error.reason, "TLS error")
             XCTAssert(error.isApplication == false)
         }
     }

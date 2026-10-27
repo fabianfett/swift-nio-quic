@@ -163,6 +163,8 @@ func withConsumerPair<
     configureClient: @escaping @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
     configureServer: @escaping @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
     inspectClientDatagram: (@Sendable (_ datagram: ByteBuffer) -> Void)? = nil,
+    configureClientPipeline: (@Sendable (_ pipeline: ChannelPipeline.SynchronousOperations) throws -> Void)? = nil,
+    configureServerPipeline: (@Sendable (_ pipeline: ChannelPipeline.SynchronousOperations) throws -> Void)? = nil,
     client: Client,
     server: Server,
     onServerConnection: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Void = { _ in },
@@ -179,6 +181,8 @@ func withConsumerPair<
         configureClient: configureClient,
         configureServer: configureServer,
         inspectClientDatagram: inspectClientDatagram,
+        configureClientPipeline: configureClientPipeline,
+        configureServerPipeline: configureServerPipeline,
         makeClientConsumer: { _ in client },
         makeServerConsumer: { connection in
             onServerConnection(connection)
@@ -208,6 +212,8 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
     configureClient: @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
     configureServer: @Sendable (_ configuration: inout QUICConfiguration) -> Void = { _ in },
     inspectClientDatagram: (@Sendable (_ datagram: ByteBuffer) -> Void)? = nil,
+    configureClientPipeline: (@Sendable (_ pipeline: ChannelPipeline.SynchronousOperations) throws -> Void)? = nil,
+    configureServerPipeline: (@Sendable (_ pipeline: ChannelPipeline.SynchronousOperations) throws -> Void)? = nil,
     makeClientConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Client>) -> Client,
     makeServerConsumer: @escaping @Sendable (_ connection: QUICStreamConnection<Server>) -> Server
 ) async throws -> ConsumerPair<Client, Server> {
@@ -269,6 +275,8 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
                 }
             )
             handler.connectionDriver = QUICConnectionDriver(drivers.server)
+            // Handlers between the socket and the QUIC handler.
+            try configureServerPipeline?(channel.pipeline.syncOperations)
             try channel.pipeline.syncOperations.addHandler(handler)
             return channel
         }
@@ -295,6 +303,7 @@ func makeConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>(
                 if let inspectClientDatagram {
                     try channel.pipeline.syncOperations.addHandler(DatagramInspector(inspect: inspectClientDatagram))
                 }
+                try configureClientPipeline?(channel.pipeline.syncOperations)
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }

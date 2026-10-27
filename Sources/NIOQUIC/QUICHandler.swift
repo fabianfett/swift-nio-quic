@@ -97,6 +97,10 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// A registry of connections.
     private var connectionRegistry: ConnectionRegistry<QUICConnectionChannel<Consumer>.TransportView>
+    /// State machine connections whose channel closed while their core still closes or drains
+    /// (RFC 9000 Section 10.2), under the routes they had. They answer their peer's packets until
+    /// the core is closed.
+    private var closingConnections: ConnectionRegistry<StateMachineQUICConnection<Consumer>>
     /// Decides whether new connections may be admitted.
     private var connectionAdmissionController: ConnectionAdmissionController
 
@@ -177,6 +181,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.authenticator = authenticator
         self.connectionHandle = .initial
         self.connectionRegistry = ConnectionRegistry()
+        self.closingConnections = ConnectionRegistry()
         self.makeConsumer = makeConsumer
         self.connectionDriver = .default(for: quicConfiguration.role)
         self.connectionAdmissionController = makeConnectionAdmissionController(
@@ -264,6 +269,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             }()
             let handle = self.nextConnectionHandle()
             let channel: QUICConnectionChannel<Consumer>
+            var stateMachineConnection: StateMachineQUICConnection<Consumer>?
             if self.makeConsumer != nil && self.connectionDriver == .stateMachine
                 && QUICConnectionDriver.stateMachineSupports(self.quicConfiguration)
             {
@@ -278,6 +284,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                     logger: connectionLogger
                 )
                 channel = self.makeQUICConnectionChannel(stateMachineConnection: connection, handle: handle)
+                stateMachineConnection = connection
             } else {
                 // The context is set when the channel becomes active so force unwrapping is okay here
                 let quicConnection = try SwiftNetworkQUICConnection<Consumer>.client(
@@ -319,7 +326,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                 }
 
             channel.closeFuture.assumeIsolated().whenComplete { _ in
-                self.connectionDidClose(handle)
+                self.connectionDidClose(handle, stateMachineConnection: stateMachineConnection)
             }
 
         case .shuttingDown:
@@ -371,9 +378,37 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.connectionsAwaitingReadComplete.removeAll(keepingCapacity: true)
     }
 
-    private func connectionDidClose(_ handle: ConnectionHandle) {
+    private func connectionDidClose(
+        _ handle: ConnectionHandle,
+        stateMachineConnection: StateMachineQUICConnection<Consumer>?
+    ) {
         self.eventLoop.assertInEventLoop()
+        let connectionIDs = self.connectionRegistry.connectionIDs(for: handle)
         self.connectionRegistry.remove(handle)
+
+        // A state machine connection's core outlives its channel while it closes or drains
+        // (RFC 9000 Section 10.2): keep routing the peer's packets to it, so that it answers them
+        // with CONNECTION_CLOSE, until the core is closed. Not once the UDP channel is gone.
+        guard let connection = stateMachineConnection, connection.isClosingWithoutChannel,
+            let firstConnectionID = connectionIDs.first, self.context?.channel.isActive == true
+        else { return }
+        self.closingConnections.insert(connection, forHandle: handle, connectionID: firstConnectionID)
+        for connectionID in connectionIDs.dropFirst() {
+            self.closingConnections.associate(connectionID, with: handle)
+        }
+        // The cycle through the handler is broken when the core is closed, or in
+        // `abandonClosingConnections()`.
+        connection.continueClosing(transport: ChildView(self)) {
+            self.closingConnections.remove(handle)
+        }
+    }
+
+    /// Stops driving the connections that close without a channel: the UDP channel is gone.
+    private func abandonClosingConnections() {
+        for connection in self.closingConnections.values {
+            connection.abandonClosing()
+        }
+        self.closingConnections = ConnectionRegistry()
     }
 
     /// Hands a short-header packet that routes to no connection to the connections with its sender.
@@ -810,6 +845,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         self.logger.trace("QUICHandler removed from channel pipeline")
         self.context = nil
         self.connectionRegistry.shutdownConnections(deadline: .now(), promise: nil)
+        self.abandonClosingConnections()
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
@@ -817,6 +853,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         asyncVerifierRunner?.terminate()
 
         self.connectionRegistry.notifyParentChannelInactive()
+        self.abandonClosingConnections()
 
         switch self.multiplexerContinuation {
         case .none:
@@ -887,6 +924,8 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
             case .accepting:
                 if let view = self.connectionRegistry[header.destinationConnectionID] {
                     self.deliverPacket(addressedEnvelope, to: view)
+                } else if let connection = self.closingConnections[header.destinationConnectionID] {
+                    connection.receiveWhileClosing(addressedEnvelope)
                 } else if self.quicConfiguration.role == .server {
                     if header.type != .short, header.version != .v1 {
                         // A long header in a version we don't speak starts no connection. Version
@@ -946,6 +985,10 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                 }
             case .shuttingDown:
                 // We still need to forward packets to open connections but not accept new ones.
+                if let connection = self.closingConnections[header.destinationConnectionID] {
+                    connection.receiveWhileClosing(addressedEnvelope)
+                    break
+                }
                 guard let view = self.connectionRegistry[header.destinationConnectionID] else {
                     self.logger.warning(
                         "QUICHandler dropping packet since the server is shutting down and not accepting new connections",
@@ -1215,9 +1258,15 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
             self.connectionAdmissionController.finishedHandshake()
         }
 
+        let stateMachineConnection: StateMachineQUICConnection<Consumer>?
+        if case .stateMachine(let connection) = quicConnection {
+            stateMachineConnection = connection
+        } else {
+            stateMachineConnection = nil
+        }
         channel.closeFuture.assumeIsolated().whenComplete { _ in
             self.connectionAdmissionController.closingConnection()
-            self.connectionDidClose(handle)
+            self.connectionDidClose(handle, stateMachineConnection: stateMachineConnection)
         }
     }
 }
