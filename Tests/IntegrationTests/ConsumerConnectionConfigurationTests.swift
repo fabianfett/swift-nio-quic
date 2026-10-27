@@ -81,7 +81,7 @@ struct ConsumerConnectionConfigurationTests {
             client: EchoConsumer(),
             server: EchoConsumer(),
             { pair in
-                await #expect(throws: QUICError.peerDoesNotAcceptDatagrams) {
+                _ = await #expect(throws: QUICError.peerDoesNotAcceptDatagrams) {
                     try await pair.clientConnection.channel.writeAndFlush(ByteBuffer(string: "ping"))
                 }
             }

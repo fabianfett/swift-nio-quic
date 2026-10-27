@@ -38,15 +38,18 @@ struct StatelessResetTests {
     ) async throws -> any Channel {
         let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
         let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
-        var configuration = QUICConfiguration.forServer(
-            serverName: "quic-test.local",
-            authenticationConfiguration: .rawPublicKeys(
-                publicKeyFilePath: publicKeyPath,
-                privateKeyFilePath: privateKeyPath
-            ),
-            applicationProtocols: ["http/0.9"]
-        )
-        configuration.maxIdleTimeout = Self.maxIdleTimeout
+        let configuration = {
+            var configuration = QUICConfiguration.forServer(
+                serverName: "quic-test.local",
+                authenticationConfiguration: .rawPublicKeys(
+                    publicKeyFilePath: publicKeyPath,
+                    privateKeyFilePath: privateKeyPath
+                ),
+                applicationProtocols: ["http/0.9"]
+            )
+            configuration.maxIdleTimeout = Self.maxIdleTimeout
+            return configuration
+        }()
 
         return try await DatagramBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .bind(host: "127.0.0.1", port: port)
@@ -80,11 +83,14 @@ struct StatelessResetTests {
 
         let recording = StreamRecording()
         let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
-        var configuration = QUICConfiguration.forClient(
-            verificationConfiguration: .rawPublicKeys(publicKeyFilePath: publicKeyPath),
-            applicationProtocols: ["http/0.9"]
-        )
-        configuration.maxIdleTimeout = Self.maxIdleTimeout
+        let configuration = {
+            var configuration = QUICConfiguration.forClient(
+                verificationConfiguration: .rawPublicKeys(publicKeyFilePath: publicKeyPath),
+                applicationProtocols: ["http/0.9"]
+            )
+            configuration.maxIdleTimeout = Self.maxIdleTimeout
+            return configuration
+        }()
         let client = try await DatagramBootstrap(group: MultiThreadedEventLoopGroup.singleton)
             .bind(host: "127.0.0.1", port: 0)
             .flatMapThrowing { channel in

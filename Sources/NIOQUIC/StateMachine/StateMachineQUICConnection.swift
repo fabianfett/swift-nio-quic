@@ -387,7 +387,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         let allocator = self.allocator
         while let datagram = self.core.readDatagram({ bytes in
             var buffer = allocator.buffer(capacity: bytes.byteCount)
-            bytes.withUnsafeBytes { buffer.writeBytes($0) }
+            _ = bytes.withUnsafeBytes { buffer.writeBytes($0) }
             return buffer
         }) {
             self.channelView?.datagramRead(datagram)
