@@ -75,11 +75,10 @@ struct ConsumerPair<Client: QUICStreamConsumer, Server: QUICStreamConsumer>: Sen
     func close() async throws {
         // A test that passes on the wrong driver proves nothing about the one it was meant for.
         #expect(self.clientConnection.driver == QUICConnectionDriver(self.drivers.client))
-        #expect(
-            self.serverConnectionDrivers.withLockedValue { $0 }.allSatisfy {
-                $0 == QUICConnectionDriver(self.drivers.server)
-            }
-        )
+        // At least one server connection, or the server's driver went unchecked.
+        let serverDrivers = self.serverConnectionDrivers.withLockedValue { $0 }
+        #expect(!serverDrivers.isEmpty, "the server accepted no connection")
+        #expect(serverDrivers.allSatisfy { $0 == QUICConnectionDriver(self.drivers.server) })
 
         do {
             try await self.serverChannel.close()
@@ -796,4 +795,3 @@ struct WindowedSenderConsumer: QUICStreamConsumer {
         }
     }
 }
-

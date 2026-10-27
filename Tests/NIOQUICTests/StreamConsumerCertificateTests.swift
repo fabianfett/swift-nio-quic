@@ -109,7 +109,8 @@ struct StreamConsumerCertificateTests {
     private static func serverChannel(
         certificates: TestCAFilePaths,
         serverName: String,
-        driver: QUICConnectionDriver
+        driver: QUICConnectionDriver,
+        acceptedDrivers: NIOLockedValueBox<[QUICConnectionDriver?]>
     ) async throws -> any Channel {
         let configuration = QUICConfiguration.forServer(
             serverName: serverName,
@@ -131,7 +132,10 @@ struct StreamConsumerCertificateTests {
                         privateKeyFilePath: certificates.serverPrivateKeyFilePath
                     ),
                     logger: Logger(label: "Server"),
-                    makeConsumer: { _ in EchoServer() }
+                    makeConsumer: { connection in
+                        acceptedDrivers.withLockedValue { $0.append(connection.driver) }
+                        return EchoServer()
+                    }
                 )
                 handler.connectionDriver = driver
                 try channel.pipeline.syncOperations.addHandler(handler)
@@ -142,6 +146,8 @@ struct StreamConsumerCertificateTests {
 
     /// Connects with `trustRoots` as the only trust anchors, sends `request` and returns the
     /// response, or `nil` if the connection closed without one.
+    ///
+    /// Checks that the client connection runs on `driver`, whether or not the handshake succeeds.
     @available(anyAppleOS 26, *)
     private static func echo(
         _ request: String,
@@ -151,6 +157,12 @@ struct StreamConsumerCertificateTests {
         driver: QUICConnectionDriver
     ) async throws -> String? {
         let (responses, continuation) = AsyncStream<ByteBuffer>.makeStream()
+        // The consumer is made when the connection is created, before the handshake can fail.
+        let clientDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
+        defer {
+            let drivers = clientDrivers.withLockedValue { $0 }
+            #expect(drivers == [driver])
+        }
         let configuration = QUICConfiguration.forClient(
             verificationConfiguration: .x509Certificates(trustRootsFilePath: trustRoots.trustStoreFilePath),
             applicationProtocols: ["echo"]
@@ -167,7 +179,10 @@ struct StreamConsumerCertificateTests {
                     ),
                     authenticator: nil,
                     logger: Logger(label: "Client"),
-                    makeConsumer: { _ in ResponseCollector(responses: continuation) }
+                    makeConsumer: { connection in
+                        clientDrivers.withLockedValue { $0.append(connection.driver) }
+                        return ResponseCollector(responses: continuation)
+                    }
                 )
                 handler.connectionDriver = driver
                 try channel.pipeline.syncOperations.addHandler(handler)
@@ -179,7 +194,6 @@ struct StreamConsumerCertificateTests {
         let connection = try await client.pipeline.handler(type: QUICHandler<ResponseCollector>.self)
             .flatMap { $0.createOutboundConnection(serverName: serverName, remoteAddress: server.localAddress!) }
             .get()
-        #expect(connection.driver == driver)
         // A failed handshake closes the connection channel; end the response stream then.
         connection.channel.closeFuture.whenComplete { _ in continuation.finish() }
         _ = try await connection.withStreams { streams in
@@ -202,10 +216,12 @@ struct StreamConsumerCertificateTests {
         let certificates = try TestCertificates()
         // Each case writes its own files: the cases run in parallel.
         let paths = try certificates.writeToTemp(fileTag: "aVerifiedServerEchoes-\(UUID())")
+        let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
         let server = try await Self.serverChannel(
             certificates: paths,
             serverName: certificates.leafName,
-            driver: drivers.server
+            driver: drivers.server,
+            acceptedDrivers: serverDrivers
         )
         let response = try await Self.echo(
             "ping",
@@ -215,6 +231,8 @@ struct StreamConsumerCertificateTests {
             driver: drivers.client
         )
         try await server.close()
+        let acceptedDrivers = serverDrivers.withLockedValue { $0 }
+        #expect(!acceptedDrivers.isEmpty && acceptedDrivers.allSatisfy { $0 == drivers.server })
         #expect(response == "ping")
     }
 
@@ -224,19 +242,29 @@ struct StreamConsumerCertificateTests {
         let certificates = try TestCertificates()
         let paths = try certificates.writeToTemp(fileTag: "aServerWithAnUntrustedChainIsRejected-\(UUID())")
         let otherRoots = try TestCertificates().writeToTemp(fileTag: "aServerWithAnUntrustedChainIsRejected-\(UUID())")
+        let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
         let server = try await Self.serverChannel(
             certificates: paths,
             serverName: certificates.leafName,
-            driver: drivers.server
+            driver: drivers.server,
+            acceptedDrivers: serverDrivers
         )
-        let response = try? await Self.echo(
-            "ping",
-            to: server,
-            serverName: certificates.leafName,
-            trustRoots: otherRoots,
-            driver: drivers.client
-        )
+        // The client's verifier rejects the chain, which fails the handshake with a TLS error
+        // (RFC 9001 Section 4.8) and so the connection attempt.
+        let error = await #expect(throws: QUICConnectionError.self) {
+            try await Self.echo(
+                "ping",
+                to: server,
+                serverName: certificates.leafName,
+                trustRoots: otherRoots,
+                driver: drivers.client
+            )
+        }
         try await server.close()
-        #expect(response == nil)
+        let acceptedDrivers = serverDrivers.withLockedValue { $0 }
+        #expect(!acceptedDrivers.isEmpty && acceptedDrivers.allSatisfy { $0 == drivers.server })
+        // A CRYPTO_ERROR (RFC 9000 Section 20.1), not some other failure such as a timeout.
+        #expect(error?.isApplication == false)
+        #expect(error.map { (0x100...0x1ff).contains($0.code) } == true, "\(String(describing: error))")
     }
 }
