@@ -70,6 +70,39 @@ struct ConnectionMigrationTests {
         }
     }
 
+    /// What a client of the dual-stack server sends to `127.0.0.1` reaches that server, not a
+    /// socket another test bound to `127.0.0.1` on the same port.
+    @available(anyAppleOS 26, *)
+    @Test(.enabled { await Self.isDualStackAvailable() })
+    func dualStackServerSharesNoPortWithIPv4Sockets() async throws {
+        let group = MultiThreadedEventLoopGroup.singleton
+        // Some 2% of the ports in the ephemeral range: without the explicit port, about every 50th
+        // dual-stack bind shares its port with one of them.
+        var ipv4Sockets: [any Channel] = []
+        defer {
+            for socket in ipv4Sockets {
+                socket.close(promise: nil)
+            }
+        }
+        for _ in 0..<300 {
+            ipv4Sockets.append(try await DatagramBootstrap(group: group).bind(host: Self.host, port: 0).get())
+        }
+        let ipv4Ports = Set(ipv4Sockets.map { $0.localAddress!.port! })
+
+        var sharedPorts: [Int] = []
+        for _ in 0..<400 {
+            let server = try await Self.bindDualStack(on: group) { port in
+                try await DatagramBootstrap(group: group).bind(host: "::", port: port).get()
+            }
+            let port = server.localAddress!.port!
+            try await server.close()
+            if ipv4Ports.contains(port) {
+                sharedPorts.append(port)
+            }
+        }
+        #expect(sharedPorts.isEmpty)
+    }
+
     @available(anyAppleOS 26, *)
     @Test
     func clientMigratesBackToItsFirstAddress() async throws {
@@ -128,6 +161,32 @@ struct ConnectionMigrationTests {
 
     private static let host = "127.0.0.1"
 
+    /// Binds a dual-stack socket with `bind`, to a port that no socket on an IPv4 address has.
+    ///
+    /// macOS picks the ephemeral port of a socket bound to `[::]:0` without looking at the sockets
+    /// bound to IPv4 addresses, so it can share its port with another test's socket on `127.0.0.1`,
+    /// which then gets everything sent to `127.0.0.1` on that port: a client of this server would
+    /// talk to the other test's server instead. A bind to an explicit port is checked against those
+    /// sockets, and later ephemeral IPv4 binds skip the port, so this binds to the port a socket on
+    /// `127.0.0.1` just got, once that socket is closed again.
+    static func bindDualStack(
+        on eventLoopGroup: any EventLoopGroup,
+        _ bind: (_ port: Int) async throws -> any Channel
+    ) async throws -> any Channel {
+        var attempts = 0
+        while true {
+            let probe = try await DatagramBootstrap(group: eventLoopGroup).bind(host: Self.host, port: 0).get()
+            let port = probe.localAddress!.port!
+            try await probe.close()
+            do {
+                return try await bind(port)
+            } catch let error as IOError where error.errnoCode == EADDRINUSE && attempts < 10 {
+                // Another socket took the port in between.
+                attempts += 1
+            }
+        }
+    }
+
     /// Whether a socket can bind `::`, which NIO makes dual-stack.
     static func isDualStackAvailable() async -> Bool {
         let channel = try? await DatagramBootstrap(group: MultiThreadedEventLoopGroup.singleton)
@@ -184,23 +243,29 @@ struct ConnectionMigrationTests {
             let serverConnectionChannel = NIOLockedValueBox<(any Channel)?>(nil)
             let latestServerStreamChannel = NIOLockedValueBox<(any Channel)?>(nil)
 
-            let serverChannel = try await createServerChannel(
-                eventLoopGroup: eventLoopGroup,
-                host: serverHost,
-                port: 0,
-                logger: Logger(label: "Server"),
-                inboundConnectionInitializer: { connectionChannel, _ in
-                    serverConnectionChannel.withLockedValue { $0 = connectionChannel }
-                    return connectionChannel.eventLoop.makeSucceededVoidFuture()
-                },
-                inboundStreamInitializer: { streamChannel in
-                    latestServerStreamChannel.withLockedValue { $0 = streamChannel }
-                    return streamChannel.eventLoop.makeCompletedFuture {
-                        try streamChannel.pipeline.syncOperations.addHandler(TestServerHandler())
-                    }
-                },
-                noMoreConnections: {}
-            ).get()
+            let bindServer = { (port: Int) in
+                try await createServerChannel(
+                    eventLoopGroup: eventLoopGroup,
+                    host: serverHost,
+                    port: port,
+                    logger: Logger(label: "Server"),
+                    inboundConnectionInitializer: { connectionChannel, _ in
+                        serverConnectionChannel.withLockedValue { $0 = connectionChannel }
+                        return connectionChannel.eventLoop.makeSucceededVoidFuture()
+                    },
+                    inboundStreamInitializer: { streamChannel in
+                        latestServerStreamChannel.withLockedValue { $0 = streamChannel }
+                        return streamChannel.eventLoop.makeCompletedFuture {
+                            try streamChannel.pipeline.syncOperations.addHandler(TestServerHandler())
+                        }
+                    },
+                    noMoreConnections: {}
+                ).get()
+            }
+            let serverChannel =
+                serverHost == "::"
+                ? try await ConnectionMigrationTests.bindDualStack(on: eventLoopGroup, bindServer)
+                : try await bindServer(0)
             let serverAddress = try SocketAddress(
                 ipAddress: ConnectionMigrationTests.host,
                 port: serverChannel.localAddress!.port!
