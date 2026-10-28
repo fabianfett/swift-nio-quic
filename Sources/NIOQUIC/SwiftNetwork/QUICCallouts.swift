@@ -262,28 +262,3 @@ enum QUICConnectionCallout {
 protocol QUICConnectionCalloutTarget: AnyObject {
     func run(_ callout: QUICConnectionCallout)
 }
-
-/// A protocol instance that exists only to enter the stack on behalf of code with no instance of its
-/// own: the stream table's operations, which act for streams that aren't `ProtocolInstance`s.
-@available(anyAppleOS 26, *)
-final class EventContextAnchor: ProtocolInstance {
-    let context: NetworkContext
-    var identifier: InstanceIdentifier
-    var eventManager: ProtocolEventManager
-
-    /// Registers with `context`, which acquires the event context: must be called with none held.
-    init(context: NetworkContext) {
-        self.context = context
-        var eventManager = ProtocolEventManager()
-        self.identifier = InstanceIdentifier(context: context, eventManager: &eventManager)
-        self.eventManager = eventManager
-    }
-
-    /// Unregisters, so its event manager doesn't trap on deinit. Idempotent.
-    func retire(through callouts: QUICCallouts) {
-        if self.identifier.isNone { return }
-        callouts.enter(as: self) { eventContext in
-            self.unregisterEventManager(in: &eventContext)
-        }
-    }
-}

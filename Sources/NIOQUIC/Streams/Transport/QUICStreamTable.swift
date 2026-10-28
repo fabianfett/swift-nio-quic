@@ -50,10 +50,10 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// right after, and `deinit` is the only other caller.
     private var _ignoresStackEvents: Bool
 
-    /// The lower linkage for the stream `open` is currently attaching to the stack.
+    /// Store the lower linkage for a stream during calls to `open`.
     ///
-    /// `ListenerLinkage.invokeAttachUpperProtocolToNewFlow` returns `Void` — it delivers the new
-    /// stream's `BaseOutboundStreamLinkage` synchronously via a callback to the stream's
+    /// A `QUICStreamOpener`'s attach calls `ListenerLinkage.invokeAttachUpperProtocolToNewFlow`,
+    /// which delivers the new stream's `BaseOutboundStreamLinkage` synchronously via a callback to the stream's
     /// `QUICStreamUpperLinkage.invokeAttachLowerProtocol`, fired from inside that same call. The
     /// callback stashes the linkage here once its attach has succeeded, and `open` takes it as soon
     /// as that call returns, so this is `nil` outside an `open`.
@@ -128,16 +128,8 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
             self.isClosed,
             "QUICStreamTable released before closeAll(error:disconnect:into:) or retireAnchor()"
         )
-        // A closed table takes no new streams (`open` throws, `attachInboundFlowToTable` declines
-        // the flow), and `closeAll` removes every stream, including any opened during its drain.
-        // So a table reaching `deinit` with live streams never ran `closeAll`: a teardown bug.
-        // Such streams' event managers are still registered and trap (an unretired anchor trips
-        // the precondition above first), and `deinit` has no event context to detach them with.
-        // Fabricating one would hide the bug.
-        //
-        // Streams that never reached the stack (unit tests insert slots directly) hold nothing
-        // registered. Their queued frames still need finalizing: `Frame.deinit` traps otherwise.
-        self.abandonAllLocally()
+        // Ensure all buffered data is cleaned up (i.e., finalize the frames).
+        self.vacateAllSlots()
     }
 
     /// The number of streams in the table.
@@ -656,7 +648,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Shared by `forceCloseAll(error:in:)` (detaches from the stack) and `abandonAllLocally()`
     /// (doesn't) so a future field added to one of these bulk-teardown paths isn't forgotten in
     /// the other. Consumer states are the caller's to release.
-    private func removeAllSlots(perSlot: (inout QUICStreamTransportState) -> Void) {
+    fileprivate func removeAllSlots(perSlot: (inout QUICStreamTransportState) -> Void) {
         // First, so no event resolves a stream while `removeAll` has the slots: closing a stream
         // can deliver its events synchronously.
         self._ignoresStackEvents = true
@@ -670,6 +662,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
     }
 
     /// Closes and vacates every remaining slot, without a visit.
+    ///
+    /// WARN: All events will be ignored after this.
     private func forceCloseAll(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
         self.removeAllSlots { transport in
             transport.core.close(error: error, in: &eventContext)
@@ -679,11 +673,15 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
     /// Vacates every remaining slot without touching the stack.
     ///
-    /// Used only from `deinit` — see the note there for why this doesn't call
-    /// `core.close(error:in:)` the way `forceCloseAll(error:in:)` does.
-    private func abandonAllLocally() {
+    /// Used only from `deinit`, which has no event context, so unlike `forceCloseAll(error:in:)`
+    /// this doesn't call `core.close(error:in:)`. Only slots that never reached the stack are
+    /// expected by then: a stream still attached means `closeAll` never ran, and its registered
+    /// event manager traps.
+    ///
+    /// WARN: All events will be ignored after this.
+    private func vacateAllSlots() {
         self.removeAllSlots { transport in
-            transport.core.abandonLocally()
+            transport.core.discardBufferedReadsAndWrites()
         }
     }
 }

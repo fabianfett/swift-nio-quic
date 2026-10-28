@@ -27,9 +27,9 @@ struct QUICStreamOpener {
 
     /// Attaches a new outbound flow for a stream.
     ///
-    /// Does not return the new flow's linkage — `invokeAttachUpperProtocolToNewFlow` delivers it
-    /// via a synchronous callback to `upperProtocol.invokeAttachLowerProtocol` instead, before it
-    /// returns. Callers read it from wherever that callback stashed it.
+    /// The new flow's linkage is delivered synchronously via the callback
+    /// `upperProtocol.invokeAttachLowerProtocol`, which will
+    /// assign it to `QUICStreamTable._pendingAttachLinkage`.
     func attach(
         isUnidirectional: Bool,
         upperProtocol: BaseInboundStreamLinkage

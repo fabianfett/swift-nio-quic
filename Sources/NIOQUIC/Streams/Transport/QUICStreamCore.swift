@@ -53,11 +53,6 @@ struct QUICStreamCore: ~Copyable {
     /// The handle used to talk to the SwiftNetwork stack.
     private var handle: SwiftNetworkStreamHandle
 
-    #if DEBUG
-    /// Whether attach has been called yet.
-    private var hasAttached: Bool = false
-    #endif
-
     /// Temporary space for coalescing into when the consumer asks for reads to be coalesced and
     /// the leading frame doesn't contain enough bytes.
     private var coalescedBytes: [UInt8]
@@ -79,10 +74,7 @@ struct QUICStreamCore: ~Copyable {
 
     /// Attaches this stream core to the stack.
     mutating func attach(identifier: InstanceIdentifier, linkage: BaseOutboundStreamLinkage) {
-        #if DEBUG
-        assert(!self.hasAttached, "\(#function) called more than once")
-        self.hasAttached = true
-        #endif
+        assert(!self.handle.isAttached)
         self.handle = SwiftNetworkStreamHandle(linkage: linkage, identifier: identifier)
     }
 
@@ -757,20 +749,13 @@ extension QUICStreamCore {
             ()
         }
 
-        self.abandonLocally()
+        self.discardBufferedReadsAndWrites()
         self.finPending = false
         self.coalescedBytes = []
     }
 
     /// Finalizes whatever is still queued locally, without touching the stack.
-    ///
-    /// `close(error:in:)` ends with it, once the stream has detached. `QUICStreamTable.deinit` calls
-    /// it on its own, because it has no event context to detach with: only a stream that never
-    /// reached the stack is expected there. One still attached means the table was never closed, a
-    /// teardown bug: its registered event manager traps when it's released (see
-    /// `QUICStreamTable.deinit`). Finalizing the queued frames is not optional: an un-finalized
-    /// `Frame` traps in its own `deinit`.
-    mutating func abandonLocally() {
+    mutating func discardBufferedReadsAndWrites() {
         self.pendingWrites.finalizeAllFramesAsFailed()
         self.undeliveredReads.finalizeAllFramesAsFailed()
     }
