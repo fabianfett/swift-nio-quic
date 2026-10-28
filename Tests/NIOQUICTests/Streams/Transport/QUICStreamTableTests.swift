@@ -655,6 +655,37 @@ struct QUICStreamTableTests {
         #expect(table.count == 0)
     }
 
+    /// Closing one stream can make the stack report events for another before the close returns.
+    /// While the table tears all its slots down, those must find nothing either.
+    @available(anyAppleOS 26, *)
+    @Test
+    func eventsForOtherStreamsDeliveredWhileAllSlotsAreTornDownAreDropped() {
+        let table = Self.makeRecordingTable()
+        var consumer = RecordingConsumer(pullLimit: 0)
+
+        let first = table.insertSlot(id: 0, state: nil)
+        let firstIdentifier = table.registerIdentifier(for: first)
+        let firstLinkage = TestLowerLinkage(context: table.context)
+        table.attach(first, identifier: firstIdentifier, linkage: BaseOutboundStreamLinkage(external: firstLinkage))
+
+        let second = table.insertSlot(id: 4, state: nil)
+        let secondIdentifier = table.registerIdentifier(for: second)
+        let secondLinkage = TestLowerLinkage(context: table.context)
+        table.attach(second, identifier: secondIdentifier, linkage: BaseOutboundStreamLinkage(external: secondLinkage))
+        let secondUpper = QUICStreamUpperLinkage(table: table, handle: second, identifier: secondIdentifier)
+
+        // The first stream closes first. Its flow reports room available on the second, as the
+        // stack's connection does when a disconnect sends frames.
+        var secondEvents: QUICStreamEvents?
+        firstLinkage.onDisconnect = { eventContext in
+            secondUpper.handleOutboundRoomAvailableEvent(for: InstanceIdentifier(), in: &eventContext)
+            secondEvents = table.events(for: second)
+        }
+
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+        #expect(secondEvents == [.closed, .readable])
+    }
+
     // MARK: - Reading
 
     /// Each pull enters the stack. Nothing follows a FIN, so a read that brings one pulls once; any
@@ -708,6 +739,9 @@ private final class TestLowerLinkage: ExternalOutboundStreamLinkage, ProtocolIns
     /// How many times the stream pulled inbound frames.
     private(set) var receiveCalls: Int
 
+    /// Called at the end of the stream's disconnect, before the stack's call returns.
+    var onDisconnect: ((inout NetworkContext.EventContext) -> Void)?
+
     /// Registers with `context`, which acquires the event context: must be called with none held.
     init(context: NetworkContext) {
         self.context = context
@@ -718,6 +752,7 @@ private final class TestLowerLinkage: ExternalOutboundStreamLinkage, ProtocolIns
         self.reportedDisconnect = false
         self.inbound = nil
         self.receiveCalls = 0
+        self.onDisconnect = nil
     }
 
     func disconnect(
@@ -727,10 +762,12 @@ private final class TestLowerLinkage: ExternalOutboundStreamLinkage, ProtocolIns
     ) {
         self.reportedDisconnect = true
         self.upper?.handleDisconnectedEvent(error: error, for: self.identifier, in: &eventContext)
+        self.onDisconnect?(&eventContext)
     }
 
     func teardown(in eventContext: inout NetworkContext.EventContext) {
         self.upper = nil
+        self.onDisconnect = nil
         self.unregisterEventManager(in: &eventContext)
     }
 

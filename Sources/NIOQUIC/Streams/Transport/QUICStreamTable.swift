@@ -635,6 +635,9 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Shared by `forceCloseAll(error:in:)` (detaches from the stack) and `vacateAllSlots()`
     /// (doesn't) so a future field added to one of these bulk-teardown paths isn't forgotten in
     /// the other. Consumer states are the caller's to release.
+    ///
+    /// `perSlot` gets a pointer rather than `inout` access: the slot stays in the store while its
+    /// stream closes, and resolving the events that delivers reads the store.
     fileprivate func removeAllSlots(perSlot: (UnsafeMutablePointer<QUICStreamTransportState>) -> Void) {
         // Every stream before any closes: closing one can deliver events synchronously, its own and
         // other streams', and they must find nothing.
@@ -645,7 +648,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
         }
 
         // Through pointers, as in `_remove`, so nothing holds `_transportStates` while a stream
-        // closes: resolving those events reads it.
+        // closes: resolving those events reads it. Reading the store afresh on every iteration also
+        // keeps the loop memory-safe if a close modifies it.
         index = .first
         while index.rawValue < self._transportStates.allocated {
             let transport = self._transportStates.pointer(at: index)
@@ -658,6 +662,9 @@ extension QUICStreamTable where Consumer: ~Copyable {
 
             index.advance()
         }
+
+        // A slot inserted into one the loop had already passed would never close.
+        precondition(self._transportStates.count == 0, "a slot was inserted while all slots were torn down")
 
         self._ready.removeAll(keepingCapacity: true)
         self._needsState.removeAll(keepingCapacity: true)
