@@ -41,15 +41,6 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     @usableFromInline
     var _byID: QUICStreamIDDictionary<QUICStreamHandle>
 
-    /// Whether the stack's events find no stream any more, because the table is tearing all its
-    /// slots down.
-    ///
-    /// Set first thing in `removeAllSlots`. Closing a stream there can deliver its events
-    /// synchronously, and resolving one would read `_transportStates` while `removeAll` modifies it,
-    /// an exclusivity violation. Never cleared, so for teardown only: `closeAll` retires the anchor
-    /// right after, and `deinit` is the only other caller.
-    private var _ignoresStackEvents: Bool
-
     /// Store the lower linkage for a stream during calls to `open`.
     ///
     /// A `QUICStreamOpener`'s attach calls `ListenerLinkage.invokeAttachUpperProtocolToNewFlow`,
@@ -110,7 +101,6 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         self._ready = []
         self._needsState = []
         self._byID = QUICStreamIDDictionary()
-        self._ignoresStackEvents = false
         self._pendingAttachLinkage = nil
         self._outputPending = false
         self.opener = nil
@@ -354,9 +344,6 @@ extension QUICStreamTable where Consumer: ~Copyable {
 extension QUICStreamTable where Consumer: ~Copyable {
     /// The transport state of `handle`'s stream, if the stack's events for it are handled.
     private func attachedTransport(for handle: QUICStreamHandle) -> UnsafeMutablePointer<QUICStreamTransportState>? {
-        if self._ignoresStackEvents {
-            return nil
-        }
         if let transport = self._transportStates.pointer(for: handle), transport.pointee.isAttached {
             return transport
         } else {
@@ -645,29 +632,43 @@ extension QUICStreamTable where Consumer: ~Copyable {
     }
 
     /// Vacates every remaining slot, running `perSlot` on each slot just before it's dropped.
-    /// Shared by `forceCloseAll(error:in:)` (detaches from the stack) and `abandonAllLocally()`
+    /// Shared by `forceCloseAll(error:in:)` (detaches from the stack) and `vacateAllSlots()`
     /// (doesn't) so a future field added to one of these bulk-teardown paths isn't forgotten in
     /// the other. Consumer states are the caller's to release.
-    fileprivate func removeAllSlots(perSlot: (inout QUICStreamTransportState) -> Void) {
-        // First, so no event resolves a stream while `removeAll` has the slots: closing a stream
-        // can deliver its events synchronously.
-        self._ignoresStackEvents = true
-        self._transportStates.removeAll { transport in
-            var transport = consume transport
-            perSlot(&transport)
+    fileprivate func removeAllSlots(perSlot: (UnsafeMutablePointer<QUICStreamTransportState>) -> Void) {
+        // Every stream before any closes: closing one can deliver events synchronously, its own and
+        // other streams', and they must find nothing.
+        var index = QUICStreamHandle.Index.first
+        while index.rawValue < self._transportStates.allocated {
+            self._transportStates.pointer(at: index)?.pointee.isAttached = false
+            index.advance()
         }
+
+        // Through pointers, as in `_remove`, so nothing holds `_transportStates` while a stream
+        // closes: resolving those events reads it.
+        index = .first
+        while index.rawValue < self._transportStates.allocated {
+            let transport = self._transportStates.pointer(at: index)
+            let handle = self._transportStates.handle(at: index)
+
+            if let transport, let handle {
+                perSlot(transport)
+                self._transportStates.removeValue(for: handle)
+            }
+
+            index.advance()
+        }
+
         self._ready.removeAll(keepingCapacity: true)
         self._needsState.removeAll(keepingCapacity: true)
         self._byID.removeAll()
     }
 
     /// Closes and vacates every remaining slot, without a visit.
-    ///
-    /// WARN: All events will be ignored after this.
     private func forceCloseAll(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
         self.removeAllSlots { transport in
-            transport.core.close(error: error, in: &eventContext)
-            self.unregisterEventManager(of: &transport, in: &eventContext)
+            transport.pointee.core.close(error: error, in: &eventContext)
+            self.unregisterEventManager(of: &transport.pointee, in: &eventContext)
         }
     }
 
@@ -677,11 +678,9 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// this doesn't call `core.close(error:in:)`. Only slots that never reached the stack are
     /// expected by then: a stream still attached means `closeAll` never ran, and its registered
     /// event manager traps.
-    ///
-    /// WARN: All events will be ignored after this.
     private func vacateAllSlots() {
         self.removeAllSlots { transport in
-            transport.core.discardBufferedReadsAndWrites()
+            transport.pointee.core.discardBufferedReadsAndWrites()
         }
     }
 }

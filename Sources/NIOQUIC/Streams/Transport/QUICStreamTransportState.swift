@@ -37,7 +37,8 @@ struct QUICStreamTransportState: ~Copyable {
     var eventManager: ProtocolEventManager
 
     /// Whether the stream is attached to a flow, so the stack's events for it are handled. Set by
-    /// `QUICStreamTable.attach`, and cleared by `_remove` before it closes the stream.
+    /// `QUICStreamTable.attach`, and cleared by `_remove` and `removeAllSlots` before they close the
+    /// stream.
     var isAttached: Bool
 
     /// Why the stream closed, as the consumer sees it.
