@@ -790,6 +790,29 @@ struct StreamTableTests {
         }
     }
 
+    /// A consumer may leave streams unpulled, so a forced close tears down streams still attached
+    /// to their flows. Closing one makes the stack report its disconnect before the close returns,
+    /// while the table tears its slots down: that event must find nothing.
+    @available(anyAppleOS 26, *)
+    @Test
+    func forceClosingUnpulledStreamsDropsTheirEvents() async throws {
+        try await withConsumerPair(client: IdleConsumer(), server: EchoConsumer()) { pair in
+            // No FIN, so the stream is still open when the connection is forced closed.
+            let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /quic"), fin: false)
+
+            let channel = try #require(pair.clientConnection.channel as? QUICConnectionChannel<IdleConsumer>)
+            try await channel.eventLoop.submit {
+                channel.transportView.forceClose()
+            }.get()
+            try await channel.closeFuture.get()
+
+            let resolved = try await pair.clientConnection.withStreams { streams -> Bool in
+                streams.withStream(handle: handle) { _, _ in } != nil
+            }.get()
+            #expect(resolved == false)
+        }
+    }
+
     @available(anyAppleOS 26, *)
     @Test
     func creditBlockedStreamIsOpenedOnlyOnceItHasAnID() async throws {
@@ -983,6 +1006,16 @@ struct StreamTableTests {
         #expect(clientTable.isReleased)
         #expect(serverTable.isReleased)
     }
+}
+
+/// Never pulls a visit, as a consumer may: its streams stay unvisited.
+@available(anyAppleOS 26, *)
+private struct IdleConsumer: QUICStreamConsumer {
+    func makeStreamState(_ stream: inout QUICStream<Self>) -> ByteBuffer {
+        ByteBuffer()
+    }
+
+    mutating func processStreams(_ streams: inout QUICStreamIterator<Self>) {}
 }
 
 /// Tells whether an object has been released, without keeping it alive.
