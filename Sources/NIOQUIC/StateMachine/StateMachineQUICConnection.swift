@@ -161,7 +161,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         coreConfiguration.maxDatagramFrameSize = maxDatagramFrameSize > 0 ? UInt64(maxDatagramFrameSize) : nil
         // Spread each congestion window over the RTT rather than sending it in one burst (RFC
         // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
-        coreConfiguration.pacingEnabled = true
+        // Off by default, as on the SwiftNetwork driver, which never paces for NIOQUIC.
+        coreConfiguration.pacingEnabled = configuration.pacePackets
         // The driver issues no spare connection IDs and routes none (`.newLocalConnectionID`),
         // so a peer can't migrate to a new connection ID: it only follows a NAT rebinding,
         // which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).

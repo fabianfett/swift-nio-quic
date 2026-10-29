@@ -169,6 +169,11 @@ public struct QUICConfiguration: Sendable {
     ///
     /// NOTE: Only raise it if the whole path and the peer support it. Values of 1200 or less have no effect.
     public var initialPacketSize: InitialPacketSize = .fixed(1200)
+    /// Spread the packets of each congestion window over the round-trip time instead of sending them in one
+    /// burst (RFC 9002, Section 7.7). Defaults to `false`.
+    ///
+    /// NOTE: Only connections driven by the state machine pace. Connections driven by SwiftNetwork ignore it.
+    public var pacePackets: Bool = false
 
     /// The path to the file where the key log should be written to. Defaults to `nil`, no key log.
     public var keyLogPath: String?

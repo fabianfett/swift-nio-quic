@@ -1573,6 +1573,7 @@ enum QUICConnectionDriver: Hashable, Sendable {
         "initialMaxData", "initialMaxStreamDataBidiLocal", "initialMaxStreamDataBidiRemote",
         "initialMaxStreamDataUni", "initialMaxStreamsBidi", "initialMaxStreamsUni", "maxIdleTimeout",
         "keepAliveInterval", "maxDatagramFrameSize", "initialPacketSize", "forceVersionNegotiation",
+        "pacePackets",
     ]
 
     /// The ``QUICConfiguration`` properties the state machine driver implements only at their
