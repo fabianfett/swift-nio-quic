@@ -243,7 +243,7 @@ struct QUICCalloutsTests {
     func aRetiredAnchorLeavesNothingRegistered() {
         // Its event manager traps on deinit if still registered, so completing is the check.
         self.withCallouts { callouts, _, _, instance in
-            let anchor = EventContextAnchor(context: instance.context)
+            var anchor = EventContextAnchor(context: instance.context)
             #expect(!anchor.identifier.isNone)
             anchor.retire(through: callouts)
             #expect(anchor.identifier.isNone)

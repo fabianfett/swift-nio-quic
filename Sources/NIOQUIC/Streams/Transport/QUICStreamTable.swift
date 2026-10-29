@@ -86,8 +86,9 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The instance the table's operations enter the stack as.
     ///
     /// Registered for the table's lifetime, and retired by ``retireAnchor()``, which must run
-    /// before the table is released: the anchor's event manager traps on deinit otherwise.
-    let anchor: EventContextAnchor
+    /// before the table is released: the anchor's event manager traps on deinit otherwise. Held
+    /// inline, so that entering the stack doesn't load another object.
+    var anchor: EventContextAnchor
 
     /// The class of the streams' upper linkages, looked up once: the table's code is generic over
     /// the consumer and runs unspecialized, so naming the class for each stream would look up its

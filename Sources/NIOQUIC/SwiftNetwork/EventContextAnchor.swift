@@ -16,8 +16,10 @@
 
 /// A protocol instance that exists only to enter the stack on behalf of code with no instance of its
 /// own: the stream table's operations, which act for streams that aren't `ProtocolInstance`s.
+///
+/// A value, so that its owner holds it inline and entering the stack doesn't load another object.
 @available(anyAppleOS 26, *)
-final class EventContextAnchor: ProtocolInstance {
+struct EventContextAnchor: ProtocolInstance, ~Copyable {
     let context: NetworkContext
     var identifier: InstanceIdentifier
     var eventManager: ProtocolEventManager
@@ -25,15 +27,24 @@ final class EventContextAnchor: ProtocolInstance {
     /// Registers with `context`, which acquires the event context: must be called with none held.
     init(context: NetworkContext) {
         self.context = context
-        var eventManager = ProtocolEventManager()
-        self.identifier = InstanceIdentifier(context: context, eventManager: &eventManager)
-        self.eventManager = eventManager
+        self.eventManager = ProtocolEventManager()
+        self.identifier = InstanceIdentifier(context: context, eventManager: &self.eventManager)
     }
 
-    /// Unregisters, so its event manager doesn't trap on deinit.
-    func retire(through callouts: QUICCallouts) {
+    /// An unregistered instance that enters the stack as `identifier`.
+    private init(context: NetworkContext, enteringAs identifier: InstanceIdentifier) {
+        self.context = context
+        self.identifier = identifier
+        self.eventManager = ProtocolEventManager()
+    }
+
+    /// Unregisters, so its event manager doesn't trap on deinit. Idempotent.
+    mutating func retire(through callouts: QUICCallouts) {
         if self.identifier.isNone { return }
-        callouts.enter(as: self) { eventContext in
+        // Enters as a stand-in with the same identifier: entering borrows the instance it enters as
+        // for the whole call, and this one changes inside it.
+        let entry = EventContextAnchor(context: self.context, enteringAs: self.identifier)
+        callouts.enter(as: entry) { eventContext in
             self.unregisterEventManager(in: &eventContext)
         }
     }

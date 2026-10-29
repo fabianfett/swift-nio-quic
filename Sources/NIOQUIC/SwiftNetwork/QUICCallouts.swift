@@ -96,8 +96,8 @@ final class QUICCallouts {
     /// Enter as the NIOQUIC instance that makes the call, never as a framework instance it calls
     /// into: a down-call requires its callee to be idle, and entering as the callee makes it busy.
     @inline(__always)
-    func enter<Instance: ProtocolInstance, Value, Failure: Error>(
-        as instance: Instance,
+    func enter<Instance: ProtocolInstance & ~Copyable, Value, Failure: Error>(
+        as instance: borrowing Instance,
         _ body: (inout NetworkContext.EventContext) throws(Failure) -> Value
     ) throws(Failure) -> Value {
         self.willEnterStack()

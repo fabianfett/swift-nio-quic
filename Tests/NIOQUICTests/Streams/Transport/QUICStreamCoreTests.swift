@@ -71,7 +71,7 @@ private func withTestEventContext<R, E: Error>(
         identifier: "QUICStreamCoreTests",
         externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop(), callouts: callouts)
     )
-    let anchor = EventContextAnchor(context: context)
+    var anchor = EventContextAnchor(context: context)
     defer { anchor.retire(through: callouts) }
     return try callouts.enter(as: anchor, body)
 }
