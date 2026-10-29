@@ -268,11 +268,10 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
             case .newOutboundConnectionID, .retiredOutboundConnectionID, .earlyDataRejected,
                 .maxStreamsLimitBidirectionalUpdated, .maxStreamsLimitUnidirectionalUpdated,
                 .receivedRemoteTransportParameters, .remoteBidirectionalStreamsBlocked,
-                .remoteUnidirectionalStreamsBlocked,
-                // The connection takes the last validated path as the active one, so it doesn't act on
-                // these path events (yet).
-                .pathCIDAssigned, .pathCurrent:
+                .remoteUnidirectionalStreamsBlocked, .pathCIDAssigned:
                 break
+            case .pathCurrent(let info):
+                self.connectionView.pathCurrent(remote: info.remote)
             case .pathChanged:
                 // SwiftNetwork announces a path as soon as it is attached. Not much to do at that point.
                 break

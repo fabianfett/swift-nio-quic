@@ -205,20 +205,34 @@ struct QUICConnectionPathTests {
 
     @available(anyAppleOS 26, *)
     @Test
-    func pathValidatedPromotesPath() throws {
+    func pathValidatedDoesNotPromotePath() throws {
+        let connection = try self.makeConnection(role: .server)
+        connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
+
+        // A peer can validate a path without migrating to it (RFC 9000, Section 9.1).
+        connection._forTesting_handlePathValidated(remote: Self.newAddress.toAddressEndpoint())
+        #expect(connection._forTesting_getActivePath().remoteAddress == Self.pathAddress)
+        #expect(connection._forTesting_getOtherPaths().map(\.remoteAddress) == [Self.newAddress])
+        #expect(connection._forTesting_getOtherPaths().first?.isValidated == true)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func pathCurrentPromotesPath() throws {
         let connection = try self.makeConnection(role: .server)
         connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
         try #require(connection._forTesting_getActivePath().remoteAddress == Self.pathAddress)
 
-        connection._forTesting_handlePathValidated(remote: Self.newAddress.toAddressEndpoint())
+        // A server follows a client to a new address before it validated it (RFC 9000, Section 9.3).
+        connection._forTesting_handlePathCurrent(remote: Self.newAddress.toAddressEndpoint())
         #expect(connection._forTesting_getActivePath().remoteAddress == Self.newAddress)
-        #expect(connection._forTesting_getActivePath().isValidated)
+        #expect(!connection._forTesting_getActivePath().isValidated)
         #expect(connection._forTesting_getOtherPaths().map(\.remoteAddress) == [Self.pathAddress])
     }
 
     @available(anyAppleOS 26, *)
     @Test
-    func pathValidatedPromotesIPv4MappedPath() throws {
+    func pathCurrentPromotesIPv4MappedPath() throws {
         // The IPv4-mapped addresses a dual-stack socket reports for an IPv4 peer.
         let pathAddress = try SocketAddress(ipAddress: "::ffff:192.0.2.1", port: 443)
         let newAddress = try SocketAddress(ipAddress: "::ffff:192.0.2.1", port: 444)
@@ -228,6 +242,7 @@ struct QUICConnectionPathTests {
 
         // SwiftNetwork names the path by the `Endpoint` it was attached with.
         connection._forTesting_handlePathValidated(remote: newAddress.toAddressEndpoint())
+        connection._forTesting_handlePathCurrent(remote: newAddress.toAddressEndpoint())
         #expect(connection._forTesting_getActivePath().remoteAddress == newAddress)
         #expect(connection._forTesting_getActivePath().isValidated)
     }
@@ -311,10 +326,11 @@ struct QUICConnectionPathTests {
         let validated = try SocketAddress(ipAddress: "127.0.0.1", port: 9001)
         let unvalidated = try SocketAddress(ipAddress: "127.0.0.1", port: 9002)
         let active = try SocketAddress(ipAddress: "127.0.0.1", port: 9003)
-        // Validating a path promotes it, so the path validated last ends up active.
+        // The path made current last ends up active.
         for address in [validated, active] {
             connection.receivePacket(AddressedEnvelope(remoteAddress: address, data: Self.payload))
             connection._forTesting_handlePathValidated(remote: address.toAddressEndpoint())
+            connection._forTesting_handlePathCurrent(remote: address.toAddressEndpoint())
         }
         connection.receivePacket(AddressedEnvelope(remoteAddress: unvalidated, data: Self.payload))
         try #require(connection._forTesting_getActivePath().remoteAddress == active)

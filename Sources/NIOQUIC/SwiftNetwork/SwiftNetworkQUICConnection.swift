@@ -1736,6 +1736,11 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         self.handlePathValidated(remote: remote)
     }
 
+    /// Simulate SwiftNetwork making the path to `remote` its current one.
+    func _forTesting_handlePathCurrent(remote: AddressEndpoint) {
+        self.handlePathCurrent(remote: remote)
+    }
+
     /// Simulate a path unreachable event for the path to `remote`, which reaches the connection through
     /// the new-flow handler.
     func _forTesting_handlePathUnreachable(remote: AddressEndpoint) {
@@ -1770,8 +1775,9 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 // * Path events reach the connection through the new-flow handler while SwiftNetwork holds the event context, so
 //   telling SwiftNetwork about a dropped path from there enters as the path with the context it holds.
 //
-// TODO: Revisit once we adopt SwiftNetwork 0.5.0's `pathCurrent` event. It should drive promotion.
-// * Paths can become active before validation. And validation does not mean that a path becomes the active path.
+// * SwiftNetwork's `pathCurrent` event drives promotion: a path can become the active one before it is validated
+//   (a server follows a client to a new address right away, RFC 9000 Section 9.3), and a validated path doesn't
+//   have to become the active one (RFC 9000 Section 9.1).
 
 @available(anyAppleOS 26, *)
 extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
@@ -1950,8 +1956,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
         return self.otherPaths.first { $0.addressEndpointType == remote }
     }
 
-    /// SwiftNetwork validated the path to `remote`: the peer proved that it receives packets there. Promotes
-    /// the path to the active path.
+    /// SwiftNetwork validated the path to `remote`: the peer proved that it receives packets there.
     private func handlePathValidated(remote: AddressEndpoint) {
         guard let path = self.trackedPath(remote.type) else {
             self.log(
@@ -1961,8 +1966,17 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             return
         }
         path.isValidated = true
-        // TODO: Promote the path SwiftNetwork reports once the events are available.
-        // A peer can validate a path and without migrating to it (RFC 9000, Section 9.1).
+    }
+
+    /// SwiftNetwork sends on the path to `remote` from now on. Promotes the path to the active path.
+    private func handlePathCurrent(remote: AddressEndpoint) {
+        guard let path = self.trackedPath(remote.type) else {
+            self.log(
+                "Ignoring untracked current path",
+                metadata: [LoggingKeys.pathRemoteEndpoint: "\(remote)"]
+            )
+            return
+        }
         if let index = self.otherPaths.firstIndex(where: { $0 === path }) {
             self.otherPaths.append(self.activePath)
             self.activePath = self.otherPaths.remove(at: index)
@@ -2100,6 +2114,10 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
 
         func pathValidated(remote: AddressEndpoint) {
             self.connection.handlePathValidated(remote: remote)
+        }
+
+        func pathCurrent(remote: AddressEndpoint) {
+            self.connection.handlePathCurrent(remote: remote)
         }
 
         func pathUnreachable(remote: AddressEndpoint, in eventContext: inout NetworkContext.EventContext) {
