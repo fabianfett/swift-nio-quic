@@ -62,8 +62,10 @@ struct FramePool: ~Copyable {
         FramePool(
             // Small frames are approx MSS sized.
             smallFrameSize: 1500,
-            // GSO expects fewer small frames.
-            maxSmallFrames: gso ? 8 : 64,
+            // SwiftNetwork writes every datagram into a small frame, GSO or not, and asks for them in
+            // bursts: a large write leaves dozens queued on the path before they're coalesced and
+            // returned. Fewer than that, and each burst allocates and frees the rest.
+            maxSmallFrames: 64,
             // 64KB is the upper limit on what can be sent with GSO.
             largeFrameSize: gso ? 64 * 1024 : 0,
             // 4 * 64KB is 256KB: the maximum amount retained per connection for GSO.
