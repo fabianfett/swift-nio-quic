@@ -381,6 +381,33 @@ struct QUICStreamTableTests {
 
     @available(anyAppleOS 26, *)
     @Test
+    func inboundStreamsGetStateOnlyOnceVisited() {
+        // Inbound slots reserve no storage for their state until the visit makes it, so several can
+        // be allocated, and some vacated, before any is reserved.
+        let table = Self.makeRecordingTable(role: .server)
+        defer { table.retireAnchor() }
+        var consumer = RecordingConsumer()
+        let first = table.insertSlotNeedingState(id: 0)
+        let second = table.insertSlotNeedingState(id: 4)
+        let third = table.insertSlotNeedingState(id: 8)
+        table.vacateSlot(first)
+
+        table.markReady(handle: third, events: .readable)
+        table.markReady(handle: second, events: .readable)
+        table.drain(into: &consumer)
+
+        #expect(consumer.madeStates == 2)
+        #expect(consumer.sightings.map { $0.handle } == [third, second])
+        #expect(table.handle(forID: 0) == nil)
+        #expect(table.handle(forID: 8) == third)
+
+        table.vacateSlot(second)
+        table.vacateSlot(third)
+        #expect(table.count == 0)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
     func slotInsertedWithStateIsNotOfferedToTheConsumer() {
         let table = Self.makeRecordingTable()
         defer { table.retireAnchor() }

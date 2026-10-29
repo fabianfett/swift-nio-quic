@@ -32,15 +32,17 @@ struct QUICStreamConsumerStates<State: ~Copyable>: ~Copyable {
         self._storage.deinitializeAll()
     }
 
-    /// The pointer for the value at `index`, growing the storage by one slot if `index` is a slot
-    /// the slots have only just allocated.
+    /// The pointer for the value at `index`, growing the storage up to `index` if the slots have
+    /// allocated it since.
+    ///
+    /// The slots can allocate several before any is reserved: an inbound stream's state is only
+    /// reserved when the consumer makes it, before its first visit.
     @inlinable
     mutating func reserve(at index: QUICStreamHandle.Index) -> UnsafeMutablePointer<State?> {
-        if index.rawValue < self._storage.count {
-            return self._storage.pointer(at: index.rawValue)
-        } else {
-            return self._storage.appendNil()
+        while index.rawValue >= self._storage.count {
+            _ = self._storage.appendNil()
         }
+        return self._storage.pointer(at: index.rawValue)
     }
 
     /// The pointer for `index`, which must have been reserved.

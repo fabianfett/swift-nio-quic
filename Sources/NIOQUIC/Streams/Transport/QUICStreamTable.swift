@@ -217,6 +217,18 @@ extension QUICStreamTable where Consumer: ~Copyable {
         return handle
     }
 
+    /// Adds a slot for a stream the peer opened. The consumer makes its state before its first visit.
+    ///
+    /// Leaves the consumer's states alone, unlike ``insertSlot(id:state:)``: the stack opens inbound
+    /// streams, so this runs as NIOQUIC's generic code, and the visit that makes the state reserves its
+    /// storage, specialized for the consumer.
+    func insertSlotNeedingState(id: QUICStreamID) -> QUICStreamHandle {
+        let handle = self._transportStates.insert(QUICStreamTransportState(core: QUICStreamCore(id: id)))
+        self._needsState.append(handle)
+        self._byID[id] = handle
+        return handle
+    }
+
     /// Registers a fresh identifier for `handle`'s stream, using that stream's own event
     /// manager.
     func registerIdentifier(
@@ -436,7 +448,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
             assert(!transport.pointee.hasState)
 
             var stream = QUICStream<Consumer>(table: self, transport: transport, handle: handle)
-            let consumerState = self._consumerStates.pointer(at: handle.index)
+            let consumerState = self._consumerStates.reserve(at: handle.index)
             consumerState.pointee = consumer.makeStreamState(&stream)
             transport.pointee.hasState = true
         }
@@ -581,8 +593,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
     func vacateSlot(_ handle: QUICStreamHandle, in eventContext: inout NetworkContext.EventContext) {
         // Note: this is helpful for a stream which never reached the stack, the consumer wasn't
         // told about it so there's nothing to report.
+        // Only a slot with state has reserved storage for it.
+        let hasState = self._transportStates.pointer(for: handle)?.pointee.hasState ?? false
         self._remove(handle: handle, in: &eventContext)
-        self._consumerStates.removeValue(at: handle.index)
+        if hasState {
+            self._consumerStates.removeValue(at: handle.index)
+        }
     }
 
     /// As ``vacateSlot(_:in:)``, but acquires the event context itself, and releases the consumer's
@@ -610,7 +626,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// once no event context is held: its deinit is consumer code.
     @inlinable
     func takeConsumerState(for handle: QUICStreamHandle) -> Consumer.StreamState? {
-        if self._transportStates.pointer(for: handle) == nil {
+        // Only a slot with state has reserved storage for it.
+        guard let transport = self._transportStates.pointer(for: handle), transport.pointee.hasState else {
             return nil
         }
         return self._consumerStates.pointer(at: handle.index).pointee.take()

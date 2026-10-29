@@ -371,7 +371,7 @@ final class QUICChannelNewFlowHandler<Consumer: QUICStreamConsumer & ~Copyable>:
         }
 
         // No state: the consumer makes it in 'makeStreamState' before the first visit.
-        let handle = table.insertSlot(id: streamID, state: nil)
+        let handle = table.insertSlotNeedingState(id: streamID)
         let identifier = table.registerIdentifier(for: handle, in: &eventContext)
 
         let linkage: BaseOutboundStreamLinkage
