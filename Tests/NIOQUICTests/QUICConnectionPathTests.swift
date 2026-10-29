@@ -30,7 +30,7 @@ struct QUICConnectionPathTests {
     private func withPath(
         isValidated: Bool = false,
         remoteAddress: SocketAddress = try! SocketAddress(ipAddress: "127.0.0.1", port: 9000),
-        _ body: (QUICConnectionPath<QUICStreamChannels>, QUICCallouts) throws -> Void
+        _ body: (QUICConnectionPath, QUICCallouts) throws -> Void
     ) rethrows {
         let eventLoop = EmbeddedEventLoop()
         let callouts = QUICCallouts(eventLoop: eventLoop)
@@ -38,7 +38,7 @@ struct QUICConnectionPathTests {
             identifier: "test-context",
             externalScheduler: callouts
         )
-        let path = QUICConnectionPath<QUICStreamChannels>(
+        let path = QUICConnectionPath(
             role: .server,
             remoteAddress: remoteAddress,
             context: context,
@@ -272,8 +272,8 @@ struct QUICConnectionPathTests {
     @available(anyAppleOS 26, *)
     @Test
     func closingTheConnectionReleasesItsPaths() throws {
-        var firstPath: QUICConnectionPath<QUICStreamChannels>
-        var newPath: QUICConnectionPath<QUICStreamChannels>
+        var firstPath: QUICConnectionPath
+        var newPath: QUICConnectionPath
         do {
             let connection = try self.makeConnection(role: .server)
             connection.receivePacket(AddressedEnvelope(remoteAddress: Self.newAddress, data: Self.payload))
@@ -448,7 +448,7 @@ struct QUICConnectionPathTests {
     @available(anyAppleOS 26, *)
     private func trackedPaths(
         _ connection: SwiftNetworkQUICConnection<QUICStreamChannels>
-    ) -> [QUICConnectionPath<QUICStreamChannels>] {
+    ) -> [QUICConnectionPath] {
         [connection._forTesting_getActivePath()] + connection._forTesting_getOtherPaths()
     }
 
@@ -532,7 +532,7 @@ struct QUICConnectionPathTests {
 }
 
 @available(anyAppleOS 26, *)
-extension QUICConnectionPath where Consumer: ~Copyable {
+extension QUICConnectionPath {
     /// Gets datagrams to send and sends them back, the way the stack does: with the event context
     /// held, which this fabricates by entering as the path.
     fileprivate func sendDatagramsFromStack(maximumDatagramCount: Int, minimumDatagramSize: Int) throws {
