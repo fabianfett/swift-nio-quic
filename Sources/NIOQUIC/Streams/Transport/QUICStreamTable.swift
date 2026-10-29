@@ -424,6 +424,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Hand each ready stream to the consumer.
     ///
     /// Holds no event context while the consumer runs: its stream operations each acquire one.
+    ///
+    /// Inlinable, so that ``QUICStreamConsumer/_visitStreams(_:)`` runs it specialized for the
+    /// consumer: it works on the consumer's states throughout.
+    @inlinable
     func drain(into consumer: inout Consumer) {
         self.outOfBandDrainRequested = false
 
@@ -539,12 +543,21 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Clears the flags a visit presented and, if that visit was the stream's last, recycles its
     /// slot.
     ///
-    /// Acquires the event context only to recycle the slot.
-    @usableFromInline
+    /// Acquires the event context only to recycle the slot. Inlinable, so that it runs specialized
+    /// for the consumer wherever its visits do: recycling a slot releases the consumer's state.
+    @inlinable
     func finishVisit(_ handle: QUICStreamHandle, presented: QUICStreamEvents) {
         if presented.contains(.closed) {
             self.vacateSlot(handle)
-        } else if let transport = self._transportStates.pointer(for: handle) {
+        } else {
+            self._finishOpenVisit(handle, presented: presented)
+        }
+    }
+
+    /// ``finishVisit(_:presented:)`` for a stream that stays open. Doesn't touch the consumer's state.
+    @usableFromInline
+    func _finishOpenVisit(_ handle: QUICStreamHandle, presented: QUICStreamEvents) {
+        if let transport = self._transportStates.pointer(for: handle) {
             // Clear the events which were shown in the last visit.
             transport.pointee.events.subtract(presented)
 
@@ -569,22 +582,34 @@ extension QUICStreamTable where Consumer: ~Copyable {
         // Note: this is helpful for a stream which never reached the stack, the consumer wasn't
         // told about it so there's nothing to report.
         self._remove(handle: handle, in: &eventContext)
+        self._consumerStates.removeValue(at: handle.index)
     }
 
     /// As ``vacateSlot(_:in:)``, but acquires the event context itself, and releases the consumer's
     /// state for the stream only once that acquisition has ended: the state's deinit is consumer code.
+    ///
+    /// Inlinable, like ``finishVisit(_:presented:)``, its caller on every stream's last visit.
+    @inlinable
     func vacateSlot(_ handle: QUICStreamHandle) {
         let state = self.takeConsumerState(for: handle)
-        self.withEventContext { eventContext in
-            self._remove(handle: handle, in: &eventContext)
-        }
+        self._removeTransport(handle)
         // Only now, with nothing held: the state's deinit is consumer code.
         _ = consume state
     }
 
+    /// Closes the stream core of `handle`'s slot and vacates it, acquiring the event context to do
+    /// so. The slot's consumer state must already be taken.
+    @usableFromInline
+    func _removeTransport(_ handle: QUICStreamHandle) {
+        self.withEventContext { eventContext in
+            self._remove(handle: handle, in: &eventContext)
+        }
+    }
+
     /// Moves the consumer's state for `handle`'s stream out of the table, for the caller to release
     /// once no event context is held: its deinit is consumer code.
-    private func takeConsumerState(for handle: QUICStreamHandle) -> Consumer.StreamState? {
+    @inlinable
+    func takeConsumerState(for handle: QUICStreamHandle) -> Consumer.StreamState? {
         if self._transportStates.pointer(for: handle) == nil {
             return nil
         }
@@ -612,7 +637,6 @@ extension QUICStreamTable where Consumer: ~Copyable {
         self.unregisterEventManager(of: &transport.pointee, in: &eventContext)
 
         self._transportStates.removeValue(for: handle)
-        self._consumerStates.removeValue(at: handle.index)
     }
 
     /// Retires the stack's registration of a slot's event manager, which traps on deinit otherwise.

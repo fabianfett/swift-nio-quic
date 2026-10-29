@@ -38,4 +38,34 @@ public protocol QUICStreamConsumer: SendableMetatype, ~Copyable {
     ///
     /// - Parameter streams: The streams to visit.
     mutating func processStreams(_ streams: inout QUICStreamIterator<Self>)
+
+    /// Visits the streams with unhandled events, through ``processStreams(_:)``.
+    ///
+    /// Don't implement this: NIOQUIC calls the default implementation. Being a requirement, its
+    /// witness is emitted with each conforming type, so the visit runs specialized for that type
+    /// rather than as NIOQUIC's generic code, which looks up the stream state's metadata throughout.
+    mutating func _visitStreams(_ visit: borrowing _QUICStreamsVisit<Self>)
 }
+
+@available(anyAppleOS 26, *)
+extension QUICStreamConsumer where Self: ~Copyable {
+    @inlinable
+    public mutating func _visitStreams(_ visit: borrowing _QUICStreamsVisit<Self>) {
+        visit._table.drain(into: &self)
+    }
+}
+
+/// The streams a connection hands to its consumer's ``QUICStreamConsumer/_visitStreams(_:)``.
+@available(anyAppleOS 26, *)
+public struct _QUICStreamsVisit<Consumer: QUICStreamConsumer & ~Copyable>: ~Copyable {
+    @usableFromInline
+    let _table: QUICStreamTable<Consumer>
+
+    init(table: QUICStreamTable<Consumer>) {
+        self._table = table
+    }
+}
+
+@available(anyAppleOS 26, *)
+@available(*, unavailable)
+extension _QUICStreamsVisit: Sendable where Consumer: ~Copyable {}
