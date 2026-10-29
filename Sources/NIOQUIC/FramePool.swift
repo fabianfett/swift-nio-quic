@@ -21,8 +21,10 @@ import BasicContainers
 /// frames must have exactly the capacity as required by their size class. The pool limits also how
 /// many of each category size can be stored at a given time. This avoids situations where bursty
 /// traffic results in the pool overcomitting memory indefinitely.
+///
+/// Each path owns one, inline in its `GSOCoalescer`, which returns the frames it sent to it.
 @available(anyAppleOS 26, *)
-final class FramePool {
+struct FramePool: ~Copyable {
     private var smallStorage: BufferPool
     private var largeStorage: BufferPool
 
@@ -56,8 +58,8 @@ final class FramePool {
         self.largeStorage.count
     }
 
-    static func makePool(forGSO gso: Bool) -> Self {
-        Self(
+    static func makePool(forGSO gso: Bool) -> FramePool {
+        FramePool(
             // Small frames are approx MSS sized.
             smallFrameSize: 1500,
             // GSO expects fewer small frames.
@@ -69,7 +71,7 @@ final class FramePool {
         )
     }
 
-    private func storeBufferPointer(_ buffer: consuming UnsafeMutableRawBufferPointer) -> Bool {
+    private mutating func storeBufferPointer(_ buffer: consuming UnsafeMutableRawBufferPointer) -> Bool {
         let stored: Bool
 
         switch buffer.count {
@@ -91,7 +93,7 @@ final class FramePool {
     /// - Parameter frame: The frame to store.
     /// - Returns: Whether the frame was stored or not.
     @discardableResult
-    func storeFrame(_ frame: inout Frame) -> Bool {
+    mutating func storeFrame(_ frame: inout Frame) -> Bool {
         let stored: Bool
 
         if let customFinalizer = frame.takeOwnershipOfCustomFinalizerBuffer() {
@@ -111,7 +113,7 @@ final class FramePool {
     ///
     /// - Parameter minimumSize: The minimum size of the frame to take.
     /// - Returns: A pooled frame, if one was available.
-    func takeFrame(minimumSize: Int) -> Frame? {
+    mutating func takeFrame(minimumSize: Int) -> Frame? {
         let buffer: UnsafeMutableRawBufferPointer?
 
         if minimumSize <= self.smallFrameSize {
@@ -133,7 +135,7 @@ final class FramePool {
     ///
     /// - Parameter minimumSize: The minimum size of the frame to take or create.
     /// - Returns: A frame.
-    func takeOrCreateFrame(minimumSize: Int) -> Frame {
+    mutating func takeOrCreateFrame(minimumSize: Int) -> Frame {
         if let frame = self.takeFrame(minimumSize: minimumSize) {
             return frame
         }

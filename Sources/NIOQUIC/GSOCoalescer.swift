@@ -34,12 +34,13 @@ struct GSOCoalescer: ~Copyable {
     /// A pool of byte buffers.
     private var pool: BufferPool
 
-    /// A pool of `Frame`s.
-    private let framePool: FramePool
+    /// A pool of `Frame`s: the path takes the frames the stack writes datagrams into from it, and
+    /// the coalescer returns them once it copied them out.
+    private var framePool: FramePool
 
     init(
         remoteAddress: SocketAddress,
-        framePool: FramePool,
+        framePool: consuming FramePool,
         maxSegments: Int = 64,
         maxCoalescedSize: Int = 65535,
         bufferPoolCapacity: Int = 8
@@ -56,6 +57,11 @@ struct GSOCoalescer: ~Copyable {
 
     var isEmpty: Bool {
         self.frames.isEmpty
+    }
+
+    /// Takes a frame for a datagram from the pool, or creates one if it's empty.
+    mutating func takeOrCreateFrame(minimumSize: Int) -> Frame {
+        self.framePool.takeOrCreateFrame(minimumSize: minimumSize)
     }
 
     mutating func finalizeAllFramesAsFailed() {

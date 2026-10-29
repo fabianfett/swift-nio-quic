@@ -55,7 +55,6 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
 
     private var state: State = .idle
 
-    private let framePool: FramePool
     private var coalescer: GSOCoalescer
     private var inputPacketQueue: FrameArray
 
@@ -64,7 +63,7 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
         role: Role,
         remoteAddress: SocketAddress,
         context: NetworkContext,
-        framePool: FramePool,
+        framePool: consuming FramePool,
         isValidated: Bool,
         maxSegments: Int,
         bufferPoolCapacity: Int,
@@ -76,7 +75,6 @@ final class QUICConnectionPath<Consumer: QUICStreamConsumer & ~Copyable>: Extern
         self.logPrefix = "[\(role.description)][Path]"
         self.logger = logger
         self.context = context
-        self.framePool = framePool
         self.coalescer = GSOCoalescer(
             remoteAddress: remoteAddress,
             framePool: framePool,
@@ -292,7 +290,7 @@ extension QUICConnectionPath where Consumer: ~Copyable {
         var array = FrameArray(capacity: maximumDatagramCount)
 
         for _ in 0..<maximumDatagramCount {
-            let frame = self.framePool.takeOrCreateFrame(minimumSize: minimumDatagramSize)
+            let frame = self.coalescer.takeOrCreateFrame(minimumSize: minimumDatagramSize)
             array.add(frame: frame)
         }
 

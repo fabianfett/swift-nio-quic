@@ -115,8 +115,8 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
     // The connection's other paths, oldest first. A demoted active path counts as the newest one.
     private var otherPaths: [QUICConnectionPath<Consumer>]
-    // The pool for frames shared across QUIC connection paths.
-    private let framePool: FramePool
+    // Whether every path on this connection pools frames for GSO.
+    private let pathFramePoolForGSO: Bool
     // The GSO settings every path on this connection is built with.
     private let pathMaxSegments: Int
     private let pathBufferPoolCapacity: Int
@@ -435,10 +435,10 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.swiftNetworkParameters = swiftNetworkParameters
 
         #if os(Linux) || os(Android)
-        self.framePool = FramePool.makePool(forGSO: true)
+        self.pathFramePoolForGSO = true
         self.pathMaxSegments = 64
         #else
-        self.framePool = FramePool.makePool(forGSO: false)
+        self.pathFramePoolForGSO = false
         self.pathMaxSegments = 1
         #endif
         self.pathBufferPoolCapacity = 8
@@ -516,7 +516,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             role: self.role,
             remoteAddress: remoteAddress,
             context: swiftNetworkParameters.context,
-            framePool: self.framePool,
+            framePool: .makePool(forGSO: self.pathFramePoolForGSO),
             isValidated: true,
             maxSegments: self.pathMaxSegments,
             bufferPoolCapacity: self.pathBufferPoolCapacity,
@@ -1841,7 +1841,7 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             role: self.role,
             remoteAddress: remoteAddress,
             context: self.swiftNetworkParameters.context,
-            framePool: self.framePool,
+            framePool: .makePool(forGSO: self.pathFramePoolForGSO),
             isValidated: false,
             maxSegments: self.pathMaxSegments,
             bufferPoolCapacity: self.pathBufferPoolCapacity,

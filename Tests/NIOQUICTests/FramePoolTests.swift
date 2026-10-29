@@ -37,7 +37,7 @@ struct FramePoolTests {
     @Test
     @available(anyAppleOS 26, *)
     func empty() {
-        let pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
+        var pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
         #expect(pool.smallFrameCount == 0)
         #expect(pool.largeFrameCount == 0)
 
@@ -91,7 +91,7 @@ struct FramePoolTests {
     )
     @available(anyAppleOS 26, *)
     func appropriateSizeFrameIsCreated(requestedSize: Int, expectedSize: Int) {
-        let pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
+        var pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
 
         var frame = pool.takeOrCreateFrame(minimumSize: requestedSize)
         #expect(frame.unclaimedLength == expectedSize)
@@ -101,7 +101,7 @@ struct FramePoolTests {
     @Test
     @available(anyAppleOS 26, *)
     func returnedFrameGoesInRightBucket() {
-        let pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
+        var pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
 
         var small = pool.takeOrCreateFrame(minimumSize: 100)
         let storedSmall = pool.storeFrame(&small)
@@ -125,7 +125,7 @@ struct FramePoolTests {
     @available(anyAppleOS 26, *)
     func capacityIsRespected(small: Bool) {
         let size = small ? 100 : 200
-        let pool = self.makeFramePool(
+        var pool = self.makeFramePool(
             smallFrameSize: 100,
             maxSmallFrames: 4,
             largeFrameSize: 200,
@@ -168,7 +168,7 @@ struct FramePoolTests {
     @Test
     @available(anyAppleOS 26, *)
     func foreignFrameIsNotStored() {
-        let pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
+        var pool = self.makeFramePool(smallFrameSize: 100, largeFrameSize: 200)
         // Right size, wrong backing type.
         var frame = Frame(count: 100)
         let stored = pool.storeFrame(&frame)
