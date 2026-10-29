@@ -13,7 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 @available(anyAppleOS 26, *)
-final class AsyncVerifierRunner: Sendable {
+struct AsyncVerifierRunner: Sendable {
     let asyncVerifier: AsyncVerifier
     let asyncVerifierTask: Task<(), Never>
 
