@@ -67,7 +67,7 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
     private let _registrar: ConnectionIDRegistrar
 
     /// A view into the QUIC handler in the UDP channel, for outbound operations.
-    private let _transport: Transport
+    private let _transport: QUICConnectionTransport
 
     /// The lifecycle state machine for the channel.
     private var _lifecycle: QUICConnectionChannelLifecycle
@@ -135,7 +135,7 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         udpChannel: any Channel,
         connection: Connection,
         registrar: ConnectionIDRegistrar,
-        transport: Transport,
+        transport: QUICConnectionTransport,
         isServer: Bool,
         table: QUICStreamTable<Consumer>?
     ) {
@@ -543,8 +543,35 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 extension QUICConnectionChannel.TransportView: Sendable where Consumer: ~Copyable {}
 
 @available(anyAppleOS 26, *)
-extension QUICConnectionChannel.TransportView: QUICConnectionRegistryView
-where Consumer: ~Copyable {}
+extension QUICConnectionChannel: QUICConnectionRegistryView where Consumer: ~Copyable {
+    func parentChannelRead(_ envelope: AddressedEnvelope<ByteBuffer>) -> Bool {
+        self._parentChannelRead(envelope)
+    }
+
+    func parentChannelReadComplete() {
+        self._parentChannelReadComplete()
+    }
+
+    func parentChannelInactive() {
+        self._parentChannelBecameInactive()
+    }
+
+    func parentChannelWritabilityChanged(to isWritable: Bool) {
+        self._parentChannelWritabilityChanged(to: isWritable)
+    }
+
+    func parentChannelUserInboundEventTriggered(_ event: Any) {
+        self._parentChannelUserInboundEvent(event)
+    }
+
+    func shutdown(promise: EventLoopPromise<Void>?) {
+        self._parentInvokedShutdown(promise: promise)
+    }
+
+    func forceClose() {
+        self._forceClose()
+    }
+}
 
 @available(anyAppleOS 26, *)
 extension QUICConnectionChannel.TransportView where Consumer: ~Copyable {

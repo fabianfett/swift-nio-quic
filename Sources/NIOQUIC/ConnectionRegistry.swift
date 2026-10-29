@@ -137,7 +137,16 @@ struct ConnectionRegistry<Value> {
 
 /// What the registry needs from a connection.
 @available(anyAppleOS 26, *)
-protocol QUICConnectionRegistryView {
+///
+/// Also what the QUIC handler delivers packets to. Class-bound and not generic, so the registry and the
+/// handler's per-packet bookkeeping are specialized: `QUICConnectionChannel`, which conforms, is
+/// generic over its consumer, and storing it under its own type made every lookup generic code that
+/// looked up metadata.
+protocol QUICConnectionRegistryView: AnyObject {
+    /// Delivers a packet; returns whether it caused the connection to enter a read loop.
+    func parentChannelRead(_ envelope: AddressedEnvelope<ByteBuffer>) -> Bool
+    /// Ends the read loop the connection entered.
+    func parentChannelReadComplete()
     func shutdown(promise: EventLoopPromise<Void>?)
     func forceClose()
     func parentChannelInactive()
@@ -151,7 +160,7 @@ private final class ShutdownRace {
 }
 
 @available(anyAppleOS 26, *)
-extension ConnectionRegistry where Value: QUICConnectionRegistryView {
+extension ConnectionRegistry where Value == any QUICConnectionRegistryView {
     /// Shut down every registered connection, racing graceful completion against `deadline`.
     ///
     /// If all connections drain before the deadline, `promise` succeeds. If the deadline wins,

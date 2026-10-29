@@ -91,10 +91,13 @@ protocol QUICConnectionProtocol {
 extension QUICConnectionChannel where Consumer: ~Copyable {
     /// The channel's connection, either the real SwiftNetwork-backed connection
     /// (statically dispatched) or an existential test conformance.
+    /// Its hot methods are always inlined: the enum is generic, and calling one out of line looks up the
+    /// enum's metadata.
     enum Connection {
         case live(SwiftNetworkQUICConnection<Consumer>)
         case test(any QUICConnectionProtocol)
 
+        @inline(__always)
         func withLiveOnly(
             promise: EventLoopPromise<Void>? = nil,
             execute body: (SwiftNetworkQUICConnection<Consumer>) throws -> Void
@@ -134,6 +137,7 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         }
     }
 
+    @inline(__always)
     @discardableResult
     func receivePacket(_ envelope: AddressedEnvelope<ByteBuffer>) -> Int {
         switch self {
@@ -144,6 +148,7 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         }
     }
 
+    @inline(__always)
     func receivePacketsComplete() {
         switch self {
         case .live(let connection):
@@ -153,6 +158,7 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         }
     }
 
+    @inline(__always)
     func drainPacketsToSend(to transport: some QUICTransport) {
         switch self {
         case .live(let connection):
@@ -188,6 +194,7 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         }
     }
 
+    @inline(__always)
     func writeDatagram(_ datagram: ByteBuffer) -> Bool {
         switch self {
         case .live(let connection):
@@ -197,6 +204,7 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
         }
     }
 
+    @inline(__always)
     func flushDatagrams() {
         switch self {
         case .live(let connection):
