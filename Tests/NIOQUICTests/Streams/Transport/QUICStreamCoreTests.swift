@@ -66,10 +66,10 @@ extension QUICStreamCore {
 private func withTestEventContext<R, E: Error>(
     _ body: (inout NetworkContext.EventContext) throws(E) -> R
 ) throws(E) -> R {
-    let callouts = QUICCallouts()
+    let callouts = QUICCallouts(eventLoop: EmbeddedEventLoop())
     let context = NetworkContext(
         identifier: "QUICStreamCoreTests",
-        externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop(), callouts: callouts)
+        externalScheduler: callouts
     )
     var anchor = EventContextAnchor(context: context)
     defer { anchor.retire(through: callouts) }

@@ -55,23 +55,22 @@ struct QUICCalloutsTests {
 
     private struct Boom: Error {}
 
-    /// Runs `body` with a queue, its scheduler's event loop and a registered instance, and unregisters
+    /// Runs `body` with a queue, its event loop and a registered instance, and unregisters
     /// the instance afterwards (its event manager traps on deinit otherwise).
     @available(anyAppleOS 26, *)
     private func withCallouts(
-        _ body: (QUICCallouts, EmbeddedEventLoop, EventLoopBackedScheduler, TestInstance) throws -> Void
+        _ body: (QUICCallouts, EmbeddedEventLoop, TestInstance) throws -> Void
     ) rethrows {
         let loop = EmbeddedEventLoop()
-        let callouts = QUICCallouts()
-        let scheduler = EventLoopBackedScheduler(eventLoop: loop, callouts: callouts)
-        let context = NetworkContext(identifier: "QUICCalloutsTests", externalScheduler: scheduler)
+        let callouts = QUICCallouts(eventLoop: loop)
+        let context = NetworkContext(identifier: "QUICCalloutsTests", externalScheduler: callouts)
         let instance = TestInstance(context: context)
         defer {
             callouts.enter(as: instance) { eventContext in
                 instance.unregisterEventManager(in: &eventContext)
             }
         }
-        try body(callouts, loop, scheduler, instance)
+        try body(callouts, loop, instance)
     }
 
     @available(anyAppleOS 26, *)
@@ -82,7 +81,7 @@ struct QUICCalloutsTests {
     @available(anyAppleOS 26, *)
     @Test
     func queuedCalloutsRunInOrderOnceTheAcquisitionEnds() {
-        self.withCallouts { callouts, _, _, instance in
+        self.withCallouts { callouts, _, instance in
             let target = RecordingTarget()
             callouts.enter(as: instance) { eventContext in
                 callouts.add(.connection(target, Self.datagram("a")), in: &eventContext)
@@ -98,7 +97,7 @@ struct QUICCalloutsTests {
     func anEntryFromACalloutRunsItsOwnCalloutsBeforeReturning() {
         // A handler that flushes from a `channelRead`: its entry's callouts run before it returns,
         // and the rest of the outer batch runs after it.
-        self.withCallouts { callouts, _, _, instance in
+        self.withCallouts { callouts, _, instance in
             let target = RecordingTarget()
             target.onRun = { tag in
                 if tag == "a" {
@@ -119,7 +118,7 @@ struct QUICCalloutsTests {
     @available(anyAppleOS 26, *)
     @Test
     func aThrowingAcquisitionStillRunsItsCallouts() {
-        self.withCallouts { callouts, _, _, instance in
+        self.withCallouts { callouts, _, instance in
             let target = RecordingTarget()
             #expect(throws: Boom.self) {
                 try callouts.enter(as: instance) { (eventContext) throws(Boom) -> Void in
@@ -136,9 +135,9 @@ struct QUICCalloutsTests {
     func calloutsQueuedInAStackTaskRunWhenItEnds() {
         // The stack acquires the event context itself inside the tasks it schedules: a timer, or
         // asynchronous work.
-        self.withCallouts { callouts, loop, scheduler, instance in
+        self.withCallouts { callouts, loop, instance in
             let target = RecordingTarget()
-            scheduler.runImmediate {
+            callouts.runImmediate {
                 instance.fromExternal { eventContext in
                     callouts.add(.connection(target, Self.datagram("task")), in: &eventContext)
                 }
@@ -153,9 +152,9 @@ struct QUICCalloutsTests {
     @available(anyAppleOS 26, *)
     @Test
     func calloutsQueuedInATimerWakeupRunWhenItEnds() {
-        self.withCallouts { callouts, loop, scheduler, instance in
+        self.withCallouts { callouts, loop, instance in
             let target = RecordingTarget()
-            scheduler.schedule(
+            callouts.schedule(
                 {
                     instance.fromExternal { eventContext in
                         callouts.add(.connection(target, Self.datagram("wakeup")), in: &eventContext)
@@ -175,7 +174,7 @@ struct QUICCalloutsTests {
     func calloutsQueuedByAFrameworkCallInACalloutRunBeforeTheRestOfTheBatch() {
         // A queued call that calls a framework entry point which acquires the event context itself,
         // such as the keep-alive setter: what that entry point's witnesses queue runs first.
-        self.withCallouts { callouts, _, _, instance in
+        self.withCallouts { callouts, _, instance in
             let target = RecordingTarget()
             target.onRun = { tag in
                 if tag == "a" {
@@ -205,10 +204,10 @@ struct QUICCalloutsTests {
         // would run what its witnesses queue.
         await #expect(processExitsWith: .failure) {
             let loop = EmbeddedEventLoop()
-            let callouts = QUICCallouts()
+            let callouts = QUICCallouts(eventLoop: loop)
             let context = NetworkContext(
                 identifier: "QUICCalloutsTests",
-                externalScheduler: EventLoopBackedScheduler(eventLoop: loop, callouts: callouts)
+                externalScheduler: callouts
             )
             let instance = TestInstance(context: context)
             let promise = loop.makePromise(of: Void.self)
@@ -224,12 +223,12 @@ struct QUICCalloutsTests {
     @available(anyAppleOS 26, *)
     @Test
     func theQueueKnowsWhenTheStackMayHoldTheEventContext() {
-        self.withCallouts { callouts, loop, scheduler, instance in
+        self.withCallouts { callouts, loop, instance in
             #expect(!callouts.isInsideStack)
             callouts.enter(as: instance) { _ in
                 #expect(callouts.isInsideStack)
             }
-            scheduler.runImmediate {
+            callouts.runImmediate {
                 #expect(callouts.isInsideStack)
             }
             loop.run()
@@ -242,7 +241,7 @@ struct QUICCalloutsTests {
     @Test
     func aRetiredAnchorLeavesNothingRegistered() {
         // Its event manager traps on deinit if still registered, so completing is the check.
-        self.withCallouts { callouts, _, _, instance in
+        self.withCallouts { callouts, _, instance in
             var anchor = EventContextAnchor(context: instance.context)
             #expect(!anchor.identifier.isNone)
             anchor.retire(through: callouts)

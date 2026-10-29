@@ -33,10 +33,10 @@ struct QUICConnectionPathTests {
         _ body: (QUICConnectionPath<QUICStreamChannels>, QUICCallouts) throws -> Void
     ) rethrows {
         let eventLoop = EmbeddedEventLoop()
-        let callouts = QUICCallouts()
+        let callouts = QUICCallouts(eventLoop: eventLoop)
         let context = NetworkContext(
             identifier: "test-context",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop, callouts: callouts)
+            externalScheduler: callouts
         )
         let path = QUICConnectionPath<QUICStreamChannels>(
             role: .server,

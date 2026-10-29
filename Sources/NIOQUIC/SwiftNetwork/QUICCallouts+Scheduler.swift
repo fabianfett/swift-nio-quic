@@ -15,8 +15,10 @@
 import NIOCore
 @_spi(ProtocolProvider) @_spi(Essentials) import SwiftNetwork
 
+/// The connection's scheduler: the stack schedules its timers and immediate tasks on the
+/// connection's event loop through it, and the calls they queue run after each of them.
 @available(anyAppleOS 26, *)
-final class EventLoopBackedScheduler: NetworkContext.Scheduler {
+extension QUICCallouts: NetworkContext.Scheduler {
     struct Wakeup {
         /// When the task is due.
         var deadline: NIODeadline
@@ -39,7 +41,7 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
 
     /// Identifies which timer an event loop wakeup belongs to.
     private struct Handler: NIOScheduledCallbackHandler {
-        let scheduler: EventLoopBackedScheduler
+        let scheduler: QUICCallouts
         let reference: TimerReference
 
         func handleScheduledCallback(eventLoop: some EventLoop) {
@@ -51,15 +53,6 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
         self.eventLoop.inEventLoop
     }
 
-    private var wakeups: [TimerReference: Wakeup] = [:]
-    private let eventLoop: any EventLoop
-    /// The connection's queued callouts. The stack acquires the event context itself only inside the
-    /// tasks it schedules here, so they run after each one.
-    private let callouts: QUICCallouts
-    // The factory for nanoseconds is not inlinable and will not be specialized.
-    // Reduce the cost to the initial initialization.
-    private let oneNanosecond = NetworkDuration.nanoseconds(1)
-
     var now: NetworkClock.Instant {
         .zero + self.oneNanosecond * Int(self.eventLoop.now.uptimeNanoseconds)
     }
@@ -67,11 +60,6 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
     /// NIO has a single clock, so there is no offset between the continuous and absolute clocks.
     var nowAbsolute: NetworkClock.Instant {
         self.now
-    }
-
-    internal init(eventLoop: any EventLoop, callouts: QUICCallouts) {
-        self.eventLoop = eventLoop
-        self.callouts = callouts
     }
 
     private struct UnsafeTransfer<Wrapped>: @unchecked Sendable {
@@ -82,8 +70,7 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
     }
 
     func runImmediate(_ task: @escaping (() -> Void)) {
-        let callouts = self.callouts
-        let stackTask = { callouts.runStackTask(task) }
+        let stackTask = { self.runStackTask(task) }
         if self.eventLoop.inEventLoop {
             self.eventLoop.assumeIsolatedUnsafeUnchecked().execute(stackTask)
         } else {
@@ -177,7 +164,7 @@ final class EventLoopBackedScheduler: NetworkContext.Scheduler {
         } else {
             // Deadline has been passed: run the task.
             let (_, wakeup) = self.wakeups.remove(at: index)
-            self.callouts.runStackTask(wakeup.task)
+            self.runStackTask(wakeup.task)
         }
     }
 

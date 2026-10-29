@@ -372,11 +372,11 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
         var swiftNetworkParameters = SwiftNetwork.Parameters()
         self.eventLoop = eventLoop
-        let callouts = QUICCallouts()
+        let callouts = QUICCallouts(eventLoop: eventLoop)
         self.callouts = callouts
         let networkContext = NetworkContext(
             identifier: "swift-nio-quic-context-\(self.role.description)",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: eventLoop, callouts: callouts)
+            externalScheduler: callouts
         )
         swiftNetworkParameters.context = networkContext
         self.networkContext = networkContext

@@ -842,10 +842,10 @@ extension QUICStreamTable {
     /// Builds a table on an event-loop-backed context: acquiring the default scheduler's context
     /// traps off its queue. Its anchor must be retired, or the table closed, before it's released.
     convenience init(role: Role) {
-        let callouts = QUICCallouts()
+        let callouts = QUICCallouts(eventLoop: EmbeddedEventLoop())
         let context = NetworkContext(
             identifier: "QUICStreamTableTests",
-            externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop(), callouts: callouts)
+            externalScheduler: callouts
         )
         self.init(role: role, context: context, callouts: callouts)
     }

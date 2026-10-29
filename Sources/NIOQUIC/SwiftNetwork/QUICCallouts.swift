@@ -33,8 +33,8 @@ import NIOQUICHelpers
 ///   through ``enter(as:_:)``, which runs the queue on the way out. Framework entry points that
 ///   acquire the token themselves (attaching flows and paths, metadata setters such as keep-alive)
 ///   are called through ``callFramework(_:)``, which runs what their witnesses queued. Otherwise
-///   the stack acquires the token only inside the tasks it schedules on the connection's
-///   `EventLoopBackedScheduler`, which runs the queue after each of them.
+///   the stack acquires the token only inside the tasks it schedules: the queue is also the
+///   connection's `NetworkContext.Scheduler`, and runs itself after each of them.
 ///
 /// So NIO and consumer code only run with nothing held, NIOQUIC's entry points always acquire the
 /// token afresh, and the queued calls run in order, in the event loop tick that queued them. A call
@@ -49,6 +49,14 @@ import NIOQUICHelpers
 final class QUICCallouts {
     private var queue: Deque<QUICCallout>
 
+    /// The scheduler's pending timers. See `QUICCallouts+Scheduler.swift`.
+    var wakeups: [TimerReference: Wakeup]
+    /// The event loop the scheduler runs the stack's tasks on.
+    let eventLoop: any EventLoop
+    // The factory for nanoseconds is not inlinable and will not be specialized.
+    // Reduce the cost to the initial initialization.
+    let oneNanosecond = NetworkDuration.nanoseconds(1)
+
     /// Whether `queue` holds calls. Nearly every entry queues none, and checking this instead of the
     /// queue spares a load of its storage, which is usually cold.
     private var hasQueued: Bool
@@ -58,8 +66,10 @@ final class QUICCallouts {
     private var stackDepth: Int
     #endif
 
-    init() {
+    init(eventLoop: any EventLoop) {
         self.queue = []
+        self.wakeups = [:]
+        self.eventLoop = eventLoop
         self.hasQueued = false
         #if DEBUG
         self.stackDepth = 0
