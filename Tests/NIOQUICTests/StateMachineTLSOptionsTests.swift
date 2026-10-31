@@ -102,6 +102,7 @@ struct StateMachineTLSOptionsTests {
     ) throws -> (stateMachine: QUICConnectionCore.Configuration, swiftNetwork: TLSProtocol.Options) {
         let stateMachine = try Connection.clientCoreConfiguration(
             configuration,
+            sourceConnectionID: NIOQUIC.QUICConnectionID(bytes: [1, 2, 3, 4, 5, 6, 7, 8].span),
             serverName: serverName,
             asyncVerifier: asyncVerifier,
             remoteAddress: try Self.remoteAddress()
@@ -253,6 +254,7 @@ struct StateMachineTLSOptionsTests {
         #expect(throws: QUICError.tlsConfigurationIncomplete) {
             _ = try Connection.clientCoreConfiguration(
                 configuration,
+                sourceConnectionID: NIOQUIC.QUICConnectionID(bytes: [1, 2, 3, 4, 5, 6, 7, 8].span),
                 serverName: nil,
                 asyncVerifier: NIOQUIC.AsyncVerifier(),
                 remoteAddress: try Self.remoteAddress()

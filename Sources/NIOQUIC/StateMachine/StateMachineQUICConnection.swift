@@ -211,6 +211,21 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.core.peerConnectionID(on: self.core.activePathID).map(NIOQUIC.QUICConnectionID.init)
     }
 
+    /// Moves a client to a new path to the server, which it validates first and then sends on
+    /// with a new connection ID of the server, as when it moved to a new local address (RFC 9000
+    /// Sections 9.2 and 9.5). Returns `false` if the core refused, see
+    /// `QUICConnectionCore.migrate(to:now:)`.
+    func _forTesting_migrateToANewPath() -> Bool {
+        precondition(self.role == .client, "Only a client migrates")
+        let path = CorePathID(self.nextPathID)
+        self.nextPathID += 1
+        guard self.core.migrate(to: path, now: Self.now) else { return false }
+        // Every path of a client leads to the server.
+        self.paths.append((self.remoteAddress.value, path))
+        self.coreUpdatedOutsideOfEvents()
+        return true
+    }
+
     /// Marks `connectionID` as retired, so that issuing it closes the connection.
     func _forTesting_addRetiredConnectionID(_ connectionID: QUICConnectionID) {
         self.rememberRetiredConnectionID(connectionID)
@@ -259,10 +274,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.logger = logger
     }
 
-    /// The core configuration of a client connection to the server called `serverName`, which it
-    /// verifies with `asyncVerifier` or the configuration's raw public key.
+    /// The core configuration of a client connection with the connection ID
+    /// `sourceConnectionID` to the server called `serverName`, which it verifies with
+    /// `asyncVerifier` or the configuration's raw public key.
     static func clientCoreConfiguration(
         _ configuration: QUICConfiguration,
+        sourceConnectionID: QUICConnectionID,
         serverName: String?,
         asyncVerifier: AsyncVerifier?,
         remoteAddress: SocketAddress
@@ -275,7 +292,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             asyncVerifier: asyncVerifier,
             serverName: serverName
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tls: tls, remoteAddress: remoteAddress)
+        var coreConfiguration = Self.makeCoreConfiguration(
+            configuration,
+            tls: tls,
+            localConnectionID: sourceConnectionID,
+            remoteAddress: remoteAddress
+        )
         if configuration.forceVersionNegotiation {
             // The server answers with Version Negotiation, and the client starts over in QUIC
             // version 1 (RFC 9000 Section 6).
@@ -305,7 +327,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             authenticator: authenticator,
             serverName: serverName
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tls: tls, remoteAddress: remoteAddress)
+        var coreConfiguration = Self.makeCoreConfiguration(
+            configuration,
+            tls: tls,
+            localConnectionID: sourceConnectionID,
+            remoteAddress: remoteAddress
+        )
         // The token for the handshake connection ID, which lets a client recognize the stateless
         // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
         // Only a server sends one. Zero-length connection IDs have no token to derive.
@@ -318,6 +345,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private static func makeCoreConfiguration(
         _ configuration: QUICConfiguration,
         tls: SwiftTLSOptions,
+        localConnectionID: QUICConnectionID,
         remoteAddress: SocketAddress
     ) -> QUICConnectionCore.Configuration {
         // Stream consumer connections don't enable 0-RTT, so there are no transport parameters
@@ -362,9 +390,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // The peer may issue as many connection IDs as to a SwiftNetwork driver connection
         // (RFC 9000 Section 5.1.1). The driver issues its own, see `issueSpareConnectionIDs()`.
         coreConfiguration.activeConnectionIDLimit = Self.activeConnectionIDLimit
-        // Peers don't migrate to new addresses on their own yet: the connection only follows a
-        // NAT rebinding, which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
-        coreConfiguration.disableActiveMigration = true
+        // A peer that migrates sends to one of the connection's spare connection IDs (RFC 9000
+        // Section 9.5), which the handler routes, and the server follows it to its new address.
+        // Zero-length connection IDs have no spares: the peer must not migrate then (RFC 9000
+        // Section 18.2), as on the SwiftNetwork driver. It may still rebind, which keeps the
+        // connection ID.
+        coreConfiguration.disableActiveMigration = localConnectionID.length == 0
         return coreConfiguration
     }
 
@@ -405,6 +436,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     ) throws -> StateMachineQUICConnection<Consumer> {
         let coreConfiguration = try Self.clientCoreConfiguration(
             configuration,
+            sourceConnectionID: sourceConnectionID,
             serverName: serverName,
             asyncVerifier: asyncVerifier,
             remoteAddress: remoteAddress

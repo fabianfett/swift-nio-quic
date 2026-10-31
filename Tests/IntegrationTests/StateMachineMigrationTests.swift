@@ -138,6 +138,99 @@ struct StateMachineMigrationTests {
         }
     }
 
+    /// A client that moves to a new address sends from there to a spare connection ID of the
+    /// server (RFC 9000 Sections 9.2 and 9.5), which the server's handler routes to the
+    /// connection, and the server follows it. The core client migrates once it validated the new
+    /// path, which it can only do if the server doesn't disable active migration.
+    @available(anyAppleOS 26, *)
+    @Test
+    func aClientMigratesToANewAddressWithANewConnectionID() async throws {
+        // One thread: the relay hands datagrams from one channel's pipeline to the other's synchronously.
+        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        do {
+            try await Self.migrateTheClient(eventLoopGroup: eventLoopGroup)
+        } catch {
+            try? await eventLoopGroup.shutdownGracefully()
+            throw error
+        }
+        try await eventLoopGroup.shutdownGracefully()
+    }
+
+    @available(anyAppleOS 26, *)
+    private static func migrateTheClient(eventLoopGroup: MultiThreadedEventLoopGroup) async throws {
+        let recording = StreamRecording()
+        let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
+        let captureConnection: @Sendable (QUICStreamConnection<EchoConsumer>) -> Void = { connection in
+            serverConnection.withLockedValue { $0 = connection }
+        }
+        func roundTrip(_ pair: ConsumerPair<RecordConsumer, EchoConsumer>) async throws {
+            let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /"), fin: true)
+            let visits = await recording.visits { $0.handle == handle && $0.events.contains(.closed) }
+            #expect(visits.last?.bytesReadSoFar == ByteBuffer(string: "GET /"))
+        }
+
+        let switchAddresses: @Sendable (ChannelPipeline.SynchronousOperations) throws -> Void = {
+            try $0.addHandler(AddressSwitchHandler())
+        }
+
+        try await withConsumerPair(
+            drivers: Drivers(client: .stateMachine, server: .stateMachine),
+            eventLoopGroup: eventLoopGroup,
+            configureClientPipeline: switchAddresses,
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer(),
+            onServerConnection: captureConnection
+        ) { pair in
+            try await roundTrip(pair)
+            let server = try #require(serverConnection.withLockedValue { $0 }).channel
+            let serverConnectionIDs = try await server.eventLoop.submit {
+                (server as! QUICConnectionChannel<EchoConsumer>)._forTesting_stateMachineConnection!
+                    ._forTesting_localConnectionIDs
+            }.get()
+            let client = pair.clientConnection.channel
+            let clientConnection = { @Sendable in
+                (client as! QUICConnectionChannel<RecordConsumer>)._forTesting_stateMachineConnection!
+            }
+            let handshakeID = try await client.eventLoop.submit { clientConnection()._forTesting_peerConnectionID }
+                .get()
+            #expect(handshakeID == serverConnectionIDs.first)
+
+            // The client moves to a new socket, and its old address is gone.
+            let clientChannel = pair.clientChannel
+            let newSocket = try await DatagramBootstrap(group: eventLoopGroup)
+                .channelInitializer { channel in
+                    channel.eventLoop.makeCompletedFuture {
+                        try channel.pipeline.syncOperations.addHandler(RelayHandler(clientChannel: clientChannel))
+                    }
+                }
+                .bind(host: Self.host, port: 0)
+                .get()
+            defer { newSocket.close(promise: nil) }
+            let migrated = try await clientChannel.eventLoop.submit {
+                try clientChannel.pipeline.syncOperations.handler(type: AddressSwitchHandler.self).currentSocket =
+                    newSocket
+                return clientConnection()._forTesting_migrateToANewPath()
+            }.get()
+            try #require(migrated, "the client can't migrate")
+
+            // The client sends to a spare once it validated the new path.
+            var connectionID = handshakeID
+            let deadline = ContinuousClock.now + .seconds(10)
+            while connectionID == handshakeID, ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(1))
+                connectionID = try await client.eventLoop.submit { clientConnection()._forTesting_peerConnectionID }
+                    .get()
+            }
+            try #require(connectionID != handshakeID, "the client didn't validate the new path")
+            let spare = try #require(connectionID)
+            #expect(serverConnectionIDs.dropFirst().contains(spare))
+
+            // Only completes if the server routes the spare to the connection.
+            try await roundTrip(pair)
+            #expect(server.remoteAddress == newSocket.localAddress)
+        }
+    }
+
     /// Anyone who sees the connection's traffic can send packets to it from any address.
     @available(anyAppleOS 26, *)
     @Test
