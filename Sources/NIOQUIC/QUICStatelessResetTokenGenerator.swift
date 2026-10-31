@@ -14,7 +14,7 @@
 
 import Crypto
 import NIOCore
-@_spi(ProtocolProvider) import SwiftNetwork
+@_spi(ProtocolProvider) import QUICStateMachine
 
 @available(anyAppleOS 26, *)
 extension QUICStatelessResetToken {
@@ -98,9 +98,9 @@ extension QUICStatelessResetToken.Generator {
     ) -> ByteBuffer? {
         let token = self.token(for: connectionID)
 
-        // Throws if no reset can be built which is both a plausible QUIC packet (21 bytes at
-        // minimum) and smaller than the packet that triggered it.
-        let bytes = try? QUICConnectionUtilities.createStatelessResetPacket(
+        // `nil` if no reset can be built which is both a plausible QUIC packet (21 bytes at
+        // minimum) and smaller than the packet that triggered it (RFC 9000 Section 10.3.3).
+        let bytes = QUICStatelessPackets.statelessReset(
             token: token.token,
             triggeringPacketLength: triggeringPacketLength
         )
