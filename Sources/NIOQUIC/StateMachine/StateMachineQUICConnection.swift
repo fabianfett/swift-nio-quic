@@ -23,10 +23,10 @@ import NIOQUICHelpers
 /// the SwiftNetwork framework.
 ///
 /// Inbound datagrams are decrypted in place in their `ByteBuffer`s, the outbound datagrams of a
-/// drain are written back to back into one `ByteBuffer` (see ``DatagramBatch``), and one scheduled
-/// task serves the connection's timer.
+/// drain are written back to back into one `ByteBuffer` (see ``DatagramBatch``), and the timer is a
+/// slot in the ``StateMachineTimerQueue`` of the connection's handler.
 @available(anyAppleOS 26, *)
-final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable> {
+final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>: StateMachineTimerTarget {
     private var core: QUICConnectionCore
     let role: Role
     let localAddress: SocketAddress
@@ -56,8 +56,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     static var maximumPaths: Int { 4 }
     private var inReadLoop = false
 
-    private var timer: Scheduled<Void>?
-    private var timerDeadline: NetworkClock.Instant?
+    /// The handler's timer queue, shared by its state machine connections, and the slot armed in
+    /// it, if any. The slot holds the connection until it fires or is cancelled.
+    private let timerQueue: StateMachineTimerQueue
+    private var timer: StateMachineTimerQueue.Slot?
 
     /// A datagram the core built for a later departure, and when it leaves (RFC 9002 Section
     /// 7.7). The core paces each datagram as it builds it, so the driver holds this one, and
@@ -114,6 +116,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.paths.count
     }
 
+    var _forTesting_timerQueue: StateMachineTimerQueue {
+        self.timerQueue
+    }
+
+    /// Whether the connection's timer is armed.
+    var _forTesting_isTimerArmed: Bool {
+        self.timer.map { self.timerQueue.isArmed($0) } ?? false
+    }
+
     /// The largest UDP payload the connection sends on the active path now, but for PMTUD probes.
     var _forTesting_datagramSize: Int {
         self.core.maxDatagramSize
@@ -162,6 +173,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timerQueue: StateMachineTimerQueue,
         logger: Logger
     ) {
         self.core = core
@@ -171,6 +183,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.remoteAddress = SendableAddress(remoteAddress)
         self.paths = [(remoteAddress, .initial)]
         self.eventLoop = eventLoop
+        self.timerQueue = timerQueue
         self.allocator = ByteBufferAllocator()
         // Runs of datagrams go to the kernel in one send where it segments them (UDP GSO).
         self.batch = DatagramBatch(allocator: self.allocator)
@@ -248,6 +261,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timerQueue: StateMachineTimerQueue,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
         guard let serverName else {
@@ -281,6 +295,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
+            timerQueue: timerQueue,
             logger: logger
         )
         connection.makeStreamTable(configuration: configuration)
@@ -298,6 +313,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timerQueue: StateMachineTimerQueue,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
         guard let serverName = configuration.serverName,
@@ -337,6 +353,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
+            timerQueue: timerQueue,
             logger: logger
         )
         connection.makeStreamTable(configuration: configuration)
@@ -389,11 +406,6 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     static var now: NetworkClock.Instant {
         NetworkClock.Instant.zero.advanced(by: .microseconds(Int64(NIODeadline.now().uptimeNanoseconds / 1000)))
-    }
-
-    private static func deadline(for instant: NetworkClock.Instant) -> NIODeadline {
-        let nanoseconds = NetworkClock.Instant.zero.duration(to: instant).nanoseconds
-        return .uptimeNanoseconds(UInt64(max(0, nanoseconds)))
     }
 
     // MARK: Driver
@@ -576,9 +588,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// The core is closed: nothing is left to drive, and the connection can be released.
     private func coreClosed(_ reason: QUICConnectionCore.CloseReason) {
-        self.timer?.cancel()
-        self.timer = nil
-        self.timerDeadline = nil
+        self.cancelTimer()
         self.isClosed = true
         self.logger.debug("Connection closed", metadata: ["quic.close.reason": "\(reason)"])
         // `.closing` always comes first, so this only reports a close the channel missed.
@@ -628,23 +638,22 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             // Nothing is due; a timer still armed fires as a no-op.
             return
         }
-        // Rescheduling a NIO task is expensive. Keep an armed timer that fires no later than
-        // needed: if it fires early, `timerFired` re-arms it for the real deadline.
-        if let current = self.timerDeadline, self.timer != nil, current <= deadline {
-            return
-        }
-        self.timer?.cancel()
-        self.timerDeadline = deadline
-        self.timer = self.eventLoop.assumeIsolated().scheduleTask(deadline: Self.deadline(for: deadline)) {
-            self.timerFired()
-        }
+        // The queue keeps an armed timer that fires no later than needed: if it fires early,
+        // `timerFired` re-arms it for the real deadline.
+        self.timer = self.timerQueue.schedule(self.timer, at: deadline, target: self)
     }
 
-    private func timerFired() {
+    func timerFired() {
         self.timer = nil
-        self.timerDeadline = nil
         self.core.handleTimeout(now: Self.now)
         self.afterCoreUpdate()
+    }
+
+    /// Disarms the timer, which releases the connection from the timer queue.
+    private func cancelTimer() {
+        guard let timer = self.timer else { return }
+        self.timer = nil
+        self.timerQueue.cancel(timer)
     }
 
     // MARK: Output
@@ -775,9 +784,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             // holds the connection until the core reports `.closed`. The handler may route the
             // peer's packets here meanwhile, see `continueClosing(transport:onClosed:)`.
         } else {
-            self.timer?.cancel()
-            self.timer = nil
-            self.timerDeadline = nil
+            self.cancelTimer()
         }
         #if canImport(SwiftTLS)
         // The core releases the handler only once the handshake is confirmed or the connection
@@ -819,9 +826,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// Stops driving a connection whose channel went away: the handler is going away.
     func abandonClosing() {
-        self.timer?.cancel()
-        self.timer = nil
-        self.timerDeadline = nil
+        self.cancelTimer()
         self.closingTransport = nil
         self.onClosedWithoutChannel = nil
     }

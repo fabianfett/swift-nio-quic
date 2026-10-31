@@ -101,6 +101,8 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     /// (RFC 9000 Section 10.2), under the routes they had. They answer their peer's packets until
     /// the core is closed.
     private var closingConnections: ConnectionRegistry<StateMachineQUICConnection<Consumer>>
+    /// The timers of the state machine connections, which one scheduled task serves.
+    private let timerQueue: StateMachineTimerQueue
     /// Decides whether new connections may be admitted.
     private var connectionAdmissionController: ConnectionAdmissionController
 
@@ -139,6 +141,12 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The implementation that drives new consumer connections. Set it before the first
     /// connection is created.
     var connectionDriver: QUICConnectionDriver
+
+    #if DEBUG
+    var _forTesting_timerQueue: StateMachineTimerQueue {
+        self.timerQueue
+    }
+    #endif
 
     private func nextConnectionHandle() -> ConnectionHandle {
         let handle = self.connectionHandle
@@ -182,6 +190,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.connectionHandle = .initial
         self.connectionRegistry = ConnectionRegistry()
         self.closingConnections = ConnectionRegistry()
+        self.timerQueue = StateMachineTimerQueue(eventLoop: channel.eventLoop)
         self.makeConsumer = makeConsumer
         self.connectionDriver = .default(for: quicConfiguration.role)
         self.connectionAdmissionController = makeConnectionAdmissionController(
@@ -281,6 +290,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                     localAddress: localAddress,
                     remoteAddress: remoteAddress,
                     eventLoop: self.context!.eventLoop,
+                    timerQueue: self.timerQueue,
                     logger: connectionLogger
                 )
                 channel = self.makeQUICConnectionChannel(stateMachineConnection: connection, handle: handle)
@@ -404,11 +414,13 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     }
 
     /// Stops driving the connections that close without a channel: the UDP channel is gone.
+    /// Releases every state machine connection the timer queue holds.
     private func abandonClosingConnections() {
         for connection in self.closingConnections.values {
             connection.abandonClosing()
         }
         self.closingConnections = ConnectionRegistry()
+        self.timerQueue.cancelAll()
     }
 
     /// Hands a short-header packet that routes to no connection to the connections with its sender.
@@ -1113,6 +1125,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         localAddress: localAddress,
                         remoteAddress: addressedEnvelope.remoteAddress,
                         eventLoop: self.context!.eventLoop,
+                        timerQueue: self.timerQueue,
                         logger: connectionLogger
                     )
                 )
