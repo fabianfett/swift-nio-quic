@@ -166,11 +166,10 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private(set) var _forTesting_connectionsAcceptedAfterRetry = 0
     #endif
 
-    /// Whether a new connection with `configuration` runs on a ``StateMachineQUICConnection``: the
-    /// handler's driver is the state machine, which implements the configuration.
-    private func servesStateMachineConnections(_ configuration: QUICConfiguration) -> Bool {
-        self.connectionDriver == .stateMachine && QUICConnectionDriver.stateMachineSupports(configuration)
-            && (self.makeConsumer != nil || self.setUpStreamChannels != nil)
+    /// Whether new connections run on a ``StateMachineQUICConnection``: the handler's driver is
+    /// the state machine.
+    private var servesStateMachineConnections: Bool {
+        self.connectionDriver == .stateMachine && (self.makeConsumer != nil || self.setUpStreamChannels != nil)
     }
 
     private func nextConnectionHandle() -> ConnectionHandle {
@@ -308,7 +307,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             let handle = self.nextConnectionHandle()
             let channel: QUICConnectionChannel<Consumer>
             var stateMachineConnection: StateMachineQUICConnection<Consumer>?
-            if self.servesStateMachineConnections(self.quicConfiguration) {
+            if self.servesStateMachineConnections {
                 let connection = try StateMachineQUICConnection<Consumer>.client(
                     configuration: self.quicConfiguration,
                     sourceConnectionID: sourceConnectionID,
@@ -585,7 +584,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         of header: QUICPacketHeader,
         triggeredBy envelope: AddressedEnvelope<ByteBuffer>
     ) -> AddressValidation {
-        guard let retryTokens = self.retryTokens, self.servesStateMachineConnections(self.quicConfiguration) else {
+        guard let retryTokens = self.retryTokens, self.servesStateMachineConnections else {
             return .notRequired
         }
         // RFC 9000 Section 14.1: "A server MUST discard an Initial packet that is carried in a
@@ -1301,7 +1300,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         )
         let quicConnection: AcceptedConnection
         do {
-            if self.servesStateMachineConnections(configuration) {
+            if self.servesStateMachineConnections {
                 quicConnection = .stateMachine(
                     try StateMachineQUICConnection<Consumer>.server(
                         configuration: configuration,
@@ -1764,8 +1763,7 @@ private func makeConnectionAdmissionController(
 enum QUICConnectionDriver: Hashable, Sendable {
     /// The SwiftNetwork framework's `QUICConnection`.
     case swiftNetwork
-    /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections with a configuration
-    /// it ``stateMachineSupports(_:)`` can use it; the others fall back to ``swiftNetwork``.
+    /// swift-network-evolution's `QUICConnectionCore`, driven directly.
     case stateMachine
 
     /// The default for a role: ``stateMachine``, unless the `NIOQUIC_DRIVER` environment variable
@@ -1784,9 +1782,8 @@ enum QUICConnectionDriver: Hashable, Sendable {
         }
     }
 
-    /// The ``QUICConfiguration`` properties the state machine driver implements, whatever their
-    /// value. A configuration that sets any other property to something but its default falls back
-    /// to ``swiftNetwork``, see ``stateMachineSupports(_:)``.
+    /// The ``QUICConfiguration`` properties the state machine driver implements: all of them. A
+    /// test checks that a new one is added here.
     static let stateMachineProperties: Set<String> = [
         "role",
         // TLS: the drivers make the same `SwiftTLSProtocol.Options`.
@@ -1801,21 +1798,9 @@ enum QUICConnectionDriver: Hashable, Sendable {
         "keyLogPath",
         // The handler sends the state machine driver's Retry packets.
         "sendRetry",
+        // Written with swift-network-evolution's `QlogOutput` trait, as on the SwiftNetwork driver.
+        "qLogConfiguration",
     ]
-
-    /// The ``QUICConfiguration`` properties the state machine driver implements only at their
-    /// defaults: it writes no qlog. ``stateMachineSupports(_:)`` checks each.
-    ///
-    /// Together with ``stateMachineProperties`` these are all of the configuration's properties;
-    /// a test checks that a new one is added to either.
-    static let stateMachineDefaultOnlyProperties: Set<String> = ["qLogConfiguration"]
-
-    /// Whether the state machine driver implements everything `configuration` asks for: the
-    /// ``stateMachineProperties`` at any value, and the ``stateMachineDefaultOnlyProperties`` at
-    /// their defaults.
-    static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
-        configuration.qLogConfiguration == nil
-    }
 
     /// The default for the stream channels of a role: as for stream consumers, see
     /// ``default(for:)``.

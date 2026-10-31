@@ -12,9 +12,12 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Foundation
 import Logging
+import NIOCore
 import NIOEmbedded
 import Testing
+import XCTest
 
 @testable import NIOQUIC
 
@@ -28,42 +31,51 @@ struct QUICConnectionDriverTests {
         )
     }
 
-    @Test
+    /// A qlog runs on the state machine driver as well: the server's stream channel connection
+    /// does.
+    @Test(.timeLimit(.minutes(1)))
     @available(anyAppleOS 26, *)
-    func theStateMachineServesADefaultConfiguration() {
-        #expect(QUICConnectionDriver.stateMachineSupports(Self.configuration))
-    }
+    func aConnectionWithAQLogRunsOnTheStateMachine() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var configuration = QUICConfiguration.forServer(
+            serverName: "quic-test.local",
+            authenticationConfiguration: .rawPublicKeys(
+                publicKeyFilePath: XCTestCase.testPublicKeyPath,
+                privateKeyFilePath: XCTestCase.testPrivateKeyPath
+            ),
+            applicationProtocols: []
+        )
+        configuration.qLogConfiguration = QLogConfiguration(path: directory.path)
+        let channel = EmbeddedChannel()
+        channel.localAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
+        let (handler, _) = try QUICHandler<QUICStreamChannels>.makeHandlerAndConnectionMultiplexer(
+            channel: channel,
+            quicConfiguration: configuration,
+            logger: Logger(label: "test"),
+            inboundStreamChannelInitializer: { $0.eventLoop.makeSucceededVoidFuture() }
+        )
+        handler.connectionDriver = .stateMachine
+        let drivers = DriverRecorder()
+        handler._forTesting_onStreamChannelsConnection = { drivers.drivers.append($0) }
+        try channel.pipeline.syncOperations.addHandler(handler)
+        defer { _ = try? channel.finish() }
 
-    @Test
-    @available(anyAppleOS 26, *)
-    func featuresTheStateMachineLacksFallBackToSwiftNetwork() {
-        var qlog = Self.configuration
-        qlog.qLogConfiguration = QLogConfiguration(path: "/tmp")
+        var random = SystemRandomNumberGenerator()
+        var packet = QUICPackets.initial(
+            destinationID: .random(length: 8, using: &random),
+            sourceID: .random(length: 8, using: &random),
+            token: [],
+            version: 1
+        )
+        packet += [UInt8](repeating: 0, count: 1200 - packet.count)
+        channel.pipeline.fireChannelRead(
+            AddressedEnvelope(remoteAddress: try SocketAddress(ipAddress: "127.0.0.1", port: 443), data: ByteBuffer(bytes: packet))
+        )
+        channel.pipeline.fireChannelReadComplete()
 
-        #expect(!QUICConnectionDriver.stateMachineSupports(qlog))
-    }
-
-    @Test
-    @available(anyAppleOS 26, *)
-    func theStateMachineServesTheFeaturesItImplements() {
-        var keepalive = Self.configuration
-        keepalive.keepAliveInterval = .seconds(5)
-        var versionNegotiation = Self.configuration
-        versionNegotiation.forceVersionNegotiation = true
-        var packetSize = Self.configuration
-        packetSize.initialPacketSize = .fixed(1350)
-        var noDatagrams = Self.configuration
-        noDatagrams.maxDatagramFrameSize = 0
-        // Neither driver writes a key log, so the state machine driver ignores the path as well.
-        var keyLog = Self.configuration
-        keyLog.keyLogPath = "/tmp/keys"
-        // The handler sends the Retry packets of state machine connections.
-        var retry = Self.configuration
-        retry.sendRetry = true
-
-        for configuration in [keepalive, versionNegotiation, packetSize, noDatagrams, keyLog, retry] {
-            #expect(QUICConnectionDriver.stateMachineSupports(configuration))
-        }
+        #expect(drivers.drivers == [.stateMachine])
     }
 
     /// Handlers whose streams are stream channels default to the driver of those with stream
@@ -89,17 +101,19 @@ struct QUICConnectionDriverTests {
         #expect(handler.connectionDriver == QUICConnectionDriver.default(for: .client))
     }
 
-    /// Every configuration property is either implemented by the state machine driver or checked
-    /// by ``QUICConnectionDriver/stateMachineSupports(_:)``: a new one must be added to one of them.
+    /// The state machine driver implements every configuration property: a new one must be
+    /// added to ``QUICConnectionDriver/stateMachineProperties``.
     @Test
     @available(anyAppleOS 26, *)
-    func everyConfigurationPropertyIsAllowedOrChecked() {
+    func everyConfigurationPropertyIsImplemented() {
         let properties = Set(Mirror(reflecting: Self.configuration).children.compactMap(\.label))
-        let implemented = QUICConnectionDriver.stateMachineProperties
-        let checked = QUICConnectionDriver.stateMachineDefaultOnlyProperties
 
-        #expect(implemented.isDisjoint(with: checked))
-        #expect(properties.subtracting(implemented).subtracting(checked).isEmpty)
-        #expect(implemented.union(checked).subtracting(properties).isEmpty)
+        #expect(properties == QUICConnectionDriver.stateMachineProperties)
     }
+}
+
+/// The drivers of the connections a handler made.
+@available(anyAppleOS 26, *)
+private final class DriverRecorder {
+    var drivers: [QUICConnectionDriver] = []
 }

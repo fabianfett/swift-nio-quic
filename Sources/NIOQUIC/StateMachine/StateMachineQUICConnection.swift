@@ -18,6 +18,7 @@ import NIOCore
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import QUICStateMachine
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
+import Synchronization
 
 /// A QUIC connection driven directly from NIO through the `QUICConnectionCore` of
 /// swift-network-evolution's QUICStateMachine, without the SwiftNetwork framework.
@@ -130,6 +131,13 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The version a client sends its first Initial in to force Version Negotiation: a reserved
     /// version no server supports (RFC 9000 Section 15).
     private static var versionNegotiationGreaseVersion: UInt32 { 0x1a2a_3a4a }
+
+    #if QLOG_ENABLED
+    /// The qlog of the connection, if configured: the transport parameters of both endpoints,
+    /// and the packets the core sent, received and lost. Written to a file once the connection
+    /// is done.
+    private var qlog: QLog?
+    #endif
 
     #if DEBUG
     /// Runs when the connection is released, so tests can check that nothing keeps it alive.
@@ -398,6 +406,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Section 18.2), as on the SwiftNetwork driver. It may still rebind, which keeps the
         // connection ID.
         coreConfiguration.disableActiveMigration = localConnectionID.length == 0
+        #if QLOG_ENABLED
+        // The qlog records the core's packet events, which only queue up for it.
+        coreConfiguration.recordsPacketEvents = configuration.qLogConfiguration != nil
+        #endif
         return coreConfiguration
     }
 
@@ -463,6 +475,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         connection.makeStreamTable(configuration: configuration)
         connection.installAsyncContinuationHandler()
+        connection.startQLog(configuration.qLogConfiguration)
         return connection
     }
 
@@ -511,7 +524,64 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         connection.makeStreamTable(configuration: configuration)
         connection.installAsyncContinuationHandler()
+        connection.startQLog(configuration.qLogConfiguration)
         return connection
+    }
+
+    // MARK: qlog
+
+    /// Starts the qlog, if configured, with the transport parameters the connection sends. Without
+    /// the `QlogOutput` trait of swift-network-evolution there is no qlog, as on the SwiftNetwork
+    /// driver.
+    private func startQLog(_ configuration: QLogConfiguration?) {
+        #if QLOG_ENABLED
+        guard let configuration else { return }
+        let now = Self.now
+        let qlog = QLog(
+            configuration: QUICStateMachine.QLogConfiguration(
+                logTitle: configuration.topic.isEmpty ? nil : configuration.topic,
+                logDescription: configuration.description.isEmpty ? nil : configuration.description,
+                logPath: configuration.path
+            ),
+            startTime: now
+        )
+        qlog.parametersSet(owner: .local, transportParameters: self.core.localTransportParameters, timestamp: now)
+        self.qlog = qlog
+        #endif
+    }
+
+    /// Records the peer's transport parameters in the qlog, once the handshake completed.
+    private func qlogPeerTransportParameters() {
+        #if QLOG_ENABLED
+        guard let qlog = self.qlog, let parameters = self.core.peerTransportParameters else { return }
+        qlog.parametersSet(owner: .remote, transportParameters: parameters, timestamp: Self.now)
+        #endif
+    }
+
+    /// Moves the packet events the core recorded since the last call to the qlog.
+    private func qlogPacketEvents() {
+        #if QLOG_ENABLED
+        guard let qlog = self.qlog else { return }
+        while let event = self.core.nextPacketEvent() {
+            qlog.packetEvent(event)
+        }
+        #endif
+    }
+
+    /// Writes the qlog to its file, once: the connection is done. Writing blocks the event loop,
+    /// which is fine for a debugging aid.
+    private func finishQLog() {
+        #if QLOG_ENABLED
+        guard let qlog = self.qlog else { return }
+        self.qlogPacketEvents()
+        self.qlog = nil
+        let number = QLogConnectionNumbers.last.wrappingAdd(1, ordering: .relaxed).newValue
+        if let path = qlog.writeFile(flowType: self.role == .server ? .server : .client, connectionName: "C\(number)") {
+            self.logger.debug("Wrote qlog file", metadata: ["quic.qlog.path": "\(path)"])
+        } else {
+            self.logger.error("Failed to write the qlog file")
+        }
+        #endif
     }
 
     private func makeStreamTable(configuration: QUICConfiguration) {
@@ -633,6 +703,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// Delivers the core's events and re-arms the timer.
     private func afterCoreUpdate() {
+        self.qlogPacketEvents()
         self.processEvents()
         self.openPendingStreams()
         self.rescheduleTimer()
@@ -661,6 +732,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                         peerMaxDatagramFrameSize: self.core.peerMaxDatagramFrameSize
                     )
                     self.issueSpareConnectionIDs()
+                    self.qlogPeerTransportParameters()
                 }
             case .streamOpened(let id):
                 guard let table = self.streamTable else { continue }
@@ -755,6 +827,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.logger.debug("Connection closed", metadata: ["quic.close.reason": "\(reason)"])
         // `.closing` always comes first, so this only reports a close the channel missed.
         self.reportClose(reason)
+        self.finishQLog()
         self.closingTransport = nil
         if let onClosedWithoutChannel = self.onClosedWithoutChannel {
             self.onClosedWithoutChannel = nil
@@ -1019,6 +1092,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             }
         }
         _ = self.batch.finishDrain(sendingTo: transport, remoteAddress: remoteAddress)
+        self.qlogPacketEvents()
         self.rescheduleTimer()
     }
 
@@ -1078,7 +1152,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             // holds the connection until the core reports `.closed`. The handler may route the
             // peer's packets here meanwhile, see `continueClosing(transport:onClosed:)`.
         } else {
+            // Nothing drives the connection any more.
             self.cancelTimer()
+            self.finishQLog()
         }
         #if canImport(SwiftTLS)
         // The core releases the handler only once the handshake is confirmed or the connection
@@ -1121,6 +1197,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// Stops driving a connection whose channel went away: the handler is going away.
     func abandonClosing() {
         self.cancelTimer()
+        self.finishQLog()
         self.closingTransport = nil
         self.onClosedWithoutChannel = nil
     }
@@ -1191,3 +1268,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.core.hasStream(streamID.rawValue)
     }
 }
+
+#if QLOG_ENABLED
+/// The number of the last state machine connection that wrote a qlog, which tells the files apart.
+@available(anyAppleOS 26, *)
+private enum QLogConnectionNumbers {
+    static let last = Atomic<Int>(0)
+}
+#endif

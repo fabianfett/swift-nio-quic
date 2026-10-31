@@ -1074,8 +1074,6 @@ final class QUICProtocolStackTests: StreamChannelsTestCase {
 
     func testServerUsingQlog() async throws {
         try XCTSkipUnless(QUIC.isQlogEnabled, "Qlog isn't enabled, skipping")
-        // Only the SwiftNetwork driver writes qlog: the server falls back to it.
-        self.fallsBackToSwiftNetwork = true
 
         let path = FileManager.default.temporaryDirectory
         let tag = UUID().uuidString
@@ -1155,6 +1153,11 @@ final class QUICProtocolStackTests: StreamChannelsTestCase {
                 let filePath = path.appending(component: filename)
                 let resultData = try Data(contentsOf: filePath)
                 XCTAssert(!resultData.isEmpty, "qlog file is unexpectedly empty")
+                // The transport parameters of both endpoints, and the packets sent and received.
+                let contents = String(decoding: resultData, as: UTF8.self)
+                XCTAssertEqual(contents.components(separatedBy: "PARAMETERS_SET").count - 1, 2, contents)
+                XCTAssert(contents.contains("PACKET_SENT"), contents)
+                XCTAssert(contents.contains("PACKET_RECEIVED"), contents)
                 try FileManager.default.removeItem(at: filePath)
             }
         }

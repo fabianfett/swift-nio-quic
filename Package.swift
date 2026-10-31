@@ -17,8 +17,9 @@ import PackageDescription
 
 let isRunningInCI = Context.environment["CI"] != nil
 
-// Enable the QlogOutput in CI as some tests depend on it; also enable a setting our
-// tests can depend on to gate whether the Qlog tests are expected to run or not.
+// Enable the QlogOutput in CI as some tests depend on it; also enable a setting NIOQUIC uses
+// to write qlog files with the trait, and our tests to gate whether the Qlog tests are
+// expected to run or not.
 let swiftNetworkTraits: Set<Package.Dependency.Trait>
 let qlogSetting: [SwiftSetting]
 if isRunningInCI {
@@ -81,7 +82,7 @@ let package = Package(
                 .product(name: "QUICStateMachine", package: "swift-network-evolution"),
                 .product(name: "DequeModule", package: "swift-collections"),
             ],
-            swiftSettings: swiftSettings
+            swiftSettings: swiftSettings + qlogSetting
         ),
         .testTarget(
             name: "NIOQUICTests",

@@ -102,4 +102,28 @@ struct StateMachineCoreConfigurationTests {
             #expect(!coreConfiguration.automaticallyIssueConnectionIDs)
         }
     }
+
+    /// A connection with a qlog has the core record its packet events for it, with the
+    /// `QlogOutput` trait of swift-network-evolution; nothing records them otherwise.
+    @available(anyAppleOS 26, *)
+    @Test
+    func aQLogRecordsTheCoresPacketEvents() throws {
+        var configuration = QUICConfiguration.forClient(
+            verificationConfiguration: .rawPublicKeys(publicKeyFilePath: p256PublicKeyPath),
+            applicationProtocols: ["h3"]
+        )
+        func recordsPacketEvents() throws -> Bool {
+            try StateMachineQUICConnection<NoConsumer>.clientCoreConfiguration(
+                configuration,
+                sourceConnectionID: Self.connectionID(length: 8),
+                serverName: "example.com",
+                asyncVerifier: nil,
+                remoteAddress: try SocketAddress(ipAddress: "127.0.0.1", port: 4433)
+            ).recordsPacketEvents
+        }
+
+        #expect(try !recordsPacketEvents())
+        configuration.qLogConfiguration = QLogConfiguration(path: "/tmp")
+        #expect(try recordsPacketEvents() == QUIC.isQlogEnabled)
+    }
 }

@@ -38,10 +38,6 @@ class StreamChannelsTestCase: XCTestCase {
     /// The driver the handlers of the current run serve their stream channels on.
     private(set) var streamChannelsDriver: QUICConnectionDriver = StreamChannelsTestCase.streamChannelsDrivers[0]
 
-    /// Set by a test whose connections fall back to the SwiftNetwork driver, as those with
-    /// features only it implements do: at least one must.
-    var fallsBackToSwiftNetwork = false
-
     /// How many stream channel connections the tests of each class made, by driver.
     private static let connectionsOnDriver = Mutex<[ObjectIdentifier: [QUICConnectionDriver: Int]]>([:])
 
@@ -49,7 +45,6 @@ class StreamChannelsTestCase: XCTestCase {
     override func invokeTest() {
         for driver in Self.streamChannelsDrivers {
             self.streamChannelsDriver = driver
-            self.fallsBackToSwiftNetwork = false
             super.invokeTest()
         }
     }
@@ -64,14 +59,10 @@ class StreamChannelsTestCase: XCTestCase {
     override func tearDown() {
         QUICConnectionDriver._forTesting_streamChannelsDriver.withLock { $0 = nil }
         let drivers = QUICConnectionDriver._forTesting_streamChannelsConnections.withLock { $0 }
-        if self.fallsBackToSwiftNetwork {
-            XCTAssert(drivers.contains(.swiftNetwork), "no stream channel connection fell back: \(drivers)")
-        } else {
-            XCTAssert(
-                drivers.allSatisfy { $0 == self.streamChannelsDriver },
-                "stream channel connections ran on \(drivers), not only on \(self.streamChannelsDriver)"
-            )
-        }
+        XCTAssert(
+            drivers.allSatisfy { $0 == self.streamChannelsDriver },
+            "stream channel connections ran on \(drivers), not only on \(self.streamChannelsDriver)"
+        )
         Self.connectionsOnDriver.withLock {
             $0[ObjectIdentifier(Self.self), default: [:]][self.streamChannelsDriver, default: 0] += drivers.count
         }
