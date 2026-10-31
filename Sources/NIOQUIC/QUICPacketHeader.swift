@@ -186,8 +186,8 @@ struct QUICPacketHeader: Hashable, Sendable {
     var destinationConnectionID: QUICConnectionID
     /// The source connection ID of the packet.
     var sourceConnectionID: QUICConnectionID?
-    /// The address verification token of the packet. Only present when the type is `initial`
-    /// or `retry` .
+    /// The address verification token of the packet (RFC 9000 Section 8.1). Only present when
+    /// the type is `initial` or `retry`.
     var token: [UInt8]
 }
 
@@ -235,14 +235,48 @@ extension NIOCore.ByteBuffer {
                 scid = QUICConnectionID(parsedSCID)
             }
 
+            var token = header.token
+            if packetType == .initial {
+                // The routing parser reads the tokens of Retry packets only. A server validates
+                // a client's address with the token of its Initial (RFC 9000 Section 8.1.2).
+                guard
+                    let initialToken = Self.initialToken(
+                        in: buffer,
+                        connectionIDsLength: dcid.length + (scid?.length ?? 0)
+                    )
+                else {
+                    return nil
+                }
+                token = initialToken
+            }
+
             return QUICPacketHeader(
                 type: packetType,
                 version: version,
                 destinationConnectionID: QUICConnectionID(dcid),
                 sourceConnectionID: scid,
-                token: header.token
+                token: token
             )
         }
+    }
+
+    /// The token of the Initial packet in `packet` (RFC 9000 Section 17.2.2), which follows the
+    /// connection IDs and the token's length, or `nil` if the packet ends before it does.
+    private static func initialToken(in packet: UnsafeRawBufferPointer, connectionIDsLength: Int) -> [UInt8]? {
+        // The first byte, the version, and the lengths of the two connection IDs.
+        var index = 1 + 4 + 1 + 1 + connectionIDsLength
+        guard index < packet.count else { return nil }
+        // A variable-length integer: the two high bits of its first byte give its size (RFC 9000
+        // Section 16).
+        let lengthSize = 1 << Int(packet[index] >> 6)
+        guard lengthSize <= packet.count - index else { return nil }
+        var length = UInt64(packet[index] & 0x3f)
+        for offset in 1..<lengthSize {
+            length = length << 8 | UInt64(packet[index + offset])
+        }
+        index += lengthSize
+        guard length <= UInt64(packet.count - index) else { return nil }
+        return Array(packet[index..<(index + Int(length))])
     }
 }
 
@@ -269,6 +303,41 @@ extension QUICPacketHeader {
             sourceConnectionID: QUICStateMachine.QUICConnectionID(self.destinationConnectionID)
         )
         guard bytes.count >= Self.minimumDatagramSize else {
+            return nil
+        }
+
+        var buffer = allocator.buffer(capacity: bytes.count)
+        buffer.writeBytes(bytes)
+        return buffer
+    }
+
+    /// The Retry packet (RFC 9000 Section 17.2.5) that answers this Initial: it asks the client to
+    /// send its Initial again, to `sourceConnectionID` and with `token`. The Retry Integrity Tag
+    /// covers the packet's destination connection ID (RFC 9001 Section 5.8).
+    ///
+    /// - Parameters:
+    ///   - sourceConnectionID: The connection ID the server chose for the client's next Initial.
+    ///   - token: The token the client sends with its next Initial.
+    ///   - allocator: The allocator for the returned buffer.
+    /// - Returns: The datagram, or `nil` if the packet has no source connection ID, or the tag
+    ///   couldn't be computed.
+    func retryPacket(
+        sourceConnectionID: QUICConnectionID,
+        token: [UInt8],
+        allocator: ByteBufferAllocator
+    ) -> ByteBuffer? {
+        guard let clientConnectionID = self.sourceConnectionID else {
+            return nil
+        }
+        // Only version 1 Initials start connections, see `QUICHandler`.
+        let bytes = QUICStatelessPackets.retry(
+            version: .v1,
+            destinationConnectionID: QUICStateMachine.QUICConnectionID(clientConnectionID),
+            sourceConnectionID: QUICStateMachine.QUICConnectionID(sourceConnectionID),
+            originalDestinationConnectionID: QUICStateMachine.QUICConnectionID(self.destinationConnectionID),
+            token: token
+        )
+        guard let bytes else {
             return nil
         }
 

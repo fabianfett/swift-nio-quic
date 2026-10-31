@@ -471,6 +471,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         sourceConnectionID: QUICConnectionID,
         originalDestinationConnectionID: QUICConnectionID,
         peerConnectionID: QUICConnectionID?,
+        retrySourceConnectionID: QUICConnectionID? = nil,
         statelessResetTokenGenerator: any QUICStatelessResetToken.Generator,
         authenticator: Authenticator?,
         localAddress: SocketAddress,
@@ -492,6 +493,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             originalDestinationConnectionID: QUICStateMachine.QUICConnectionID(originalDestinationConnectionID),
             peerConnectionID: peerConnectionID.map { QUICStateMachine.QUICConnectionID($0) }
                 ?? QUICStateMachine.QUICConnectionID(0),
+            // After a Retry, the client checks that the server sent it (RFC 9000 Section 7.3).
+            retrySourceConnectionID: retrySourceConnectionID.map { QUICStateMachine.QUICConnectionID($0) },
             now: Self.now
         )
         let connection = StateMachineQUICConnection(

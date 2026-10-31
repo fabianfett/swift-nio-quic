@@ -121,6 +121,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     /// Derives the stateless reset tokens for the connection IDs issued by this handler's
     /// connections, and for the resets this handler sends on their behalf once they are gone.
     private let statelessResetTokenGenerator: any QUICStatelessResetToken.Generator
+    /// Makes and checks the tokens of the Retry packets a server sends to validate its clients'
+    /// addresses (RFC 9000 Section 8.1.2), if configured to.
+    private let retryTokens: QUICRetryTokens?
     /// Our current state.
     private var state: State = .accepting
     /// Boolean to indicate if we wrote something.
@@ -153,6 +156,14 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// Runs with the driver of each stream channel connection the handler makes.
     var _forTesting_onStreamChannelsConnection: ((QUICConnectionDriver) -> Void)?
+
+    var _forTesting_retryTokens: QUICRetryTokens? {
+        self.retryTokens
+    }
+
+    /// The Retry packets the handler sent, and the connections it accepted with their tokens.
+    private(set) var _forTesting_retriesSent = 0
+    private(set) var _forTesting_connectionsAcceptedAfterRetry = 0
     #endif
 
     /// Whether a new connection with `configuration` runs on a ``StateMachineQUICConnection``: the
@@ -197,6 +208,8 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.logger = logger
         self.connectionIDGenerator = connectionIDGenerator
         self.statelessResetTokenGenerator = statelessResetTokenGenerator
+        self.retryTokens =
+            quicConfiguration.role == .server && quicConfiguration.sendRetry ? QUICRetryTokens() : nil
         if let asyncVerifier {
             self.asyncVerifierRunner = .init(asyncVerifier: asyncVerifier)
         }
@@ -549,6 +562,119 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: versionNegotiation),
             promise: nil
         )
+    }
+
+    /// How the handler validates the address of a client whose Initial routes to no connection.
+    private enum AddressValidation {
+        /// The handler sends no Retry: the connection may start.
+        case notRequired
+        /// The Initial carries a valid token of a Retry the handler sent: the client's first
+        /// Initial went to `originalDestinationConnectionID`.
+        case validated(originalDestinationConnectionID: QUICConnectionID)
+        /// The handler answered with a Retry, or dropped the Initial.
+        case pending
+    }
+
+    /// Validates the address of a client before the server keeps any state for it, if configured
+    /// to (RFC 9000 Section 8.1.2): an Initial without a token is answered with a Retry, whose
+    /// token the client's next Initial carries.
+    ///
+    /// The handler sends the Retry packets of the state machine driver. The SwiftNetwork driver
+    /// sends its own.
+    private func validateAddress(
+        of header: QUICPacketHeader,
+        triggeredBy envelope: AddressedEnvelope<ByteBuffer>
+    ) -> AddressValidation {
+        guard let retryTokens = self.retryTokens, self.servesStateMachineConnections(self.quicConfiguration) else {
+            return .notRequired
+        }
+        // RFC 9000 Section 14.1: "A server MUST discard an Initial packet that is carried in a
+        // UDP datagram with a payload that is smaller than the smallest allowed maximum datagram
+        // size of 1200 bytes." This also keeps the Retry smaller than the packet it answers.
+        guard envelope.data.readableBytes >= 1200 else {
+            return .pending
+        }
+        let now = NIODeadline.now()
+        if !header.token.isEmpty {
+            switch retryTokens.validate(
+                header.token,
+                retrySourceConnectionID: header.destinationConnectionID,
+                clientAddress: envelope.remoteAddress,
+                now: now
+            ) {
+            case .valid(let originalDestinationConnectionID):
+                return .validated(originalDestinationConnectionID: originalDestinationConnectionID)
+            case .invalid:
+                // RFC 9000 Section 8.1.3: the client accepts no second Retry. "The server can
+                // discard such a packet and allow the client to time out to detect handshake
+                // failure". Closing with INVALID_TOKEN instead takes an Initial packet, and so
+                // the state the server keeps only for validated addresses.
+                self.logger.debug(
+                    "QUICHandler dropping Initial with an invalid Retry token",
+                    metadata: [
+                        LoggingKeys.addressRemote: "\(envelope.remoteAddress)",
+                        LoggingKeys.connectionDCID: "\(header.destinationConnectionID.description)",
+                    ]
+                )
+                return .pending
+            case .unknown:
+                // Not a token of a Retry: as for an Initial without one (RFC 9000 Section 8.1.3).
+                ()
+            }
+        }
+        self.sendRetry(for: header, triggeredBy: envelope, tokens: retryTokens, now: now)
+        return .pending
+    }
+
+    /// Answers a client's Initial with a Retry (RFC 9000 Section 17.2.5), which asks the client
+    /// to send its Initial again, to a new connection ID and with a token for its address.
+    private func sendRetry(
+        for header: QUICPacketHeader,
+        triggeredBy envelope: AddressedEnvelope<ByteBuffer>,
+        tokens: QUICRetryTokens,
+        now: NIODeadline
+    ) {
+        guard let clientConnectionID = header.sourceConnectionID else { return }
+        // The connection ID of the connection the client's next Initial creates. A client
+        // discards a Retry from the connection ID its Initial went to (RFC 9000 Section
+        // 17.2.5.2), which a generator may suggest.
+        var sourceConnectionID = self.connectionIDGenerator.next(
+            sourceConnectionID: clientConnectionID,
+            destinationConnectionID: header.destinationConnectionID
+        )
+        if sourceConnectionID == header.destinationConnectionID {
+            sourceConnectionID = self.connectionIDGenerator.next()
+        }
+        let token = tokens.makeToken(
+            originalDestinationConnectionID: header.destinationConnectionID,
+            retrySourceConnectionID: sourceConnectionID,
+            clientAddress: envelope.remoteAddress,
+            now: now
+        )
+        guard
+            let retry = header.retryPacket(
+                sourceConnectionID: sourceConnectionID,
+                token: token,
+                allocator: self.udpChannel.allocator
+            )
+        else {
+            return
+        }
+
+        self.logger.debug(
+            "QUICHandler sending retry",
+            metadata: [
+                LoggingKeys.addressRemote: "\(envelope.remoteAddress)",
+                LoggingKeys.connectionDCID: "\(header.destinationConnectionID.description)",
+                LoggingKeys.connectionSCID: "\(sourceConnectionID.description)",
+                LoggingKeys.channelOutboundBytes: "\(retry.readableBytes)",
+            ]
+        )
+        #if DEBUG
+        self._forTesting_retriesSent += 1
+        #endif
+
+        self.writeDatagram(AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: retry), promise: nil)
     }
 }
 
@@ -979,13 +1105,30 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         // (RFC 9000 Section 5.2.2).
                         self.trySendVersionNegotiation(for: header, triggeredBy: addressedEnvelope)
                     } else if header.type == .initial {
-                        // Only INITIAL packets can create new connections.
+                        // Only INITIAL packets can create new connections, once their address
+                        // is validated if the server asks for that.
+                        let originalDestinationConnectionID: QUICConnectionID
+                        let retrySourceConnectionID: QUICConnectionID?
+                        switch self.validateAddress(of: header, triggeredBy: addressedEnvelope) {
+                        case .notRequired:
+                            originalDestinationConnectionID = header.destinationConnectionID
+                            retrySourceConnectionID = nil
+                        case .validated(let destinationConnectionID):
+                            // The client sends to the source connection ID of the Retry now.
+                            originalDestinationConnectionID = destinationConnectionID
+                            retrySourceConnectionID = header.destinationConnectionID
+                        case .pending:
+                            return
+                        }
+                        // Admission counts the connections created: a Retry creates none.
                         switch self.connectionAdmissionController.acceptNewConnection() {
                         case .accept:
                             try self.acceptNewConnection(
                                 for: addressedEnvelope,
                                 sourceConnectionID: header.sourceConnectionID,
                                 destinationConnectionID: header.destinationConnectionID,
+                                originalDestinationConnectionID: originalDestinationConnectionID,
+                                retrySourceConnectionID: retrySourceConnectionID,
                                 // This force unwrap is fine. We really need to have a local address at this point
                                 localAddress: context.localAddress!
                             )
@@ -1108,15 +1251,28 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         }
     }
 
+    /// Creates a server connection for a client's Initial.
+    ///
+    /// - Parameters:
+    ///   - destinationConnectionID: The destination connection ID of the Initial.
+    ///   - originalDestinationConnectionID: The destination connection ID of the client's first
+    ///     Initial: `destinationConnectionID`, unless the handler sent a Retry.
+    ///   - retrySourceConnectionID: The source connection ID of the Retry the handler sent, if any:
+    ///     `destinationConnectionID`, and the connection's own connection ID.
     private func acceptNewConnection(
         for addressedEnvelope: AddressedEnvelope<ByteBuffer>,
         sourceConnectionID: QUICConnectionID?,
         destinationConnectionID: QUICConnectionID,
+        originalDestinationConnectionID: QUICConnectionID,
+        retrySourceConnectionID: QUICConnectionID?,
         localAddress: SocketAddress
     ) throws {
-        // The original DCID was generated by the client. We'll generate a new one to use as our SCID.
+        // The original DCID was generated by the client. We'll generate a new one to use as our
+        // SCID, unless the Retry chose it already.
         let newSourceConnectionID: QUICConnectionID
-        if let sourceConnectionID {
+        if let retrySourceConnectionID {
+            newSourceConnectionID = retrySourceConnectionID
+        } else if let sourceConnectionID {
             newSourceConnectionID = self.connectionIDGenerator.next(
                 sourceConnectionID: sourceConnectionID,
                 destinationConnectionID: destinationConnectionID
@@ -1129,7 +1285,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         let connectionLogger = {
             var logger = logger
             logger[metadataKey: LoggingKeys.connectionOriginalSCID] =
-                "\(destinationConnectionID.description)"
+                "\(originalDestinationConnectionID.description)"
             logger[metadataKey: LoggingKeys.connectionSCID] = "\(newSourceConnectionID)"
             logger[metadataKey: LoggingKeys.connectionDCID] = "\(sourceConnectionID?.description ?? "none")"
             logger[metadataKey: LoggingKeys.addressLocal] = "\(localAddress)"
@@ -1150,8 +1306,9 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                     try StateMachineQUICConnection<Consumer>.server(
                         configuration: configuration,
                         sourceConnectionID: newSourceConnectionID,
-                        originalDestinationConnectionID: destinationConnectionID,
+                        originalDestinationConnectionID: originalDestinationConnectionID,
                         peerConnectionID: sourceConnectionID,
+                        retrySourceConnectionID: retrySourceConnectionID,
                         statelessResetTokenGenerator: self.statelessResetTokenGenerator,
                         authenticator: self.authenticator,
                         localAddress: localAddress,
@@ -1297,6 +1454,12 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                 }
             }
         }
+
+        #if DEBUG
+        if retrySourceConnectionID != nil {
+            self._forTesting_connectionsAcceptedAfterRetry += 1
+        }
+        #endif
 
         handshakePromise.futureResult.assumeIsolated().whenComplete { _ in
             // Make sure we release the slot for new connections.
@@ -1636,20 +1799,22 @@ enum QUICConnectionDriver: Hashable, Sendable {
         "pacePackets",
         // Neither driver writes a key log.
         "keyLogPath",
+        // The handler sends the state machine driver's Retry packets.
+        "sendRetry",
     ]
 
     /// The ``QUICConfiguration`` properties the state machine driver implements only at their
-    /// defaults: it sends no Retry, and writes no qlog. ``stateMachineSupports(_:)`` checks each.
+    /// defaults: it writes no qlog. ``stateMachineSupports(_:)`` checks each.
     ///
     /// Together with ``stateMachineProperties`` these are all of the configuration's properties;
     /// a test checks that a new one is added to either.
-    static let stateMachineDefaultOnlyProperties: Set<String> = ["qLogConfiguration", "sendRetry"]
+    static let stateMachineDefaultOnlyProperties: Set<String> = ["qLogConfiguration"]
 
     /// Whether the state machine driver implements everything `configuration` asks for: the
     /// ``stateMachineProperties`` at any value, and the ``stateMachineDefaultOnlyProperties`` at
     /// their defaults.
     static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
-        configuration.qLogConfiguration == nil && !configuration.sendRetry
+        configuration.qLogConfiguration == nil
     }
 
     /// The default for the stream channels of a role: as for stream consumers, see

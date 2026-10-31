@@ -95,8 +95,8 @@ final class HeaderIDTests {
         try #require(header?.type == .initial)
         try #require(header?.destinationConnectionID == connectionID)
         try #require(header?.sourceConnectionID == connectionID)
-        // Tokens will only be read from retry packets
-        try #require(header?.token == [])
+        // A server reads the token of an Initial to validate the client's address.
+        try #require(header?.token == token)
     }
 
     @available(anyAppleOS 26, *)
@@ -244,8 +244,8 @@ final class HeaderIDTests {
         let parsedSCID = try #require(header?.sourceConnectionID)
         #expect(parsedSCID.length == 0)
         #expect(parsedSCID == scid)
-        // Tokens will only be read from retry packets
-        try #require(header?.token == [])
+        // A server reads the token of an Initial to validate the client's address.
+        try #require(header?.token == token)
     }
 
     @available(anyAppleOS 26, *)
@@ -375,6 +375,23 @@ final class HeaderIDTests {
         let header = buffer.parseQUICPacketHeader(destinationIDLength: 16)
 
         #expect(header == nil)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test("initial with a token longer than 63 bytes")
+    func initialWithALongToken() throws {
+        let connectionID = QUICConnectionID(bytes: InlineArray(repeating: 1), length: 8)
+        let token = [UInt8](repeating: 7, count: 100)
+        // The token's length is a variable-length integer (RFC 9000 Section 16): two bytes here.
+        var packet: [UInt8] = [0b1100_0000, 0, 0, 0, 1, 8] + connectionID.asBytes + [8] + connectionID.asBytes
+        packet += [0x40, 100] + token + [UInt8](repeating: 0, count: 20)
+
+        let header = ByteBuffer(bytes: packet).parseQUICPacketHeader(destinationIDLength: 8)
+        #expect(header?.token == token)
+
+        // A token that runs past the packet.
+        let truncated = Array(packet.prefix(packet.count - 20 - 1))
+        #expect(ByteBuffer(bytes: truncated).parseQUICPacketHeader(destinationIDLength: 8) == nil)
     }
 
     @available(anyAppleOS 26, *)
