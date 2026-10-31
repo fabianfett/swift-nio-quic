@@ -376,6 +376,51 @@ final class HeaderIDTests {
 
         #expect(header == nil)
     }
+
+    @available(anyAppleOS 26, *)
+    @Test("version negotiation answer")
+    func versionNegotiationAnswer() throws {
+        let destinationID = QUICConnectionID(bytes: InlineArray(repeating: 1), length: 8)
+        let sourceID = QUICConnectionID(bytes: InlineArray(repeating: 2), length: 5)
+        let header = QUICPacketHeader(
+            type: .initial,
+            version: .init(0x1a2a_3a4a),
+            destinationConnectionID: destinationID,
+            sourceConnectionID: sourceID,
+            token: []
+        )
+
+        let answer = try #require(header.versionNegotiationPacket(allocator: ByteBufferAllocator()))
+
+        // RFC 9000 Section 17.2.1: version 0, the packet's connection IDs swapped, then version 1
+        // and a reserved version (RFC 9000 Section 15).
+        let expected: [UInt8] =
+            [0x80, 0, 0, 0, 0, 5] + sourceID.asBytes + [8] + destinationID.asBytes
+            + [0, 0, 0, 1, 0x1a, 0x2a, 0x3a, 0x4a]
+        #expect(Array(answer.readableBytesView) == expected)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test("no version negotiation answer shorter than 21 bytes")
+    func noVersionNegotiationAnswerShorterThan21Bytes() throws {
+        func answer(destinationIDLength: Int, sourceIDLength: Int) -> ByteBuffer? {
+            QUICPacketHeader(
+                type: .initial,
+                version: .init(0x1a2a_3a4a),
+                destinationConnectionID: QUICConnectionID(
+                    bytes: InlineArray(repeating: 1),
+                    length: UInt8(destinationIDLength)
+                ),
+                sourceConnectionID: QUICConnectionID(bytes: InlineArray(repeating: 2), length: UInt8(sourceIDLength)),
+                token: []
+            ).versionNegotiationPacket(allocator: ByteBufferAllocator())
+        }
+
+        // 15 bytes and two connection IDs: peers drop datagrams shorter than 21 bytes.
+        #expect(answer(destinationIDLength: 0, sourceIDLength: 0) == nil)
+        #expect(answer(destinationIDLength: 3, sourceIDLength: 2) == nil)
+        #expect(answer(destinationIDLength: 3, sourceIDLength: 3)?.readableBytes == 21)
+    }
 }
 
 extension ByteBuffer {

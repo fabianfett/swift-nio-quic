@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import NIOCore
+@_spi(ProtocolProvider) import QUICStateMachine
 @_spi(ProtocolProvider) import SwiftNetwork
 
 @available(anyAppleOS 26, *)
@@ -247,22 +248,27 @@ extension NIOCore.ByteBuffer {
 
 @available(anyAppleOS 26, *)
 extension QUICPacketHeader {
+    /// The shortest datagram the QUIC endpoints of swift-network-evolution read: they drop
+    /// shorter ones without parsing them.
+    private static var minimumDatagramSize: Int { 21 }
+
     /// The Version Negotiation packet (RFC 9000 Section 17.2.1) that answers this packet. It lists
-    /// the versions SwiftNetwork's connections speak, and swaps the packet's connection IDs, as
-    /// RFC 9000 Section 6.1 requires.
+    /// QUIC version 1 and a reserved version (RFC 9000 Section 15), and swaps the packet's
+    /// connection IDs, as RFC 9000 Section 6.1 requires.
     ///
     /// - Parameter allocator: The allocator for the returned buffer.
-    /// - Returns: The datagram, or `nil` if the packet has no source connection ID.
+    /// - Returns: The datagram, or `nil` if the packet has no source connection ID, or the answer
+    ///   would be shorter than the 21 bytes a peer reads.
     func versionNegotiationPacket(allocator: ByteBufferAllocator) -> ByteBuffer? {
         guard let sourceConnectionID = self.sourceConnectionID else {
             return nil
         }
-        // The utility swaps the IDs: the packet's source ID becomes the answer's destination ID.
-        let bytes = try? QUICConnectionUtilities.createVersionNegotiationPacket(
-            destinationConnectionID: SwiftNetwork.QUICConnectionID(self.destinationConnectionID),
-            sourceConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID)
+        // The answer goes to the packet's source connection ID, from its destination one.
+        let bytes = QUICStatelessPackets.versionNegotiation(
+            destinationConnectionID: QUICStateMachine.QUICConnectionID(sourceConnectionID),
+            sourceConnectionID: QUICStateMachine.QUICConnectionID(self.destinationConnectionID)
         )
-        guard let bytes else {
+        guard bytes.count >= Self.minimumDatagramSize else {
             return nil
         }
 
