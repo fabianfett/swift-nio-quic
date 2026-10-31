@@ -108,22 +108,64 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
             }
         }
 
-        func withLiveOnly(
-            promise: EventLoopPromise<Void>? = nil,
-            execute body: (SwiftNetworkQUICConnection<Consumer>) throws -> Void
-        ) {
+        /// Issues `connectionID` to the peer, for `QUICRequestAssociateSCIDEvent`.
+        func requestAssociationOfConnectionID(_ connectionID: QUICConnectionID) throws {
             switch self {
             case .live(let connection):
-                do {
-                    try body(connection)
-                    promise?.succeed()
-                } catch {
-                    promise?.fail(error)
-                }
-            case .stateMachine, .test:
-                promise?.fail(ChannelError.operationUnsupported)
+                try connection.requestAssociationOfConnectionID(connectionID)
+            case .stateMachine(let connection):
+                try connection.requestAssociationOfConnectionID(connectionID)
+            case .test:
+                throw ChannelError.operationUnsupported
             }
         }
+
+        /// Retires one of the peer's connection IDs, for `QUICRequestRetireDCIDEvent`.
+        func requestRetirementOfConnectionID(_ connectionID: QUICConnectionID) throws {
+            switch self {
+            case .live(let connection):
+                try connection.requestRetirementOfConnectionID(connectionID)
+            case .stateMachine(let connection):
+                try connection.requestRetirementOfConnectionID(connectionID)
+            case .test:
+                throw ChannelError.operationUnsupported
+            }
+        }
+
+        #if DEBUG
+        func _forTesting_addRetiredConnectionID(_ connectionID: QUICConnectionID) throws {
+            switch self {
+            case .live(let connection):
+                connection._forTesting_addRetiredSCID(connectionID)
+            case .stateMachine(let connection):
+                connection._forTesting_addRetiredConnectionID(connectionID)
+            case .test:
+                throw ChannelError.operationUnsupported
+            }
+        }
+
+        func _forTesting_localConnectionIDs() throws -> [QUICConnectionID] {
+            switch self {
+            case .live(let connection):
+                return connection._forTesting_getActiveSCIDs()
+            case .stateMachine(let connection):
+                return connection._forTesting_localConnectionIDs
+            case .test:
+                throw ChannelError.operationUnsupported
+            }
+        }
+
+        func _forTesting_removeLocalConnectionID(_ connectionID: QUICConnectionID) throws {
+            switch self {
+            case .live(let connection):
+                connection._forTesting_removeFromActiveSCIDs(connectionID)
+            case .stateMachine(let connection):
+                connection._forTesting_removeLocalConnectionID(connectionID)
+            case .test:
+                throw ChannelError.operationUnsupported
+            }
+        }
+        #endif
     }
 }
 

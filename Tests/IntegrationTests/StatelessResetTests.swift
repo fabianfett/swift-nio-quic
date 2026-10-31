@@ -76,6 +76,23 @@ struct StatelessResetTests {
     @available(anyAppleOS 26, *)
     @Test(arguments: Drivers.all)
     func testAClientLearnsOfLostServerStateFromAStatelessReset(drivers: Drivers) async throws {
+        try await Self.clientLearnsOfLostServerState(drivers: drivers, sendingToASpare: false)
+    }
+
+    /// The token of a spare connection ID the server issued after the handshake resets the
+    /// connection as well (RFC 9000 Section 10.3.1): the client switches to the spare before the
+    /// server loses its state.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: [
+        Drivers(client: .stateMachine, server: .stateMachine),
+        Drivers(client: .swiftNetwork, server: .stateMachine),
+    ])
+    func testAStatelessResetForASpareConnectionIDResetsTheConnection(drivers: Drivers) async throws {
+        try await Self.clientLearnsOfLostServerState(drivers: drivers, sendingToASpare: true)
+    }
+
+    @available(anyAppleOS 26, *)
+    private static func clientLearnsOfLostServerState(drivers: Drivers, sendingToASpare: Bool) async throws {
         let serverDriver = QUICConnectionDriver(drivers.server)
         let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
         let server = try await Self.bindServer(port: 0, driver: serverDriver, drivers: serverDrivers)
@@ -103,6 +120,7 @@ struct StatelessResetTests {
                     makeConsumer: { _ in RecordConsumer(recording: recording) }
                 )
                 handler.connectionDriver = QUICConnectionDriver(drivers.client)
+                try channel.pipeline.syncOperations.addHandler(ShortHeaderRecorder())
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -136,6 +154,16 @@ struct StatelessResetTests {
         let echoed = await recording.visits { $0.handle == first && $0.events.contains(.closed) }
         #expect(echoed.last?.bytesReadSoFar == ByteBuffer(string: "GET /"))
 
+        if sendingToASpare {
+            // The client retires the server's connection ID of the handshake, and sends to a spare.
+            let handshakeID = try await Self.lastDestinationConnectionID(of: client)
+            try await connection.channel.triggerUserOutboundEvent(QUICRequestRetireDCIDEvent(dcid: handshakeID)).get()
+            let next = try #require(try await request())
+            _ = await recording.visits { $0.handle == next && $0.events.contains(.closed) }
+            let spare = try await Self.lastDestinationConnectionID(of: client)
+            #expect(spare != handshakeID)
+        }
+
         // The server loses its state: closing its socket sends nothing, so the client doesn't
         // know. Its next incarnation, on the same port, has no state for the connection.
         try await server.close()
@@ -152,5 +180,19 @@ struct StatelessResetTests {
         if drivers.client == .stateMachine {
             #expect(closed.last?.closeErrorDescription?.contains("stateless reset") == true)
         }
+    }
+
+    /// The server's connection ID in the last short header packet the client sent.
+    @available(anyAppleOS 26, *)
+    private static func lastDestinationConnectionID(of client: any Channel) async throws -> QUICConnectionID {
+        let lastPacket = try await client.eventLoop.submit {
+            try client.pipeline.syncOperations.handler(type: ShortHeaderRecorder.self).lastPacket
+        }.get()
+        let packet = try #require(lastPacket)
+        // The connection ID follows the first byte (RFC 9000 Section 17.3.1).
+        let bytes = try #require(
+            packet.getBytes(at: packet.readerIndex + 1, length: Int(QUICConnectionID.randomIDLength))
+        )
+        return QUICConnectionID(bytes: bytes.span)
     }
 }

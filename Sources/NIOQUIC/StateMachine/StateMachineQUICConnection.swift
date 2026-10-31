@@ -72,6 +72,21 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// Locally opened streams waiting for the peer to allow more streams.
     private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
 
+    /// Derives the stateless reset tokens of the connection IDs the connection issues, so that
+    /// the handler can reset the peer once the connection is gone (RFC 9000 Section 10.3).
+    private let statelessResetTokenGenerator: any QUICStatelessResetToken.Generator
+    /// The length of the connection's own connection IDs. With zero-length ones it issues no others.
+    private let connectionIDLength: Int
+    /// The connection's own connection IDs that route to it in the handler, oldest first: the
+    /// handshake's, and those issued since (RFC 9000 Section 5.1).
+    private var localConnectionIDs: [QUICConnectionID]
+    /// The connection IDs the peer retired most recently, oldest first, which must not be issued
+    /// again (RFC 9000 Section 5.1.1).
+    private var retiredLocalConnectionIDs: [QUICConnectionID] = []
+    /// A connection ID the peer retired while it was the last one routing to the connection. It
+    /// keeps routing until another one does, so the connection stays reachable.
+    private var connectionIDPendingRetirement: QUICConnectionID?
+
     /// Whether a drain of the connection's output is scheduled for the next loop tick.
     private var drainScheduled = false
 
@@ -93,6 +108,22 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The UDP payload size the connection starts with, and the largest it sends on paths other
     /// than the active one. PMTUD may raise it on the active path, see `makeCoreConfiguration`.
     private let baseDatagramSize: Int
+
+    /// The connection IDs a connection issues once its handshake completed, besides the
+    /// handshake's, if the peer's `active_connection_id_limit` takes them; as many as the
+    /// SwiftNetwork driver issues.
+    static var spareConnectionIDs: Int { 8 }
+
+    /// The retired connection IDs a connection remembers to refuse issuing them again.
+    private static var rememberedRetiredConnectionIDs: Int { 2 * Self.spareConnectionIDs }
+
+    /// The `active_connection_id_limit` a connection advertises (RFC 9000 Section 18.2), as the
+    /// SwiftNetwork driver does: the peer may issue that many connection IDs to the connection.
+    static var activeConnectionIDLimit: UInt64 { 64 }
+
+    /// Whether `processEvents()` runs: it handles the events the core reports meanwhile, also
+    /// those of calls from the channel's pipeline that its events lead to.
+    private var processingEvents = false
 
     /// The version a client sends its first Initial in to force Version Negotiation: a reserved
     /// version no server supports (RFC 9000 Section 15).
@@ -164,12 +195,47 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         get { self.batch.onDatagramWritten }
         set { self.batch.onDatagramWritten = newValue }
     }
+
+    /// The connection's own connection IDs that route to it, oldest first.
+    var _forTesting_localConnectionIDs: [QUICConnectionID] {
+        self.localConnectionIDs
+    }
+
+    /// The retired connection IDs checked against those issued, oldest first.
+    var _forTesting_retiredConnectionIDs: [QUICConnectionID] {
+        self.retiredLocalConnectionIDs
+    }
+
+    /// The peer's connection ID the connection sends to on the active path.
+    var _forTesting_peerConnectionID: QUICConnectionID? {
+        self.core.peerConnectionID(on: self.core.activePathID).map(NIOQUIC.QUICConnectionID.init)
+    }
+
+    /// Marks `connectionID` as retired, so that issuing it closes the connection.
+    func _forTesting_addRetiredConnectionID(_ connectionID: QUICConnectionID) {
+        self.rememberRetiredConnectionID(connectionID)
+    }
+
+    /// Forgets `connectionID` as if the peer retired it, but keeps routing it, as the SwiftNetwork
+    /// driver does. The last one waits for another one to route, as in
+    /// `retireLocalConnectionID(_:)`.
+    func _forTesting_removeLocalConnectionID(_ connectionID: QUICConnectionID) {
+        guard let index = self.localConnectionIDs.firstIndex(of: connectionID) else { return }
+        guard self.localConnectionIDs.count > 1 else {
+            self.connectionIDPendingRetirement = connectionID
+            return
+        }
+        self.localConnectionIDs.remove(at: index)
+        self.rememberRetiredConnectionID(connectionID)
+    }
     #endif
 
     private init(
         core: consuming QUICConnectionCore,
         baseDatagramSize: Int,
         role: Role,
+        localConnectionID: QUICConnectionID,
+        statelessResetTokenGenerator: any QUICStatelessResetToken.Generator,
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
@@ -179,6 +245,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.core = core
         self.baseDatagramSize = baseDatagramSize
         self.role = role
+        self.connectionIDLength = localConnectionID.length
+        self.localConnectionIDs = [localConnectionID]
+        self.statelessResetTokenGenerator = statelessResetTokenGenerator
         self.localAddress = localAddress
         self.remoteAddress = SendableAddress(remoteAddress)
         self.paths = [(remoteAddress, .initial)]
@@ -290,9 +359,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
         // Off by default, as on the SwiftNetwork driver, which never paces for NIOQUIC.
         coreConfiguration.pacingEnabled = configuration.pacePackets
-        // The driver issues no spare connection IDs and routes none (`.newLocalConnectionID`),
-        // so a peer can't migrate to a new connection ID: it only follows a NAT rebinding,
-        // which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
+        // The peer may issue as many connection IDs as to a SwiftNetwork driver connection
+        // (RFC 9000 Section 5.1.1). The driver issues its own, see `issueSpareConnectionIDs()`.
+        coreConfiguration.activeConnectionIDLimit = Self.activeConnectionIDLimit
+        // Peers don't migrate to new addresses on their own yet: the connection only follows a
+        // NAT rebinding, which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
         coreConfiguration.disableActiveMigration = true
         return coreConfiguration
     }
@@ -323,6 +394,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     static func client(
         configuration: QUICConfiguration,
         sourceConnectionID: QUICConnectionID,
+        statelessResetTokenGenerator: any QUICStatelessResetToken.Generator,
         serverName: String?,
         asyncVerifier: AsyncVerifier?,
         localAddress: SocketAddress,
@@ -347,6 +419,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             core: core,
             baseDatagramSize: coreConfiguration.maxDatagramSize,
             role: .client,
+            localConnectionID: sourceConnectionID,
+            statelessResetTokenGenerator: statelessResetTokenGenerator,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
@@ -390,6 +464,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             core: core,
             baseDatagramSize: coreConfiguration.maxDatagramSize,
             role: .server,
+            localConnectionID: sourceConnectionID,
+            statelessResetTokenGenerator: statelessResetTokenGenerator,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
@@ -534,6 +610,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     private func processEvents() {
+        let wasProcessingEvents = self.processingEvents
+        self.processingEvents = true
+        defer { self.processingEvents = wasProcessingEvents }
         while let event = self.core.nextEvent() {
             switch event {
             case .connected:
@@ -544,6 +623,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                     self.channelView?.handshakeCompleted(
                         peerMaxDatagramFrameSize: self.core.peerMaxDatagramFrameSize
                     )
+                    self.issueSpareConnectionIDs()
                 }
             case .streamOpened(let id):
                 guard let table = self.streamTable else { continue }
@@ -575,8 +655,13 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 ()
             case .datagramsReadable:
                 self.deliverDatagrams()
-            case .newLocalConnectionID, .retiredLocalConnectionID, .newPeerConnectionID, .retiredPeerConnectionID:
-                // The core issues no connection IDs on its own, and the peer's aren't routed yet.
+            case .newLocalConnectionID(_, let connectionID, _):
+                self.connectionIDIssued(NIOQUIC.QUICConnectionID(connectionID))
+            case .retiredLocalConnectionID(let connectionID):
+                self.retireLocalConnectionID(NIOQUIC.QUICConnectionID(connectionID))
+            case .newPeerConnectionID, .retiredPeerConnectionID:
+                // The core picks the peer's connection ID to send to; the handler routes by the
+                // connection's own.
                 ()
             case .pathValidated:
                 ()
@@ -659,6 +744,138 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             error = QUICConnectionError(reason: "stateless reset", isApplication: false, code: 0)
         }
         self.channelView?.connectionClosed(error: error)
+    }
+
+    // MARK: Connection IDs
+
+    /// Issues spare connection IDs once the handshake completed, which the peer switches to when
+    /// it migrates (RFC 9000 Sections 5.1.1 and 9.5): as many as its `active_connection_id_limit`
+    /// takes besides the handshake's, up to ``spareConnectionIDs``. Zero-length connection IDs
+    /// have no spares.
+    private func issueSpareConnectionIDs() {
+        guard self.connectionIDLength > 0, let channelView = self.channelView else { return }
+        let count = min(Self.spareConnectionIDs, self.core.peerActiveConnectionIDLimit - 1)
+        for _ in 0..<max(count, 0) {
+            self.issueConnectionID(channelView.generateID())
+        }
+    }
+
+    /// Issues `connectionID` to the peer in a NEW_CONNECTION_ID frame, with the stateless reset
+    /// token the generator derives for it. The handler routes it once the core reports it, see
+    /// `connectionIDIssued(_:)`.
+    ///
+    /// - Returns: `false` if the core refused it: the peer's `active_connection_id_limit` is
+    ///   reached, or the connection is closing. A connection ID the peer retired closes the
+    ///   connection instead, as the same connection ID must not be issued more than once (RFC
+    ///   9000 Section 5.1.1).
+    @discardableResult
+    private func issueConnectionID(_ connectionID: QUICConnectionID) -> Bool {
+        if self.localConnectionIDs.contains(connectionID) {
+            // Issued before: asking again changes nothing.
+            return true
+        }
+        if self.retiredLocalConnectionIDs.contains(connectionID) {
+            self.closeWithTransportError(
+                .protocolViolation,
+                reason: "The same connection ID must not be issued more than once"
+            )
+            return false
+        }
+        let token = self.statelessResetTokenGenerator.token(for: connectionID)
+        return self.core.issueConnectionID(
+            QUICStateMachine.QUICConnectionID(connectionID),
+            statelessResetToken: token.token
+        )
+    }
+
+    /// The core issued `connectionID`: the handler routes it to the connection from now on, and
+    /// the channel fires `QUICSCIDAssociatedEvent`. A retirement that waited for another
+    /// connection ID to route goes ahead.
+    private func connectionIDIssued(_ connectionID: QUICConnectionID) {
+        guard let channelView = self.channelView else { return }
+        guard channelView.associate(connectionID) else {
+            // It routes to another connection already.
+            self.closeWithTransportError(.internalError, reason: "Failed to route a new connection ID")
+            return
+        }
+        self.localConnectionIDs.append(connectionID)
+        channelView.connectionIDAssociated(connectionID)
+        if let pending = self.connectionIDPendingRetirement, self.retireLocalConnectionID(pending) {
+            self.connectionIDPendingRetirement = nil
+        }
+    }
+
+    /// The peer retired `connectionID` (RFC 9000 Section 19.16): the handler stops routing it,
+    /// the channel fires `QUICSCIDRetiredEvent`, and a new connection ID replaces it. The last
+    /// connection ID that routes to the connection keeps routing until another one does.
+    ///
+    /// - Returns: Whether it was retired: `false` if it doesn't route to the connection, or waits
+    ///   for another one to route.
+    @discardableResult
+    private func retireLocalConnectionID(_ connectionID: QUICConnectionID) -> Bool {
+        guard let index = self.localConnectionIDs.firstIndex(of: connectionID) else { return false }
+        guard self.localConnectionIDs.count > 1 else {
+            self.connectionIDPendingRetirement = connectionID
+            return false
+        }
+        guard let channelView = self.channelView else { return false }
+        guard channelView.retire(connectionID) else {
+            self.closeWithTransportError(.internalError, reason: "Failed to retire a connection ID")
+            return false
+        }
+        self.localConnectionIDs.remove(at: index)
+        channelView.connectionIDRetired(connectionID)
+        self.rememberRetiredConnectionID(connectionID)
+        // Keep as many connection IDs with the peer as before.
+        self.issueConnectionID(channelView.generateID())
+        return true
+    }
+
+    private func rememberRetiredConnectionID(_ connectionID: QUICConnectionID) {
+        self.retiredLocalConnectionIDs.append(connectionID)
+        if self.retiredLocalConnectionIDs.count > Self.rememberedRetiredConnectionIDs {
+            self.retiredLocalConnectionIDs.removeFirst()
+        }
+    }
+
+    /// Issues `connectionID` to the peer, for `QUICRequestAssociateSCIDEvent`.
+    ///
+    /// - Throws: If the core refused it, see `issueConnectionID(_:)`, or the connection IDs are
+    ///   zero-length.
+    func requestAssociationOfConnectionID(_ connectionID: QUICConnectionID) throws {
+        guard self.connectionIDLength > 0, self.issueConnectionID(connectionID) else {
+            throw QUICError.failedToAssociateConnectionID
+        }
+        self.coreUpdatedOutsideOfEvents()
+    }
+
+    /// Retires one of the peer's connection IDs with a RETIRE_CONNECTION_ID frame (RFC 9000
+    /// Section 19.16), for `QUICRequestRetireDCIDEvent`. Retiring the one in use switches to
+    /// another.
+    ///
+    /// - Throws: If the connection ID is unknown, or it is the only one.
+    func requestRetirementOfConnectionID(_ connectionID: QUICConnectionID) throws {
+        guard self.core.retirePeerConnectionID(QUICStateMachine.QUICConnectionID(connectionID)) else {
+            throw QUICError.failedToRetireConnectionID
+        }
+        self.coreUpdatedOutsideOfEvents()
+    }
+
+    /// Closes the connection with a transport error of its own (RFC 9000 Section 10.2), which
+    /// the core reports as `.closing`.
+    private func closeWithTransportError(_ code: QUICTransportErrorCode, reason: String) {
+        guard !self.core.isTerminating else { return }
+        self.logger.error("Closing connection", metadata: ["quic.close.reason": "\(reason)"])
+        self.core.close(errorCode: UInt64(code.rawValue), isApplication: false, reason: reason, now: Self.now)
+        self.coreUpdatedOutsideOfEvents()
+    }
+
+    /// Delivers what a call from outside the core's events changed. While `processEvents()` runs,
+    /// as when a handler of the channel's events calls in, it delivers the events, and its caller
+    /// sends the output.
+    private func coreUpdatedOutsideOfEvents() {
+        guard !self.processingEvents else { return }
+        self.afterCoreUpdate()
     }
 
     // MARK: Timer

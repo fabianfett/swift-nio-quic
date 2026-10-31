@@ -285,6 +285,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                 let connection = try StateMachineQUICConnection<Consumer>.client(
                     configuration: self.quicConfiguration,
                     sourceConnectionID: sourceConnectionID,
+                    statelessResetTokenGenerator: self.statelessResetTokenGenerator,
                     serverName: serverName,
                     asyncVerifier: asyncVerifierRunner?.asyncVerifier,
                     localAddress: localAddress,

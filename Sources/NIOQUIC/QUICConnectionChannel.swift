@@ -375,31 +375,28 @@ extension QUICConnectionChannel: ChannelCore where Consumer: ~Copyable {
             )
 
         case let event as QUICRequestAssociateSCIDEvent:
-            self._connection.withLiveOnly(promise: promise) { connection in
-                try connection.requestAssociationOfConnectionID(event.scid)
-            }
+            let result = Result { try self._connection.requestAssociationOfConnectionID(event.scid) }
+            promise?.completeWith(result)
 
         case let event as QUICRequestRetireDCIDEvent:
-            self._connection.withLiveOnly(promise: promise) { connection in
-                try connection.requestRetirementOfConnectionID(event.dcid)
-            }
+            let result = Result { try self._connection.requestRetirementOfConnectionID(event.dcid) }
+            promise?.completeWith(result)
 
         #if DEBUG
         case let event as _QUICForTestingPoisonRetiredSCIDEvent:
-            self._connection.withLiveOnly(promise: promise) { connection in
-                connection._forTesting_addRetiredSCID(event.scid)
-            }
+            let result = Result { try self._connection._forTesting_addRetiredConnectionID(event.scid) }
+            promise?.completeWith(result)
 
         case let event as _QUICForTestingGetActiveSCIDsEvent:
-            self._connection.withLiveOnly(promise: promise) { connection in
-                let scids = connection._forTesting_getActiveSCIDs()
+            let result = Result {
+                let scids = try self._connection._forTesting_localConnectionIDs()
                 event.result.withLockedValue { $0 = scids }
             }
+            promise?.completeWith(result)
 
         case let event as _QUICForTestingRemoveActiveSCIDEvent:
-            self._connection.withLiveOnly(promise: promise) { connection in
-                connection._forTesting_removeFromActiveSCIDs(event.scid)
-            }
+            let result = Result { try self._connection._forTesting_removeLocalConnectionID(event.scid) }
+            promise?.completeWith(result)
         #endif
 
         default:
