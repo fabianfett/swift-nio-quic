@@ -66,25 +66,6 @@ private enum ConnectionConstants {
     }
 }
 
-/// An address the connection sets on its event loop and its channels read from any thread.
-@available(anyAppleOS 26, *)
-final class SendableAddress: Sendable {
-    private let address: Mutex<SocketAddress>
-
-    init(_ address: SocketAddress) {
-        self.address = Mutex(address)
-    }
-
-    var value: SocketAddress {
-        get {
-            self.address.withLock { $0 }
-        }
-        set {
-            self.address.withLock { $0 = newValue }
-        }
-    }
-}
-
 /// A wrapper around the objects and state we need to keep track of and access a QUIC connection in SwiftNetwork.
 /// Holds the references required to access QUIC connections and streams
 @available(anyAppleOS 26, *)

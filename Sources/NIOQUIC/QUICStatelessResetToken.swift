@@ -12,16 +12,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-@_spi(ProtocolProvider) import SwiftNetwork
+@_spi(ProtocolProvider) import QUICStateMachine
 
 /// A QUIC stateless reset token (RFC 9000 § 10.3.2).
 ///
-/// A token has exactly 16 bytes. This wraps the respective SwiftNetwork type.
+/// A token has exactly 16 bytes. This wraps the respective QUICStateMachine type.
 @available(anyAppleOS 26, *)
 public struct QUICStatelessResetToken: Equatable, Sendable, CustomStringConvertible {
 
-    // Wrapped type from SwiftNetwork.
-    var token: SwiftNetwork.QUICStatelessResetToken
+    // Wrapped type from QUICStateMachine.
+    var token: QUICStateMachine.QUICStatelessResetToken
 
     /// Create a QUIC stateless reset token.
     public init(_ token: InlineArray<16, UInt8>) {
@@ -33,7 +33,7 @@ public struct QUICStatelessResetToken: Equatable, Sendable, CustomStringConverti
     ///
     /// - Precondition: The `span` must have exactly 16 bytes.
     public init?(_ span: Span<UInt8>) {
-        guard let token = SwiftNetwork.QUICStatelessResetToken(span) else {
+        guard let token = QUICStateMachine.QUICStatelessResetToken(span) else {
             return nil
         }
 
