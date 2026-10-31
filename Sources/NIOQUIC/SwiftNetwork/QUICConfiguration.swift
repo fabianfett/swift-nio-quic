@@ -78,6 +78,9 @@ public struct InitialPacketSize: Sendable, Hashable {
     enum Kind: Sendable, Hashable {
         case fixed(Int)
         case matchingClientInitial(maximum: Int)
+        /// ``matchingClientInitial(upTo:)`` on a server once the client's first Initial arrived:
+        /// `size` is what it matched, at most `maximum`.
+        case matchedClientInitial(size: Int, maximum: Int)
     }
 
     let kind: Kind
@@ -110,6 +113,20 @@ public struct InitialPacketSize: Sendable, Hashable {
                 return min(clientInitialSize, maximum)
             }
             return 1200
+        case .matchedClientInitial(let size, _):
+            return size
+        }
+    }
+
+    /// The size for a server connection whose client sent its first Initial in a datagram of
+    /// `clientInitialSize` bytes: ``size(forClientInitial:)`` is the matched size from then on,
+    /// and the maximum stays known.
+    func matching(clientInitial clientInitialSize: Int) -> Self {
+        switch self.kind {
+        case .fixed, .matchedClientInitial:
+            return self
+        case .matchingClientInitial(let maximum):
+            return Self(kind: .matchedClientInitial(size: min(clientInitialSize, maximum), maximum: maximum))
         }
     }
 }

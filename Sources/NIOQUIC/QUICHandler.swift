@@ -1094,8 +1094,8 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         connectionLogger.trace("QUICHandler accepting new connection")
         // Size this connection's packets for the client's Initial, if configured to match it.
         var configuration = self.quicConfiguration
-        configuration.initialPacketSize = .fixed(
-            configuration.initialPacketSize.size(forClientInitial: addressedEnvelope.data.readableBytes)
+        configuration.initialPacketSize = configuration.initialPacketSize.matching(
+            clientInitial: addressedEnvelope.data.readableBytes
         )
         let quicConnection: AcceptedConnection
         do {

@@ -27,4 +27,21 @@ struct InitialPacketSizeTests {
         let initialPacketSize = InitialPacketSize.matchingClientInitial(upTo: 1400)
         #expect(initialPacketSize.size(forClientInitial: clientInitialSize) == expected)
     }
+
+    /// A server's connection keeps the size it matched, and the maximum. Both drivers configure
+    /// the connection with `size(forClientInitial: nil)`.
+    @Test(arguments: [(1200, 1200), (1350, 1350), (9000, 1400)])
+    func aMatchedSizeKeepsTheMaximum(clientInitialSize: Int, expected: Int) {
+        let matched = InitialPacketSize.matchingClientInitial(upTo: 1400).matching(clientInitial: clientInitialSize)
+        #expect(matched.kind == .matchedClientInitial(size: expected, maximum: 1400))
+        for later in [Int?.none, 1200, 9000] {
+            #expect(matched.size(forClientInitial: later) == expected)
+        }
+        #expect(matched.matching(clientInitial: 1250) == matched)
+    }
+
+    @Test
+    func aFixedSizeMatchesNothing() {
+        #expect(InitialPacketSize.fixed(1350).matching(clientInitial: 1500) == .fixed(1350))
+    }
 }
