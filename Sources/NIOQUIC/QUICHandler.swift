@@ -1587,21 +1587,22 @@ enum QUICConnectionDriver: Hashable, Sendable {
         "initialMaxStreamDataUni", "initialMaxStreamsBidi", "initialMaxStreamsUni", "maxIdleTimeout",
         "keepAliveInterval", "maxDatagramFrameSize", "initialPacketSize", "forceVersionNegotiation",
         "pacePackets",
+        // Neither driver writes a key log.
+        "keyLogPath",
     ]
 
     /// The ``QUICConfiguration`` properties the state machine driver implements only at their
-    /// defaults: it sends no Retry, and writes no key log or qlog. ``stateMachineSupports(_:)``
-    /// checks each.
+    /// defaults: it sends no Retry, and writes no qlog. ``stateMachineSupports(_:)`` checks each.
     ///
     /// Together with ``stateMachineProperties`` these are all of the configuration's properties;
     /// a test checks that a new one is added to either.
-    static let stateMachineDefaultOnlyProperties: Set<String> = ["keyLogPath", "qLogConfiguration", "sendRetry"]
+    static let stateMachineDefaultOnlyProperties: Set<String> = ["qLogConfiguration", "sendRetry"]
 
     /// Whether the state machine driver implements everything `configuration` asks for: the
     /// ``stateMachineProperties`` at any value, and the ``stateMachineDefaultOnlyProperties`` at
     /// their defaults.
     static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
-        configuration.keyLogPath == nil && configuration.qLogConfiguration == nil && !configuration.sendRetry
+        configuration.qLogConfiguration == nil && !configuration.sendRetry
     }
 
     private static let setting: String? = {

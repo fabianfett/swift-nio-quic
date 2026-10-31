@@ -35,14 +35,12 @@ struct QUICConnectionDriverTests {
     @Test
     @available(anyAppleOS 26, *)
     func featuresTheStateMachineLacksFallBackToSwiftNetwork() {
-        var keyLog = Self.configuration
-        keyLog.keyLogPath = "/tmp/keys"
         var qlog = Self.configuration
         qlog.qLogConfiguration = QLogConfiguration(path: "/tmp")
         var retry = Self.configuration
         retry.sendRetry = true
 
-        for configuration in [keyLog, qlog, retry] {
+        for configuration in [qlog, retry] {
             #expect(!QUICConnectionDriver.stateMachineSupports(configuration))
         }
     }
@@ -58,8 +56,11 @@ struct QUICConnectionDriverTests {
         packetSize.initialPacketSize = .fixed(1350)
         var noDatagrams = Self.configuration
         noDatagrams.maxDatagramFrameSize = 0
+        // Neither driver writes a key log, so the state machine driver ignores the path as well.
+        var keyLog = Self.configuration
+        keyLog.keyLogPath = "/tmp/keys"
 
-        for configuration in [keepalive, versionNegotiation, packetSize, noDatagrams] {
+        for configuration in [keepalive, versionNegotiation, packetSize, noDatagrams, keyLog] {
             #expect(QUICConnectionDriver.stateMachineSupports(configuration))
         }
     }

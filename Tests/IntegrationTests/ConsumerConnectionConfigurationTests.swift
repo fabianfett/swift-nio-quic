@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
 import Testing
@@ -190,6 +191,30 @@ struct ConsumerConnectionConfigurationTests {
                 }
             )
         }
+    }
+
+    /// Connections with a key log path connect, on the driver they were meant for, and write no
+    /// key log: SwiftTLS doesn't export the secrets yet.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: Drivers.all)
+    func testConnectionsWithAKeyLogPathConnect(drivers: Drivers) async throws {
+        let recording = StreamRecording()
+        let keyLogPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nio-quic-keylog-\(UUID().uuidString)").path
+
+        try await withConsumerPair(
+            drivers: drivers,
+            configureClient: { $0.keyLogPath = keyLogPath },
+            configureServer: { $0.keyLogPath = keyLogPath },
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer(),
+            { pair in
+                let handle = try await pair.openClientStream(writing: ByteBuffer(string: "GET /"), fin: true)
+                let visits = await recording.visits { $0.handle == handle && $0.events.contains(.closed) }
+                #expect(visits.last?.bytesReadSoFar == ByteBuffer(string: "GET /"))
+            }
+        )
+        #expect(!FileManager.default.fileExists(atPath: keyLogPath))
     }
 
     /// A client forcing Version Negotiation (RFC 9000 Section 6) still connects.

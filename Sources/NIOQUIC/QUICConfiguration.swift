@@ -216,6 +216,9 @@ public struct QUICConfiguration: Sendable {
     public var pacePackets: Bool = false
 
     /// The path to the file where the key log should be written to. Defaults to `nil`, no key log.
+    ///
+    /// NOTE: Neither driver writes a key log yet, as SwiftTLS has no hook to export the secrets.
+    /// Connections accept the path and ignore it.
     public var keyLogPath: String?
     /// Configuration for qlog. Defaults to `nil`, no qlog.
     public var qLogConfiguration: QLogConfiguration?
