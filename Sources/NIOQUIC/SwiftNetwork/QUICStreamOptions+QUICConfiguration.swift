@@ -12,7 +12,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-import Crypto
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
 
@@ -56,6 +55,7 @@ extension QUICProtocol {
     }
 }
 
+/// SwiftNetwork's TLS protocol options wrap the TLS options both drivers build.
 @available(anyAppleOS 26, *)
 extension TLSProtocol.Options {
     static func serverOptions(
@@ -65,29 +65,12 @@ extension TLSProtocol.Options {
         serverName: String
     ) throws -> Self {
         var options = SwiftTLSProtocol.Options()
-        options.applicationProtocols = config.applicationProtocols
-        options.serverName = serverName
-        options.tlsOptions.keyExchangeGroup = config.keyExchangeGroup.swiftTLSKeyExchangeGroup
-
-        switch authConfig {
-        case .x509Certificates:
-            guard let authenticator else {
-                throw QUICError.tlsConfigurationIncomplete
-            }
-            options.tlsOptions.asyncAuthenticator = .init(
-                supportedCertificateTypes: [.x509],
-                getCertificateChain: authenticator.produceCertificates(info:),
-                signTranscriptHash: authenticator.provideSignature(info:)
-            )
-
-        case .rawPublicKeys(let publicKeyFilePath, let privateKeyFilePath):
-            let publicKey = try P256.Signing.PublicKey.fromDERFile(publicKeyFilePath)
-            options.trustedRawPublicKeyCertificates = [Array(publicKey.derRepresentation)]
-
-            let privateKey = try P256.Signing.PrivateKey.fromDERFile(privateKeyFilePath)
-            options.rawPrivateKey = Array(privateKey.rawRepresentation)
-        }
-
+        options.tlsOptions = try SwiftTLSOptions.serverOptions(
+            from: config,
+            authConfig: authConfig,
+            authenticator: authenticator,
+            serverName: serverName
+        )
         return options
     }
 
@@ -97,29 +80,11 @@ extension TLSProtocol.Options {
         serverName: String
     ) throws -> Self {
         var options = SwiftTLSProtocol.Options()
-        options.applicationProtocols = config.applicationProtocols
-        options.serverName = serverName
-        options.tlsOptions.keyExchangeGroup = config.keyExchangeGroup.swiftTLSKeyExchangeGroup
-
-        if let verificationConfiguration = config.verificationConfiguration {
-            switch verificationConfiguration {
-            case .rawPublicKeys(let publicKeyFilePath):
-                let publicKey = try P256.Signing.PublicKey.fromDERFile(publicKeyFilePath)
-                options.trustedRawPublicKeyCertificates = [Array(publicKey.derRepresentation)]
-
-            case .x509Certificates:
-                if let asyncVerifier {
-                    options.tlsOptions.asyncVerifier = .init(
-                        availableCertificateTypes: [.x509],
-                        verificationCallback: asyncVerifier.makeCallback(hostname: serverName)
-                    )
-                } else {
-                    throw QUICError.tlsConfigurationIncomplete
-                }
-            }
-        }
-
+        options.tlsOptions = try SwiftTLSOptions.clientOptions(
+            from: config,
+            asyncVerifier: asyncVerifier,
+            serverName: serverName
+        )
         return options
     }
-
 }

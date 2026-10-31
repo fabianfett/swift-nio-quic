@@ -190,12 +190,70 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.logger = logger
     }
 
-    static func makeCoreConfiguration(
+    /// The core configuration of a client connection to the server called `serverName`, which it
+    /// verifies with `asyncVerifier` or the configuration's raw public key.
+    static func clientCoreConfiguration(
         _ configuration: QUICConfiguration,
-        tlsOptions: SwiftTLSProtocol.Options,
+        serverName: String?,
+        asyncVerifier: AsyncVerifier?,
+        remoteAddress: SocketAddress
+    ) throws -> QUICConnectionCore.Configuration {
+        guard let serverName else {
+            throw QUICError.tlsConfigurationIncomplete
+        }
+        let tls = try SwiftTLSOptions.clientOptions(
+            from: configuration,
+            asyncVerifier: asyncVerifier,
+            serverName: serverName
+        )
+        var coreConfiguration = Self.makeCoreConfiguration(configuration, tls: tls, remoteAddress: remoteAddress)
+        if configuration.forceVersionNegotiation {
+            // The server answers with Version Negotiation, and the client starts over in QUIC
+            // version 1 (RFC 9000 Section 6).
+            coreConfiguration.clientInitialVersion = Self.versionNegotiationGreaseVersion
+        }
+        return coreConfiguration
+    }
+
+    /// The core configuration of a server connection whose handshake connection ID is
+    /// `sourceConnectionID`, which authenticates with the certificates of `authenticator` or the
+    /// configuration's raw public key.
+    static func serverCoreConfiguration(
+        _ configuration: QUICConfiguration,
+        sourceConnectionID: QUICConnectionID,
+        statelessResetTokenGenerator: any QUICStatelessResetToken.Generator,
+        authenticator: Authenticator?,
+        remoteAddress: SocketAddress
+    ) throws -> QUICConnectionCore.Configuration {
+        guard let serverName = configuration.serverName,
+            let authConfig = configuration.authenticationConfiguration
+        else {
+            throw QUICError.tlsConfigurationIncomplete
+        }
+        let tls = try SwiftTLSOptions.serverOptions(
+            from: configuration,
+            authConfig: authConfig,
+            authenticator: authenticator,
+            serverName: serverName
+        )
+        var coreConfiguration = Self.makeCoreConfiguration(configuration, tls: tls, remoteAddress: remoteAddress)
+        // The token for the handshake connection ID, which lets a client recognize the stateless
+        // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
+        // Only a server sends one. Zero-length connection IDs have no token to derive.
+        if sourceConnectionID.length > 0 {
+            coreConfiguration.statelessResetToken = statelessResetTokenGenerator.token(for: sourceConnectionID).token
+        }
+        return coreConfiguration
+    }
+
+    private static func makeCoreConfiguration(
+        _ configuration: QUICConfiguration,
+        tls: SwiftTLSOptions,
         remoteAddress: SocketAddress
     ) -> QUICConnectionCore.Configuration {
-        var coreConfiguration = QUICConnectionCore.Configuration(tlsOptions: tlsOptions)
+        // Stream consumer connections don't enable 0-RTT, so there are no transport parameters
+        // to resume with.
+        var coreConfiguration = QUICConnectionCore.Configuration(tls: tls, resumedTransportParameters: nil)
         coreConfiguration.initialMaxData = UInt64(configuration.initialMaxData)
         coreConfiguration.initialMaxStreamDataBidirectionalLocal = UInt64(configuration.initialMaxStreamDataBidiLocal)
         coreConfiguration.initialMaxStreamDataBidirectionalRemote = UInt64(configuration.initialMaxStreamDataBidiRemote)
@@ -264,24 +322,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         timerQueue: StateMachineTimerQueue,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
-        guard let serverName else {
-            throw QUICError.tlsConfigurationIncomplete
-        }
-        let tlsOptions = try TLSProtocol.Options.clientOptions(
-            from: configuration,
-            asyncVerifier: asyncVerifier,
-            serverName: serverName
-        )
-        var coreConfiguration = Self.makeCoreConfiguration(
+        let coreConfiguration = try Self.clientCoreConfiguration(
             configuration,
-            tlsOptions: tlsOptions,
+            serverName: serverName,
+            asyncVerifier: asyncVerifier,
             remoteAddress: remoteAddress
         )
-        if configuration.forceVersionNegotiation {
-            // The server answers with Version Negotiation, and the client starts over in QUIC
-            // version 1 (RFC 9000 Section 6).
-            coreConfiguration.clientInitialVersion = Self.versionNegotiationGreaseVersion
-        }
         let core = QUICConnectionCore(
             clientWith: coreConfiguration,
             localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
@@ -316,28 +362,13 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         timerQueue: StateMachineTimerQueue,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
-        guard let serverName = configuration.serverName,
-            let authConfig = configuration.authenticationConfiguration
-        else {
-            throw QUICError.tlsConfigurationIncomplete
-        }
-        let tlsOptions = try TLSProtocol.Options.serverOptions(
-            from: configuration,
-            authConfig: authConfig,
-            authenticator: authenticator,
-            serverName: serverName
-        )
-        var coreConfiguration = Self.makeCoreConfiguration(
+        let coreConfiguration = try Self.serverCoreConfiguration(
             configuration,
-            tlsOptions: tlsOptions,
+            sourceConnectionID: sourceConnectionID,
+            statelessResetTokenGenerator: statelessResetTokenGenerator,
+            authenticator: authenticator,
             remoteAddress: remoteAddress
         )
-        // The token for the handshake connection ID, which lets a client recognize the stateless
-        // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
-        // Only a server sends one. Zero-length connection IDs have no token to derive.
-        if sourceConnectionID.length > 0 {
-            coreConfiguration.statelessResetToken = statelessResetTokenGenerator.token(for: sourceConnectionID).token
-        }
         let core = QUICConnectionCore(
             serverWith: coreConfiguration,
             localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
