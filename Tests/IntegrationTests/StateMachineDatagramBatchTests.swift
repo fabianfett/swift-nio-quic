@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #if DEBUG
+import Foundation
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOPosix
@@ -23,9 +24,7 @@ import Testing
 
 /// The bytes of the responses: a pattern that doesn't repeat with the datagram size, so a datagram
 /// sent twice or out of place shows.
-private func responseByte(at offset: Int) -> UInt8 {
-    UInt8(truncatingIfNeeded: offset % 251)
-}
+private let responsePattern: [UInt8] = (0..<(2 * 1024 * 1024)).map { UInt8(truncatingIfNeeded: $0 % 251) }
 
 /// Answers each request with `responseSize` bytes of the response pattern.
 @available(anyAppleOS 26, *)
@@ -35,7 +34,7 @@ struct PatternResponder: QUICStreamConsumer {
     private let response: ByteBuffer
 
     init(responseSize: Int) {
-        self.response = ByteBuffer(bytes: (0..<responseSize).map(responseByte(at:)))
+        self.response = ByteBuffer(bytes: responsePattern.prefix(responseSize))
     }
 
     func makeStreamState(_ stream: inout QUICStream<Self>) {}
@@ -83,6 +82,24 @@ struct PatternChecker: QUICStreamConsumer {
         Response()
     }
 
+    /// Where `bytes`, at `offset` in a response, first differ from the pattern.
+    private static func firstMismatch(in bytes: ByteBuffer, at offset: Int) -> Int? {
+        guard bytes.readableBytes > 0 else { return nil }
+        let expected = responsePattern.dropFirst(offset).prefix(bytes.readableBytes)
+        // The fast path, as debug builds compare byte by byte slowly.
+        let equal = bytes.withUnsafeReadableBytes { received in
+            expected.withUnsafeBytes { expected in
+                received.count == expected.count
+                    && memcmp(received.baseAddress!, expected.baseAddress!, received.count) == 0
+            }
+        }
+        guard !equal else { return nil }
+        let index =
+            zip(bytes.readableBytesView, expected).enumerated().first { $0.element.0 != $0.element.1 }?.offset
+            ?? expected.count
+        return offset + index
+    }
+
     mutating func processStreams(_ streams: inout QUICStreamIterator<Self>) {
         let responses = self.responses
         while var visit = streams.next() {
@@ -91,9 +108,8 @@ struct PatternChecker: QUICStreamConsumer {
                 reading: while var response = state {
                     var buffer = ByteBuffer()
                     let result = stream.read(into: &buffer)
-                    for (index, byte) in buffer.readableBytesView.enumerated()
-                    where response.firstMismatch == nil && byte != responseByte(at: response.length + index) {
-                        response.firstMismatch = response.length + index
+                    if response.firstMismatch == nil {
+                        response.firstMismatch = Self.firstMismatch(in: buffer, at: response.length)
                     }
                     response.length += buffer.readableBytes
                     state = response
@@ -125,6 +141,9 @@ struct DatagramRecording: Sendable {
     var malformedEnvelopes = 0
     /// Writes that failed.
     var failedWrites: [String] = []
+    /// The most bytes and datagrams in an envelope.
+    var largestEnvelope = 0
+    var largestRun = 0
 }
 
 /// Records the datagrams a channel writes. With `splitting`, it passes each segment of an envelope
@@ -152,6 +171,8 @@ final class DatagramRecorder: ChannelOutboundHandler {
         }
         self.recording.withLockedValue { recording in
             recording.envelopes += 1
+            recording.largestEnvelope = max(recording.largestEnvelope, envelope.data.readableBytes)
+            recording.largestRun = max(recording.largestRun, segments.count)
             if envelope.metadata?.segmentSize != nil {
                 recording.segmentedEnvelopes += 1
                 if segments.dropLast().contains(where: { $0.readableBytes != segmentSize }) || segments.count < 2 {
@@ -177,6 +198,16 @@ final class DatagramRecorder: ChannelOutboundHandler {
     }
 }
 
+/// Gives the channel's socket a receive buffer large enough for the bursts of the tests: Linux
+/// drops datagrams beyond its default of 208 KB, and losses keep the congestion window small.
+final class LargeReceiveBuffer: ChannelInboundHandler {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+
+    func handlerAdded(context: ChannelHandlerContext) {
+        _ = try? context.channel.syncOptions?.setOption(.socketOption(.so_rcvbuf), value: 4 * 1024 * 1024)
+    }
+}
+
 /// A state machine connection writes the datagrams of a drain into one buffer, and sends them as
 /// slices of it.
 @Suite(.timeLimit(.minutes(1)))
@@ -187,6 +218,7 @@ struct StateMachineDatagramBatchTests {
     private func transfer(
         responseSize: Int,
         paced: Bool,
+        delayed: Bool? = nil,
         splitting: Bool = false,
         maximumSegments: Int? = nil,
         host: String = "127.0.0.1",
@@ -199,8 +231,10 @@ struct StateMachineDatagramBatchTests {
         var iterator = responses.makeAsyncIterator()
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<PatternResponder>?>(nil)
         // An RTT of 50 ms, for the pacer to spread the window over.
+        let delayed = delayed ?? paced
         let configureClientPipeline: @Sendable (ChannelPipeline.SynchronousOperations) throws -> Void = { pipeline in
-            if paced {
+            try pipeline.addHandler(LargeReceiveBuffer())
+            if delayed {
                 try pipeline.addHandler(InboundDelay(.milliseconds(50)))
             }
         }
@@ -333,16 +367,144 @@ struct StateMachineDatagramBatchTests {
         }
     }
 
+    /// Whether the platform sends runs of datagrams with UDP GSO: NIO supports it on Linux.
+    private static var segments: Bool {
+        #if os(Linux) || os(Android)
+        true
+        #else
+        false
+        #endif
+    }
+
     @available(anyAppleOS 26, *)
     @Test(arguments: [false, true])
     func aLargeResponseArrivesIntact(paced: Bool) async throws {
         let (sent, counts) = try await self.transfer(responseSize: 1024 * 1024, paced: paced)
         // Hundreds of full datagrams.
         #expect(sent.datagrams.count > 800, "\(sent.datagrams.count) datagrams")
-        // Without UDP GSO, every datagram is its own envelope.
-        #expect(sent.segmentedEnvelopes == 0)
-        #expect(counts.segmentedEnvelopes == 0)
-        #expect(counts.datagrams == counts.envelopes)
+        if Self.segments {
+            // The kernel got runs of datagrams, which arrived as datagrams.
+            #expect(sent.segmentedEnvelopes > 0)
+            #expect(counts.segmentedEnvelopes == sent.segmentedEnvelopes)
+            #expect(counts.datagrams > counts.envelopes)
+        } else {
+            // NIO only segments on Linux: every datagram is its own envelope.
+            #expect(sent.segmentedEnvelopes == 0)
+            #expect(counts.segmentedEnvelopes == 0)
+            #expect(counts.datagrams == counts.envelopes)
+        }
+    }
+
+    /// Runs of datagrams, split as the kernel splits them, arrive intact on every platform; paced,
+    /// the datagram the pacer holds back is a slice of a buffer with runs.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: [false, true])
+    func runsOfDatagramsArriveIntact(paced: Bool) async throws {
+        let (sent, counts) = try await self.transfer(
+            responseSize: 1024 * 1024,
+            paced: paced,
+            splitting: true,
+            maximumSegments: 64
+        )
+        #expect(sent.segmentedEnvelopes > 0)
+        #expect(counts.segmentedEnvelopes > 0)
+        #expect(counts.datagrams > counts.envelopes)
+        // 54 datagrams of 1200 bytes are the most one UDP send carries.
+        #expect(sent.largestRun <= 54)
+        #expect(sent.largestEnvelope <= 65507)
+    }
+
+    /// The longest runs fit in one UDP send: 44 datagrams of 1489 bytes would be 65516 bytes, more
+    /// than IPv4 carries, so a run has at most 43 and maybe one shorter. The kernel takes them,
+    /// over IPv4 and IPv6.
+    ///
+    /// With an RTT, the second response starts with a drain of the window the first one opened,
+    /// which has room for runs that long.
+    @available(anyAppleOS 26, *)
+    @Test(arguments: ["127.0.0.1", "::1"])
+    func theLongestRunsFitOneSend(host: String) async throws {
+        let (sent, _) = try await self.transfer(
+            responseSize: 1024 * 1024,
+            paced: false,
+            delayed: true,
+            splitting: !Self.segments,
+            maximumSegments: 64,
+            host: host,
+            configureServer: { $0.initialPacketSize = .fixed(1489) }
+        )
+        #expect(sent.largestEnvelope <= 65507)
+        // Runs got about as long as they can.
+        #expect(sent.largestEnvelope > 43 * 1489, "\(sent.largestEnvelope) bytes")
+        #expect(43...44 ~= sent.largestRun, "\(sent.largestRun) datagrams")
     }
 }
+
+#if os(Linux) || os(Android)
+/// Collects the sizes of the datagrams a channel reads.
+final class DatagramSizeCollector: ChannelInboundHandler {
+    typealias InboundIn = AddressedEnvelope<ByteBuffer>
+
+    let sizes: NIOLockedValueBox<[Int]>
+
+    init(sizes: NIOLockedValueBox<[Int]>) {
+        self.sizes = sizes
+    }
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        let size = Self.unwrapInboundIn(data).data.readableBytes
+        self.sizes.withLockedValue { $0.append(size) }
+    }
+}
+
+/// The kernel segments a UDP send of up to `DatagramRuns.maximumUDPPayload` bytes, with and
+/// without the don't fragment bit, over IPv4 and IPv6; a byte more is too much for IPv4.
+@Suite(.timeLimit(.minutes(1)))
+struct UDPSegmentationOffloadTests {
+    @available(anyAppleOS 26, *)
+    @Test(arguments: ["127.0.0.1", "::1"], [false, true])
+    func theKernelTakesTheLongestRun(host: String, dontFragment: Bool) async throws {
+        let sizes = NIOLockedValueBox<[Int]>([])
+        let receiver = try await DatagramBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .channelInitializer { channel in
+                channel.eventLoop.makeCompletedFuture {
+                    try channel.pipeline.syncOperations.addHandler(DatagramSizeCollector(sizes: sizes))
+                }
+            }
+            .bind(host: host, port: 0)
+            .get()
+        let sender = try await DatagramBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .bind(host: host, port: 0)
+            .get()
+        if dontFragment {
+            try await sender.eventLoop.submit { try QUICDontFragment.set(on: sender) }.get()
+        }
+
+        let segmentSize = 1489
+        let send = { (length: Int) in
+            let envelope = AddressedEnvelope(
+                remoteAddress: receiver.localAddress!,
+                data: ByteBuffer(repeating: 0x2a, count: length),
+                metadata: .init(ecnState: .transportNotCapable, packetInfo: nil, segmentSize: segmentSize)
+            )
+            return sender.writeAndFlush(envelope)
+        }
+        let length = DatagramRuns.maximumUDPPayload
+        #expect(length == 65507)
+        try await send(length).get()
+        let expected = Array(repeating: segmentSize, count: length / segmentSize) + [length % segmentSize]
+        let deadline = ContinuousClock.now + .seconds(10)
+        while sizes.withLockedValue({ $0.count }) < expected.count, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(sizes.withLockedValue { $0 } == expected)
+
+        // IPv4 carries no more; IPv6 carries 20 bytes more.
+        let tooLong = host.contains(":") ? 65528 : length + 1
+        await #expect(throws: (any Error).self) { try await send(tooLong).get() }
+
+        try await sender.close()
+        try await receiver.close()
+    }
+}
+#endif
 #endif

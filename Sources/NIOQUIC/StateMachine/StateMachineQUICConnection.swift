@@ -171,8 +171,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.paths = [(remoteAddress, .initial)]
         self.eventLoop = eventLoop
         self.allocator = ByteBufferAllocator()
-        // UDP GSO isn't used yet: every datagram is its own send.
-        self.batch = DatagramBatch(allocator: self.allocator, maximumSegments: 1)
+        // Runs of datagrams go to the kernel in one send where it segments them (UDP GSO).
+        self.batch = DatagramBatch(allocator: self.allocator)
         self.logger = logger
     }
 
