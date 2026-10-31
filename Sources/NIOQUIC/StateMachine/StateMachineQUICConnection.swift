@@ -22,8 +22,9 @@ import NIOQUICHelpers
 /// A QUIC connection driven directly from NIO through SwiftNetwork's `QUICConnectionCore`, without
 /// the SwiftNetwork framework.
 ///
-/// Inbound datagrams are decrypted in place in their `ByteBuffer`s, outbound datagrams are written
-/// straight into fresh `ByteBuffer`s, and one scheduled task serves the connection's timer.
+/// Inbound datagrams are decrypted in place in their `ByteBuffer`s, the outbound datagrams of a
+/// drain are written back to back into one `ByteBuffer` (see ``DatagramBatch``), and one scheduled
+/// task serves the connection's timer.
 @available(anyAppleOS 26, *)
 final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable> {
     private var core: QUICConnectionCore
@@ -62,6 +63,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// 7.7). The core paces each datagram as it builds it, so the driver holds this one, and
     /// builds no more, until the timer sends it.
     private var pacedDatagram: (datagram: AddressedEnvelope<ByteBuffer>, departure: NetworkClock.Instant)?
+
+    /// Where the drains write the datagrams for the active path.
+    private var batch: DatagramBatch
 
     /// Locally opened streams waiting for the peer to allow more streams.
     private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
@@ -113,6 +117,41 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     var _forTesting_maximumDatagramSize: Int {
         self.maximumDatagramSize
     }
+
+    /// The envelopes the drains sent on the active path, the datagrams in them, and the envelopes
+    /// with more than one datagram. Datagrams held for pacing aren't counted.
+    var _forTesting_envelopesSent: Int {
+        self.batch.envelopesSent
+    }
+
+    var _forTesting_datagramsSent: Int {
+        self.batch.datagramsSent
+    }
+
+    var _forTesting_segmentedEnvelopesSent: Int {
+        self.batch.segmentedEnvelopesSent
+    }
+
+    /// The datagrams held back for a later departure.
+    private(set) var _forTesting_datagramsHeld = 0
+
+    /// The datagram held back for a later departure, if any.
+    var _forTesting_heldDatagram: ByteBuffer? {
+        self.pacedDatagram?.datagram.data
+    }
+
+    /// The most datagrams the drains send in one envelope; more than one only works where NIO
+    /// supports UDP GSO.
+    var _forTesting_maximumSegments: Int {
+        get { self.batch.maximumSegments }
+        set { self.batch.maximumSegments = newValue }
+    }
+
+    /// Runs with every datagram the drains write for the active path, in order.
+    var _forTesting_onDatagramWritten: ((ByteBuffer) -> Void)? {
+        get { self.batch.onDatagramWritten }
+        set { self.batch.onDatagramWritten = newValue }
+    }
     #endif
 
     private init(
@@ -132,6 +171,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.paths = [(remoteAddress, .initial)]
         self.eventLoop = eventLoop
         self.allocator = ByteBufferAllocator()
+        // UDP GSO isn't used yet: every datagram is its own send.
+        self.batch = DatagramBatch(allocator: self.allocator, maximumSegments: 1)
         self.logger = logger
     }
 
@@ -611,21 +652,33 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         }
         let remoteAddress = self.remoteAddress.value
         while true {
-            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
-            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
-                pointer in
-                var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-                return self.core.send(into: &span, now: now) ?? 0
+            // The core may write a PMTUD probe larger than the path MTU (RFC 9000 Section 14.4).
+            let written = self.batch.writeDatagram(
+                capacity: self.core.datagramCapacity,
+                sendingFullBufferTo: transport,
+                remoteAddress: remoteAddress
+            ) { span in
+                self.core.send(into: &span, now: now) ?? 0
             }
             guard written > 0 else { break }
             if let departure = self.core.departureTime, departure >= dueBy {
                 // The pacer holds this datagram back: keep it for the timer and stop here, as
-                // every later datagram leaves later still.
-                self.pacedDatagram = (AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), departure)
-                break
+                // every later datagram leaves later still. '!' is fine: the batch has the
+                // datagram just written.
+                let datagram = self.batch.finishDrain(
+                    sendingTo: transport,
+                    remoteAddress: remoteAddress,
+                    holdingLast: true
+                )!
+                self.pacedDatagram = (AddressedEnvelope(remoteAddress: remoteAddress, data: datagram), departure)
+                #if DEBUG
+                self._forTesting_datagramsHeld += 1
+                #endif
+                self.rescheduleTimer()
+                return
             }
-            transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), promise: nil)
         }
+        _ = self.batch.finishDrain(sendingTo: transport, remoteAddress: remoteAddress)
         self.rescheduleTimer()
     }
 
