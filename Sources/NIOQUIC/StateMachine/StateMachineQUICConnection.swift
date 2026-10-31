@@ -88,8 +88,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// connection. Holds the handler, which holds the connection, until then.
     private var onClosedWithoutChannel: (() -> Void)?
 
-    /// The largest UDP payload sent.
-    private let maximumDatagramSize: Int
+    /// The UDP payload size the connection starts with, and the largest it sends on paths other
+    /// than the active one. PMTUD may raise it on the active path, see `makeCoreConfiguration`.
+    private let baseDatagramSize: Int
 
     /// The version a client sends its first Initial in to force Version Negotiation: a reserved
     /// version no server supports (RFC 9000 Section 15).
@@ -113,9 +114,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.paths.count
     }
 
-    /// The largest UDP payload the connection sends.
-    var _forTesting_maximumDatagramSize: Int {
-        self.maximumDatagramSize
+    /// The largest UDP payload the connection sends on the active path now, but for PMTUD probes.
+    var _forTesting_datagramSize: Int {
+        self.core.maxDatagramSize
     }
 
     /// The envelopes the drains sent on the active path, the datagrams in them, and the envelopes
@@ -156,7 +157,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     private init(
         core: consuming QUICConnectionCore,
-        maximumDatagramSize: Int,
+        baseDatagramSize: Int,
         role: Role,
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
@@ -164,7 +165,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         logger: Logger
     ) {
         self.core = core
-        self.maximumDatagramSize = maximumDatagramSize
+        self.baseDatagramSize = baseDatagramSize
         self.role = role
         self.localAddress = localAddress
         self.remoteAddress = SendableAddress(remoteAddress)
@@ -178,7 +179,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     static func makeCoreConfiguration(
         _ configuration: QUICConfiguration,
-        tlsOptions: SwiftTLSProtocol.Options
+        tlsOptions: SwiftTLSProtocol.Options,
+        remoteAddress: SocketAddress
     ) -> QUICConnectionCore.Configuration {
         var coreConfiguration = QUICConnectionCore.Configuration(tlsOptions: tlsOptions)
         coreConfiguration.initialMaxData = UInt64(configuration.initialMaxData)
@@ -196,6 +198,19 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         let packetSize = max(configuration.initialPacketSize.size(forClientInitial: nil), 1200)
         coreConfiguration.initialDatagramSize = packetSize
         coreConfiguration.maxDatagramSize = packetSize
+        if let maximum = configuration.initialPacketSize.probingMaximum {
+            // Search for larger packets, up to the maximum, once the handshake is confirmed (RFC
+            // 9000 Section 14.3, RFC 8899). The core caps the search at the interface MTU, which
+            // includes the IP and UDP headers, so no payload exceeds the maximum; paths the
+            // server adds later get the same cap. The search starts at an MTU of 1280 bytes, so
+            // a smaller maximum has nothing to probe for: the first probe would exceed it.
+            let headerSize = Self.ipUDPHeaderSize(to: remoteAddress)
+            if maximum > packetSize, maximum &+ headerSize >= Self.minimumPMTUDMTU {
+                coreConfiguration.pmtudEnabled = true
+                coreConfiguration.ipUDPHeaderSize = headerSize
+                coreConfiguration.interfaceMTU = maximum &+ headerSize
+            }
+        }
         // A `max_datagram_frame_size` of zero is the same as none: no DATAGRAM frames (RFC 9221
         // Section 3). The SwiftNetwork driver sends at most 65535.
         let maxDatagramFrameSize = UInt16(clamping: configuration.maxDatagramFrameSize)
@@ -209,6 +224,20 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
         coreConfiguration.disableActiveMigration = true
         return coreConfiguration
+    }
+
+    /// The smallest MTU the core's PMTUD searches (`CorePMTUD.minimumMTU`): a smaller interface
+    /// MTU counts as this.
+    private static var minimumPMTUDMTU: Int { 1280 }
+
+    /// The size of the IP and UDP headers of a datagram to `address`: 28 bytes over IPv4, 48 over
+    /// IPv6. An IPv4-mapped IPv6 address goes over IPv4.
+    private static func ipUDPHeaderSize(to address: SocketAddress) -> Int {
+        // SwiftNetwork's endpoint for an IPv4-mapped address is the IPv4 address.
+        if case .v6 = address.addressEndpointType {
+            return 48
+        }
+        return 28
     }
 
     static func client(
@@ -229,7 +258,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             asyncVerifier: asyncVerifier,
             serverName: serverName
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
+        var coreConfiguration = Self.makeCoreConfiguration(
+            configuration,
+            tlsOptions: tlsOptions,
+            remoteAddress: remoteAddress
+        )
         if configuration.forceVersionNegotiation {
             // The server answers with Version Negotiation, and the client starts over in QUIC
             // version 1 (RFC 9000 Section 6).
@@ -243,7 +276,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         let connection = StateMachineQUICConnection(
             core: core,
-            maximumDatagramSize: coreConfiguration.maxDatagramSize,
+            baseDatagramSize: coreConfiguration.maxDatagramSize,
             role: .client,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
@@ -278,7 +311,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             authenticator: authenticator,
             serverName: serverName
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
+        var coreConfiguration = Self.makeCoreConfiguration(
+            configuration,
+            tlsOptions: tlsOptions,
+            remoteAddress: remoteAddress
+        )
         // The token for the handshake connection ID, which lets a client recognize the stateless
         // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
         // Only a server sends one. Zero-length connection IDs have no token to derive.
@@ -295,7 +332,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         let connection = StateMachineQUICConnection(
             core: core,
-            maximumDatagramSize: coreConfiguration.maxDatagramSize,
+            baseDatagramSize: coreConfiguration.maxDatagramSize,
             role: .server,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
@@ -632,8 +669,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // PATH_CHALLENGE and PATH_RESPONSE for other paths go out first, unpaced (RFC 9000
         // Section 8.2).
         while let path = self.core.pathWithProbeToSend, let address = self.address(of: path) {
-            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
-            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
+            var buffer = self.allocator.buffer(capacity: self.baseDatagramSize)
+            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.baseDatagramSize) {
                 pointer in
                 var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
                 return self.core.send(into: &span, on: path, now: now) ?? 0

@@ -85,13 +85,24 @@ public struct InitialPacketSize: Sendable, Hashable {
 
     let kind: Kind
 
-    /// Send UDP payloads of up to `size` bytes.
+    /// Send UDP payloads of up to `size` bytes. Connections never probe for larger ones.
     public static func fixed(_ size: Int) -> Self {
         Self(kind: .fixed(size))
     }
 
     /// Send UDP payloads as large as the datagram that carried the client's first Initial packet,
     /// but at most `maximum` bytes.
+    ///
+    /// Connections driven by the state machine then probe for larger payloads, up to `maximum`,
+    /// with path MTU discovery once the handshake is confirmed (RFC 9000, § 14.3, RFC 8899): a
+    /// padded probe goes out while enough stream data waits to make up for it, and the connection
+    /// sends payloads of its size once the peer acknowledged it. The search covers MTUs of 1280
+    /// bytes and more, so a `maximum` below 1252 bytes over IPv4 (1232 bytes over IPv6) has nothing
+    /// to probe for. Connections driven by SwiftNetwork keep the size they start with.
+    ///
+    /// NOTE: Probing needs the don't fragment bit (see ``QUICDontFragment``). Without it, the
+    /// network fragments a probe larger than the path MTU instead of dropping it, the probe is
+    /// acknowledged, and the connection sends payloads the path only carries in fragments.
     ///
     /// NOTE: The client's Initial only shows that the path carries packets of its size towards
     /// the server, not back towards the client. Only servers can match a client's Initial, clients
@@ -127,6 +138,16 @@ public struct InitialPacketSize: Sendable, Hashable {
             return self
         case .matchingClientInitial(let maximum):
             return Self(kind: .matchedClientInitial(size: min(clientInitialSize, maximum), maximum: maximum))
+        }
+    }
+
+    /// The largest UDP payload state machine connections probe for, `nil` if the size is fixed.
+    var probingMaximum: Int? {
+        switch self.kind {
+        case .fixed:
+            return nil
+        case .matchingClientInitial(let maximum), .matchedClientInitial(_, let maximum):
+            return maximum
         }
     }
 }
@@ -182,7 +203,9 @@ public struct QUICConfiguration: Sendable {
     public var maxDatagramFrameSize: Int = 65535
     /// The maximum UDP payload size the connection sends from its first packet on. Defaults to
     /// 1200 bytes, the minimum every QUIC path must support (RFC 9000, Section 14). Initial packets are
-    /// padded to this size, and the connection never lowers its maximum packet size below it.
+    /// padded to this size, and the connection never lowers its maximum packet size below it. With
+    /// ``InitialPacketSize/matchingClientInitial(upTo:)``, state machine connections probe for larger
+    /// packets later.
     ///
     /// NOTE: Only raise it if the whole path and the peer support it. Values of 1200 or less have no effect.
     public var initialPacketSize: InitialPacketSize = .fixed(1200)

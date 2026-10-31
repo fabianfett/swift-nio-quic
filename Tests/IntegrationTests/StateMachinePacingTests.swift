@@ -117,7 +117,7 @@ struct StateMachinePacingTests {
             let (window, datagramSize) = try await server.channel.eventLoop.submit {
                 let connection = (server.channel as! QUICConnectionChannel<StreamingConsumer>)
                     ._forTesting_stateMachineConnection!
-                return (connection._forTesting_congestionWindow, connection._forTesting_maximumDatagramSize)
+                return (connection._forTesting_congestionWindow, connection._forTesting_datagramSize)
             }.get()
             // The window is well past the initial ten datagrams, so the test means something.
             try #require(window > 100 * datagramSize, "window \(window)")
