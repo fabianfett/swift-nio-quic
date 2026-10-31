@@ -70,14 +70,6 @@ private struct TestCore: ~Copyable {
         self.core.read(minContiguous: minContiguous, from: self.operations, id: Self.id, body)
     }
 
-    mutating func expectFlushRefused(fin: Bool) {
-        do {
-            try self.core.flush(fin: fin, to: self.operations)
-            Issue.record("Expected flush to be refused")
-        } catch {
-            ()  // Refused, as expected.
-        }
-    }
 }
 
 @available(anyAppleOS 26, *)
@@ -221,7 +213,9 @@ struct QUICStreamCoreTests {
     func flushOnStreamWIthoutIDIsRefused(fin: Bool) {
         var stream = TestCore(connected: false)
         stream.core.write(ByteBuffer(string: "hello"))
-        stream.expectFlushRefused(fin: fin)
+        #expect(throws: QUICError.invalidStreamState) {
+            try stream.core.flush(fin: fin, to: stream.operations)
+        }
 
         let stillQueued = stream.core._forTesting_hasPendingWrites
         #expect(stillQueued)
@@ -245,6 +239,37 @@ struct QUICStreamCoreTests {
         #expect(stream.operations[TestCore.id]?.finished == true)
         let stillQueued = stream.core._forTesting_hasPendingWrites
         #expect(!stillQueued)
+    }
+
+    @Test
+    @available(anyAppleOS 26, *)
+    func flushAfterTheFinIsRefusedAndDropsTheWrites() throws {
+        var stream = TestCore()
+        try stream.core.flush(fin: true, to: stream.operations)
+        stream.core.write(ByteBuffer(string: "late"))
+
+        #expect(throws: QUICError.invalidStreamState) {
+            try stream.core.flush(fin: false, to: stream.operations)
+        }
+        let stillQueued = stream.core._forTesting_hasPendingWrites
+        #expect(!stillQueued)
+        #expect(stream.operations[TestCore.id]?.outbound.isEmpty == true)
+    }
+
+    @Test
+    @available(anyAppleOS 26, *)
+    func flushTheConnectionRefusesFailsAndDropsTheRest() {
+        var stream = TestCore()
+        stream.operations.refusesWrites = true
+        stream.core.write(ByteBuffer(string: "one"))
+        stream.core.write(ByteBuffer(string: "two"))
+
+        #expect(throws: QUICError.streamWriteFailed) {
+            try stream.core.flush(fin: true, to: stream.operations)
+        }
+        let stillQueued = stream.core._forTesting_hasPendingWrites
+        #expect(!stillQueued)
+        #expect(stream.operations[TestCore.id]?.finished == false)
     }
 }
 

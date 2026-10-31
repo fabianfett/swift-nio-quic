@@ -153,8 +153,12 @@ extension QUICStream where Consumer: ~Copyable {
     /// Write any queued data to the network.
     ///
     /// - Parameter fin: Whether to finish the send side.
-    /// - Throws: If the send side can't write the queued data. For example, the stream is already
-    ///   closed, or FIN has already been sent.
+    /// - Throws: ``QUICError/invalidStreamState`` if the send side can't take the queued data: the
+    ///   stack hasn't assigned the stream its ID yet, in which case the data stays queued and the
+    ///   flush can be repeated after the ``QUICStreamEvents/opened`` visit; the stream has no send
+    ///   side; or FIN or RESET\_STREAM was sent already, in which case the data is dropped.
+    ///   ``QUICError/streamWriteFailed`` if the connection refused the data, for example because it
+    ///   is closing. On the `SwiftNetwork` driver, also what its stack throws.
     @inlinable
     public mutating func flush(fin: Bool = false) throws {
         self.table.markOutputPending()

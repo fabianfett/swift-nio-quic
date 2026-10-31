@@ -16,16 +16,6 @@ import NIOCore
 import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#elseif canImport(Musl)
-import Musl
-#elseif canImport(Android)
-import Android
-#endif
-
 /// The transport state for a stream.
 @available(anyAppleOS 26, *)
 @usableFromInline
@@ -44,8 +34,8 @@ struct QUICStreamCore: ~Copyable {
     /// received all inbound data (as each read must also go through the state machine).
     private var finPending: Bool
 
-    /// Writes that haven't yet been emitted to the stack.
-    private var pendingWrites: FrameArray
+    /// Writes that haven't yet been emitted to the stack, in order.
+    private var pendingWrites: [ByteBuffer]
 
     /// Data received from `SwiftNetwork` which the application hasn't consumed yet.
     private var undeliveredReads: FrameArray
@@ -84,7 +74,7 @@ struct QUICStreamCore: ~Copyable {
         self.state = QUICStreamStateMachine()
         self.handle = SwiftNetworkStreamHandle()
         self.identifier = InstanceIdentifier()
-        self.pendingWrites = FrameArray()
+        self.pendingWrites = []
         self.undeliveredReads = FrameArray()
         self.finPending = false
         self.coalescedBytes = []
@@ -200,7 +190,7 @@ extension QUICStreamCore {
         code: QUICApplicationErrorCode,
         in eventContext: inout NetworkContext.EventContext
     ) {
-        self.pendingWrites.finalizeAllFramesAsFailed()
+        self.pendingWrites.removeAll()
         self.abortOutbound(error: NetworkError(quicApplicationError: code.rawValue), in: &eventContext)
     }
 }
@@ -533,140 +523,142 @@ extension QUICStreamCore {
         }
     }
 
-    /// Queues a frame filled in place by `body`.
+    /// Queues bytes filled in place by `body`.
     ///
     /// - Parameters:
     ///   - count: The number of writable bytes to hand to `body`.
     ///   - body: Handed `count` writable bytes, returning how many it wrote.
     @usableFromInline
     mutating func withWritableSpan(count: Int, _ body: (_ span: inout MutableRawSpan) -> Int) {
-        var frame = Frame(allocatingCustomFinalizerBufferOfSize: count)
-        var written = 0
-
-        if var span = frame.mutableSpan {
-            var bytes = span.mutableBytes
+        var buffer = ByteBufferAllocator().buffer(capacity: count)
+        buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: count) { pointer in
+            var bytes = MutableRawSpan(_unsafeBytes: UnsafeMutableRawBufferPointer(rebasing: pointer[..<count]))
             let wrote = body(&bytes)
             assert(wrote <= count, "body(_:) claimed to write more bytes than there was space for")
             assert(wrote >= 0, "body(_:) claimed to write negative bytes")
-            written = min(max(wrote, 0), count)
+            return min(max(wrote, 0), count)
         }
-
-        if written == 0 {
-            frame.finalize(success: false)
+        if buffer.readableBytes > 0 {
+            self.pendingWrites.append(buffer)
         }
-
-        if written < count {
-            let sized = frame.collapse(to: written)
-            precondition(sized, "frame of \(count) bytes cannot be sized to \(written)")
-        }
-
-        self.pendingWrites.add(frame: frame)
     }
 
-    /// Queues a copy of `buffer`.
+    /// Queues `buffer`, without copying it.
     ///
     /// - Parameter buffer: The bytes to queue.
     @usableFromInline
     mutating func write(_ buffer: ByteBuffer) {
         if buffer.readableBytes != 0 {
-            var buffer = buffer
-            buffer.withUnsafeMutableReadableBytesWithStorageManagement2 { buffer, owner in
-                self.pendingWrites.add(frame: Frame(customBuffer: buffer, owner: owner))
-            }
+            self.pendingWrites.append(buffer)
         }
     }
 
-    /// Hands buffered writes queued to the `SwiftNetwork`.
+    /// Checks that the send side takes what is queued, and finishes it in the state machine if
+    /// `fin` is set.
     ///
-    /// - Parameter fin: Whether to finish the send side.
-    /// - Throws: If the send side can no longer carry what was queued, in which case the queue is
-    ///   dropped; if the stack rejected the write; or if the flush happened before the stack
-    ///   assigned the stream its ID, in which case the queue is left as it was so the flush can be
-    ///   repeated.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    mutating func flush(fin: Bool, in eventContext: inout NetworkContext.EventContext) throws {
-        if self.pendingWrites.isEmpty && !fin { return }
+    /// - Returns: Whether the flush carries a FIN, or `nil` if there is nothing to flush.
+    /// - Throws: ``QUICError/invalidStreamState`` if the send side can't take what was queued: it
+    ///   has no ID yet, in which case the queue is kept so that the flush can be repeated once it
+    ///   has; it has no send side; or FIN or RESET\_STREAM went out already. The queue is dropped
+    ///   then.
+    private mutating func beginFlush(fin: Bool) throws(QUICError) -> Bool? {
+        if self.pendingWrites.isEmpty && !fin { return nil }
 
         // Refusals drop outbound writes unless the stream doesn't yet have an ID. Callers may
         // retry the flush once the stream gets an ID.
         var dropWritesOnRefusal = true
-        var refusalReason: String?
+        var refused = false
 
         do {
             switch try self.state.writeData() {
             case .sendData:
                 ()
             case .doNotWrite(.streamFinished):
-                refusalReason = "a FIN has already been sent"
+                refused = true  // A FIN has already been sent.
             case .doNotWrite(.streamReset):
-                refusalReason = "RESET_STREAM has already been sent"
+                refused = true  // RESET_STREAM has already been sent.
             }
         } catch {
+            refused = true
             switch error {
             case .notConnected:
                 // The stack hasn't assigned an ID yet, so nothing can have finished the send side,
                 // refuse the flush but keep the pending writes, the flush can be retried later.
-                refusalReason = "the stack hasn't assigned the stream an ID yet"
                 dropWritesOnRefusal = false
             case .wrongDirection:
-                refusalReason = "the stream has no send side"
+                ()  // The stream has no send side.
             }
         }
 
         var carriesFin = false
 
-        if fin && refusalReason == nil {
+        if fin && !refused {
             do {
                 switch try self.state.sendFin() {
                 case .sendFin:
                     carriesFin = true
                 case .ignore(.alreadyFinished):
-                    refusalReason = "a FIN has already been sent"
+                    refused = true
                 case .ignore(.streamReset):
-                    refusalReason = "RESET_STREAM has already been sent"
+                    refused = true
                 }
             } catch {
                 assert(self.pendingWrites.isEmpty)
-                throw NetworkError(streamStateViolation: "\(error)", operation: "sendFin")
+                throw QUICError.invalidStreamState
             }
         }
 
-        if let refusalReason {
+        if refused {
             if dropWritesOnRefusal {
-                self.pendingWrites.finalizeAllFramesAsFailed()
+                self.pendingWrites.removeAll()
             }
-            throw NetworkError(streamStateViolation: refusalReason, operation: "flush")
+            throw QUICError.invalidStreamState
         }
 
-        if self.pendingWrites.isEmpty && !carriesFin { return }
+        if self.pendingWrites.isEmpty && !carriesFin { return nil }
+        return carriesFin
+    }
 
-        if carriesFin {
-            self.markFin()
-        }
+    /// Hands buffered writes queued to the `SwiftNetwork`.
+    ///
+    /// - Parameter fin: Whether to finish the send side.
+    /// - Throws: As ``beginFlush(fin:)``, or what the stack throws if it rejected the write.
+    @_spi(Essentials) @_spi(ProtocolProvider)
+    @usableFromInline
+    mutating func flush(fin: Bool, in eventContext: inout NetworkContext.EventContext) throws {
+        guard let carriesFin = try self.beginFlush(fin: fin) else { return }
 
         switch self.handle.invokeSendStreamData() {
         case .proceed(let linkage):
-            let outgoing = self.pendingWrites.drainArray()
+            var outgoing = FrameArray()
+            for var buffer in self.pendingWrites {
+                buffer.withUnsafeMutableReadableBytesWithStorageManagement2 { buffer, owner in
+                    outgoing.add(frame: Frame(customBuffer: buffer, owner: owner))
+                }
+            }
+            self.pendingWrites.removeAll(keepingCapacity: true)
+            if carriesFin {
+                Self.markFin(&outgoing)
+            }
             try linkage.invokeSendStreamData(outgoing, from: self.identifier, in: &eventContext)
 
         case .handleViolation(let reason):
-            self.pendingWrites.finalizeAllFramesAsFailed()
+            self.pendingWrites.removeAll()
             throw SwiftNetworkStreamHandle.violationError(operation: "invokeSendStreamData", reason: reason)
         }
     }
 
-    /// Sets the FIN flag on the last queued frame, or adds an empty frame.
-    private mutating func markFin() {
-        if self.pendingWrites.isEmpty {
+    /// Sets the FIN flag on the last frame of `frames`, or adds an empty frame.
+    private static func markFin(_ frames: inout FrameArray) {
+        if frames.isEmpty {
             var frame = Frame(count: 0)
             frame.connectionComplete = true
-            self.pendingWrites.add(frame: frame)
+            frames.add(frame: frame)
         } else {
             // This is dumb: FrameArray should make it possible to do this without iterating.
-            let last = self.pendingWrites.count &- 1
+            let last = frames.count &- 1
             var index = 0
-            self.pendingWrites.iterateMutableFrames { frame -> Bool in
+            frames.iterateMutableFrames { frame -> Bool in
                 if index == last {
                     frame.connectionComplete = true
                 }
@@ -698,7 +690,7 @@ extension QUICStreamCore {
         switch action {
         case .sendReset:
             // RESET_STREAM abandons the stream's data, so nothing still queued is going out.
-            self.pendingWrites.finalizeAllFramesAsFailed()
+            self.pendingWrites.removeAll()
             self.abortOutbound(error: NetworkError(quicApplicationError: code.rawValue), in: &eventContext)
         case .ignore(.alreadyFinished):
             ()  // Send side finished cleanly: RESET_STREAM would contradict the FIN.
@@ -783,7 +775,7 @@ extension QUICStreamCore {
     /// `QUICStreamTable.deinit`). Finalizing the queued frames is not optional: an un-finalized
     /// `Frame` traps in its own `deinit`.
     mutating func abandonLocally() {
-        self.pendingWrites.finalizeAllFramesAsFailed()
+        self.pendingWrites.removeAll()
         self.undeliveredReads.finalizeAllFramesAsFailed()
     }
 
@@ -894,76 +886,30 @@ extension QUICStreamCore {
     }
 
     /// Hands queued writes to `operations`. See ``flush(fin:in:)``.
-    mutating func flush(fin: Bool, to operations: some QUICStreamOperations) throws {
-        if self.pendingWrites.isEmpty && !fin { return }
-
-        var dropWritesOnRefusal = true
-        var refusalReason: String?
-
-        do {
-            switch try self.state.writeData() {
-            case .sendData:
-                ()
-            case .doNotWrite(.streamFinished):
-                refusalReason = "a FIN has already been sent"
-            case .doNotWrite(.streamReset):
-                refusalReason = "RESET_STREAM has already been sent"
-            }
-        } catch {
-            switch error {
-            case .notConnected:
-                refusalReason = "the stack hasn't assigned the stream an ID yet"
-                dropWritesOnRefusal = false
-            case .wrongDirection:
-                refusalReason = "the stream has no send side"
-            }
-        }
-
-        var carriesFin = false
-
-        if fin && refusalReason == nil {
-            do {
-                switch try self.state.sendFin() {
-                case .sendFin:
-                    carriesFin = true
-                case .ignore(.alreadyFinished):
-                    refusalReason = "a FIN has already been sent"
-                case .ignore(.streamReset):
-                    refusalReason = "RESET_STREAM has already been sent"
-                }
-            } catch {
-                assert(self.pendingWrites.isEmpty)
-                throw NetworkError(streamStateViolation: "\(error)", operation: "sendFin")
-            }
-        }
-
-        if let refusalReason {
-            if dropWritesOnRefusal {
-                self.pendingWrites.finalizeAllFramesAsFailed()
-            }
-            throw NetworkError(streamStateViolation: refusalReason, operation: "flush")
-        }
+    ///
+    /// - Throws: As ``beginFlush(fin:)``, or ``QUICError/streamWriteFailed`` if the connection
+    ///   refused the bytes, in which case the rest of the queue is dropped.
+    mutating func flush(fin: Bool, to operations: some QUICStreamOperations) throws(QUICError) {
+        guard let carriesFin = try self.beginFlush(fin: fin) else { return }
 
         guard let id = self.id else {
-            self.pendingWrites.finalizeAllFramesAsFailed()
-            throw NetworkError(streamStateViolation: "the stream has no ID", operation: "flush")
+            self.pendingWrites.removeAll()
+            throw QUICError.invalidStreamState
         }
 
         // The core takes all of a write, or none once the stream or the connection can't send any
         // more: for instance while the connection is closing (RFC 9000 Section 10.2), which the
         // stream may not know yet. The rest of the queue fails with the refused write.
         var refused = false
-        var outgoing = self.pendingWrites.drainArray()
-        outgoing.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
-            if !refused, let bytes = frame.bytes, bytes.byteCount > 0 {
-                refused = operations.write(bytes, to: id, fin: false) < bytes.byteCount
+        for buffer in self.pendingWrites {
+            refused = buffer.withUnsafeReadableBytes { bytes in
+                operations.write(RawSpan(_unsafeBytes: bytes), to: id, fin: false) < bytes.count
             }
-            frame.finalize(success: !refused)
-            return .removeFrameAndContinue
+            if refused { break }
         }
+        self.pendingWrites.removeAll(keepingCapacity: true)
         if refused {
-            // What the `SwiftNetwork` stack throws for a stream it can no longer send on.
-            throw NetworkError.posix(ENOTCONN)
+            throw QUICError.streamWriteFailed
         }
         if carriesFin {
             operations.finish(id)
@@ -980,7 +926,7 @@ extension QUICStreamCore {
         }
         switch action {
         case .sendReset:
-            self.pendingWrites.finalizeAllFramesAsFailed()
+            self.pendingWrites.removeAll()
             if let id = self.id {
                 operations.resetStream(id, code: code)
             }
@@ -1019,9 +965,9 @@ extension QUICStreamCore {
         do {
             switch try self.state.receiveStopSending(applicationErrorCode: code) {
             case .sendReset:
-                self.pendingWrites.finalizeAllFramesAsFailed()
+                self.pendingWrites.removeAll()
             case .sendResetAndCloseStream:
-                self.pendingWrites.finalizeAllFramesAsFailed()
+                self.pendingWrites.removeAll()
             case .ignore:
                 ()
             }
@@ -1071,15 +1017,3 @@ extension QUICStreamCore {
     }
 }
 #endif  // DEBUG
-
-@available(anyAppleOS 26, *)
-extension NetworkError {
-    fileprivate init(streamStateViolation reason: String, operation: String) {
-        self.init(
-            category: NetworkError.CommonCategory(
-                identifier: "swift-nio-quic.streamStateViolation",
-                description: "\(operation): \(reason)"
-            )
-        )
-    }
-}
