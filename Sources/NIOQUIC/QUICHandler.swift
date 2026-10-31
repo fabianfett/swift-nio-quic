@@ -14,6 +14,7 @@
 
 import Logging
 import NIOCore
+import Synchronization
 import X509
 
 #if canImport(Darwin)
@@ -138,15 +139,28 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private var authenticator: Authenticator?
     /// Makes a consumer for a given connection, `nil` if stream channels are used.
     private let makeConsumer: ((QUICStreamConnection<Consumer>) -> Consumer)?
-    /// The implementation that drives new consumer connections. Set it before the first
-    /// connection is created.
+    /// Sets up the stream channels of a state machine connection's channel on its stream table,
+    /// for a handler whose streams are stream channels.
+    private var setUpStreamChannels: ((QUICConnectionChannel<Consumer>, QUICStreamTable<Consumer>) -> Void)?
+    /// The implementation that drives new connections. Set it before the first connection is
+    /// created.
     var connectionDriver: QUICConnectionDriver
 
     #if DEBUG
     var _forTesting_timerQueue: StateMachineTimerQueue {
         self.timerQueue
     }
+
+    /// Runs with the driver of each stream channel connection the handler makes.
+    var _forTesting_onStreamChannelsConnection: ((QUICConnectionDriver) -> Void)?
     #endif
+
+    /// Whether a new connection with `configuration` runs on a ``StateMachineQUICConnection``: the
+    /// handler's driver is the state machine, which implements the configuration.
+    private func servesStateMachineConnections(_ configuration: QUICConfiguration) -> Bool {
+        self.connectionDriver == .stateMachine && QUICConnectionDriver.stateMachineSupports(configuration)
+            && (self.makeConsumer != nil || self.setUpStreamChannels != nil)
+    }
 
     private func nextConnectionHandle() -> ConnectionHandle {
         let handle = self.connectionHandle
@@ -192,7 +206,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.closingConnections = ConnectionRegistry()
         self.timerQueue = StateMachineTimerQueue(eventLoop: channel.eventLoop)
         self.makeConsumer = makeConsumer
-        self.connectionDriver = .default(for: quicConfiguration.role)
+        self.connectionDriver =
+            makeConsumer == nil
+            ? .defaultForStreamChannels(for: quicConfiguration.role) : .default(for: quicConfiguration.role)
         self.connectionAdmissionController = makeConnectionAdmissionController(
             for: connectionLimits,
             logger: logger,
@@ -279,9 +295,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
             let handle = self.nextConnectionHandle()
             let channel: QUICConnectionChannel<Consumer>
             var stateMachineConnection: StateMachineQUICConnection<Consumer>?
-            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
-                && QUICConnectionDriver.stateMachineSupports(self.quicConfiguration)
-            {
+            if self.servesStateMachineConnections(self.quicConfiguration) {
                 let connection = try StateMachineQUICConnection<Consumer>.client(
                     configuration: self.quicConfiguration,
                     sourceConnectionID: sourceConnectionID,
@@ -666,6 +680,7 @@ extension QUICHandler where Consumer == QUICStreamChannels {
         )
 
         handler.multiplexerContinuation = .connectionMultiplexerContinuation(multiplexer)
+        handler.servesStreamChannelsOnStreamTables()
 
         return (handler, multiplexer)
     }
@@ -722,6 +737,24 @@ extension QUICHandler where Consumer == QUICStreamChannels {
             finish: noMoreConnections,
             role: quicConfiguration.role
         )
+        self.servesStreamChannelsOnStreamTables()
+    }
+
+    /// Lets state machine connections serve the stream channels: a stream table carries them, as
+    /// ``QUICStreamChannels`` consumes it.
+    private func servesStreamChannelsOnStreamTables() {
+        let role = self.quicConfiguration.role
+        self.setUpStreamChannels = { channel, table in
+            let group = QUICStreamChannelGroup(
+                parent: channel,
+                role: role,
+                localAddress: channel.localAddress,
+                remoteAddress: channel.sharedRemoteAddress
+            )
+            group.table = table
+            group.delegate = channel
+            channel.setStreamChannelGroup(group)
+        }
     }
 
     /// Create a new outbound QUIC connection.
@@ -1112,9 +1145,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         )
         let quicConnection: AcceptedConnection
         do {
-            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
-                && QUICConnectionDriver.stateMachineSupports(configuration)
-            {
+            if self.servesStateMachineConnections(configuration) {
                 quicConnection = .stateMachine(
                     try StateMachineQUICConnection<Consumer>.server(
                         configuration: configuration,
@@ -1440,6 +1471,12 @@ extension QUICHandler where Consumer: ~Copyable {
         handle: ConnectionHandle
     ) -> QUICConnectionChannel<Consumer> {
         let table = connection.streamTable
+        #if DEBUG
+        if self.makeConsumer == nil {
+            QUICConnectionDriver._forTesting_recordStreamChannelsConnection(.stateMachine)
+            self._forTesting_onStreamChannelsConnection?(.stateMachine)
+        }
+        #endif
 
         let channel = QUICConnectionChannel(
             udpChannel: self.udpChannel,
@@ -1450,8 +1487,12 @@ extension QUICHandler where Consumer: ~Copyable {
             table: table
         )
 
-        if table != nil, let makeConsumer = self.makeConsumer {
-            channel.setConsumer(makeConsumer(QUICStreamConnection(channel: channel)))
+        if let table {
+            if let makeConsumer = self.makeConsumer {
+                channel.setConsumer(makeConsumer(QUICStreamConnection(channel: channel)))
+            } else if let setUpStreamChannels = self.setUpStreamChannels {
+                setUpStreamChannels(channel, table)
+            }
         }
 
         return channel
@@ -1462,6 +1503,12 @@ extension QUICHandler where Consumer: ~Copyable {
         handle: ConnectionHandle
     ) -> QUICConnectionChannel<Consumer> {
         let table = quicConnection.streamTable
+        #if DEBUG
+        if self.makeConsumer == nil {
+            QUICConnectionDriver._forTesting_recordStreamChannelsConnection(.swiftNetwork)
+            self._forTesting_onStreamChannelsConnection?(.swiftNetwork)
+        }
+        #endif
 
         let channel = QUICConnectionChannel(
             udpChannel: self.udpChannel,
@@ -1554,9 +1601,8 @@ private func makeConnectionAdmissionController(
 enum QUICConnectionDriver: Hashable, Sendable {
     /// The SwiftNetwork framework's `QUICConnection`.
     case swiftNetwork
-    /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections that serve a stream
-    /// consumer, with a configuration it ``stateMachineSupports(_:)``, can use it; the others fall back to
-    /// ``swiftNetwork``.
+    /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections with a configuration
+    /// it ``stateMachineSupports(_:)`` can use it; the others fall back to ``swiftNetwork``.
     case stateMachine
 
     /// The default for a role: ``stateMachine``, unless the `NIOQUIC_DRIVER` environment variable
@@ -1605,6 +1651,43 @@ enum QUICConnectionDriver: Hashable, Sendable {
     static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
         configuration.qLogConfiguration == nil && !configuration.sendRetry
     }
+
+    /// The default for the stream channels of a role, behind the `NIOQUIC_DRIVER` switch while
+    /// the state machine driver learns them: ``swiftNetwork``, unless the variable is
+    /// `state-machine`, which selects ``stateMachine`` for both roles, or `state-machine-server` or
+    /// `state-machine-client`, which select it for one role.
+    static func defaultForStreamChannels(for role: Role) -> Self {
+        #if DEBUG
+        if let driver = Self._forTesting_streamChannelsDriver.withLock({ $0 }) {
+            return driver
+        }
+        #endif
+        switch Self.setting {
+        case "state-machine":
+            return .stateMachine
+        case "state-machine-server":
+            return role == .server ? .stateMachine : .swiftNetwork
+        case "state-machine-client":
+            return role == .client ? .stateMachine : .swiftNetwork
+        default:
+            return .swiftNetwork
+        }
+    }
+
+    #if DEBUG
+    /// Overrides ``defaultForStreamChannels(for:)`` for the handlers made from now on, for tests
+    /// that make their handlers out of reach.
+    static let _forTesting_streamChannelsDriver = Mutex<QUICConnectionDriver?>(nil)
+
+    /// The drivers of the stream channel connections made while `_forTesting_streamChannelsDriver`
+    /// is set, so that such tests can check which one ran.
+    static let _forTesting_streamChannelsConnections = Mutex<[QUICConnectionDriver]>([])
+
+    static func _forTesting_recordStreamChannelsConnection(_ driver: QUICConnectionDriver) {
+        guard Self._forTesting_streamChannelsDriver.withLock({ $0 }) != nil else { return }
+        Self._forTesting_streamChannelsConnections.withLock { $0.append(driver) }
+    }
+    #endif
 
     private static let setting: String? = {
         guard let value = getenv("NIOQUIC_DRIVER") else { return nil }

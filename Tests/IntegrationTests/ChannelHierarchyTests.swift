@@ -33,7 +33,7 @@ private final class UDPMarker: ChannelInboundHandler, Sendable {
 }
 
 @available(anyAppleOS 26, *)
-final class ChannelHierarchyTests: XCTestCase {
+final class ChannelHierarchyTests: StreamChannelsTestCase {
     /// End-to-end test that asserts the channel hierarchy from the perspective
     /// of a QUIC stream channel:
     ///

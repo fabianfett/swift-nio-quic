@@ -870,7 +870,7 @@ final class StreamingClientHandler: ChannelInboundHandler {
 
 // These integration tests use the nio interfaces rather than async ones
 @available(anyAppleOS 26, *)
-final class SyncIntegrationTests: XCTestCase {
+final class SyncIntegrationTests: StreamChannelsTestCase {
 
     func getChannelLoggers() -> (serverLogger: Logger, clientLogger: Logger) {
         var clientLogger = Logger(label: "Client")

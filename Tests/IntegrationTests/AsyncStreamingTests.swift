@@ -18,7 +18,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class AsyncStreamingTests: XCTestCase {
+final class AsyncStreamingTests: StreamChannelsTestCase {
 
     // MARK: - async-wrapper body transfer
 

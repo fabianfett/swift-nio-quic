@@ -23,9 +23,9 @@ import Testing
 @Suite(.timeLimit(.minutes(1)))
 struct ConnectionMigrationTests {
     @available(anyAppleOS 26, *)
-    @Test
-    func clientContinuesConnectionFromNewAddress() async throws {
-        try await Self.withConnectedPeers { peers in
+    @Test(arguments: StreamChannelsDriverCheck.all)
+    func clientContinuesConnectionFromNewAddress(driver: QUICConnectionDriver) async throws {
+        try await Self.withConnectedPeers(driver: driver) { peers in
             // The client's socket "rebinds": its packets now come from a new port and its old address is gone.
             let newSocket = try await peers.makeClientSocket()
             try await peers.rebindClient(to: newSocket)
@@ -39,9 +39,9 @@ struct ConnectionMigrationTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func clientMigratesToTwoNewAddresses() async throws {
-        try await Self.withConnectedPeers { peers in
+    @Test(arguments: StreamChannelsDriverCheck.all)
+    func clientMigratesToTwoNewAddresses(driver: QUICConnectionDriver) async throws {
+        try await Self.withConnectedPeers(driver: driver) { peers in
             for _ in 0..<2 {
                 let newSocket = try await peers.makeClientSocket()
                 try await peers.rebindClient(to: newSocket)
@@ -53,9 +53,9 @@ struct ConnectionMigrationTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test(.enabled { await Self.isDualStackAvailable() })
-    func dualStackServerFollowsClientToTwoNewAddresses() async throws {
-        try await Self.withConnectedPeers(serverHost: "::") { peers in
+    @Test(.enabled { await Self.isDualStackAvailable() }, arguments: StreamChannelsDriverCheck.all)
+    func dualStackServerFollowsClientToTwoNewAddresses(driver: QUICConnectionDriver) async throws {
+        try await Self.withConnectedPeers(serverHost: "::", driver: driver) { peers in
             for _ in 0..<2 {
                 let newSocket = try await peers.makeClientSocket()
                 try await peers.rebindClient(to: newSocket)
@@ -104,9 +104,9 @@ struct ConnectionMigrationTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test
-    func clientMigratesBackToItsFirstAddress() async throws {
-        try await Self.withConnectedPeers { peers in
+    @Test(arguments: StreamChannelsDriverCheck.all)
+    func clientMigratesBackToItsFirstAddress(driver: QUICConnectionDriver) async throws {
+        try await Self.withConnectedPeers(driver: driver) { peers in
             let newSocket = try await peers.makeClientSocket()
             try await peers.rebindClient(to: newSocket)
             #expect(try await Self.request(on: peers.streamCreator) == ByteBuffer(string: "<b>Success</b>"))
@@ -120,9 +120,9 @@ struct ConnectionMigrationTests {
 
     /// Anyone who sees the connection's traffic can send packets to it from any address.
     @available(anyAppleOS 26, *)
-    @Test(arguments: [1, 2, 100])
-    func serverIgnoresUnauthenticatedPacketsFromNewAddresses(addressCount: Int) async throws {
-        try await Self.withConnectedPeers { peers in
+    @Test(arguments: StreamChannelsDriverCheck.all, [1, 2, 100])
+    func serverIgnoresUnauthenticatedPacketsFromNewAddresses(driver: QUICConnectionDriver, addressCount: Int) async throws {
+        try await Self.withConnectedPeers(driver: driver) { peers in
             let packet = try await peers.unauthenticatedPacket()
 
             // Every new address makes the server set up a path, which SwiftNetwork then probes.
@@ -142,9 +142,9 @@ struct ConnectionMigrationTests {
 
     /// The unauthenticated packet must not interrupt .
     @available(anyAppleOS 26, *)
-    @Test
-    func serverCloseReachesClientAfterUnauthenticatedPacket() async throws {
-        try await Self.withConnectedPeers { peers in
+    @Test(arguments: StreamChannelsDriverCheck.all)
+    func serverCloseReachesClientAfterUnauthenticatedPacket(driver: QUICConnectionDriver) async throws {
+        try await Self.withConnectedPeers(driver: driver) { peers in
             let spoofer = try await DatagramBootstrap(group: peers.eventLoopGroup).bind(host: Self.host, port: 0).get()
             try await spoofer.writeAndFlush(
                 AddressedEnvelope(remoteAddress: peers.serverAddress, data: try await peers.unauthenticatedPacket())
@@ -200,9 +200,11 @@ struct ConnectionMigrationTests {
     @available(anyAppleOS 26, *)
     private static func withConnectedPeers(
         serverHost: String = ConnectionMigrationTests.host,
+        driver: QUICConnectionDriver,
         _ body: (ConnectedPeers) async throws -> Void
     ) async throws {
-        let peers = try await ConnectedPeers.connect(serverHost: serverHost)
+        let driverCheck = StreamChannelsDriverCheck(driver)
+        let peers = try await ConnectedPeers.connect(serverHost: serverHost, driverCheck: driverCheck)
         do {
             try await body(peers)
         } catch {
@@ -210,6 +212,7 @@ struct ConnectionMigrationTests {
             throw error
         }
         try await peers.close()
+        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     /// A client connected to a server over loopback, after one successful request.
@@ -224,11 +227,11 @@ struct ConnectionMigrationTests {
         var clientConnectionChannel: any Channel
         var streamCreator: QUICStreamCreator
 
-        static func connect(serverHost: String) async throws -> ConnectedPeers {
+        static func connect(serverHost: String, driverCheck: StreamChannelsDriverCheck) async throws -> ConnectedPeers {
             // One thread: the relay hands datagrams from one channel's pipeline to the other's synchronously.
             let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
             do {
-                return try await Self.connect(on: eventLoopGroup, serverHost: serverHost)
+                return try await Self.connect(on: eventLoopGroup, serverHost: serverHost, driverCheck: driverCheck)
             } catch {
                 // Shutting down the event loop group also closes the channels set up so far.
                 try? await eventLoopGroup.shutdownGracefully()
@@ -238,7 +241,8 @@ struct ConnectionMigrationTests {
 
         private static func connect(
             on eventLoopGroup: MultiThreadedEventLoopGroup,
-            serverHost: String
+            serverHost: String,
+            driverCheck: StreamChannelsDriverCheck
         ) async throws -> ConnectedPeers {
             let serverConnectionChannel = NIOLockedValueBox<(any Channel)?>(nil)
             let latestServerStreamChannel = NIOLockedValueBox<(any Channel)?>(nil)
@@ -249,6 +253,7 @@ struct ConnectionMigrationTests {
                     host: serverHost,
                     port: port,
                     logger: Logger(label: "Server"),
+                    driverCheck: driverCheck,
                     inboundConnectionInitializer: { connectionChannel, _ in
                         serverConnectionChannel.withLockedValue { $0 = connectionChannel }
                         return connectionChannel.eventLoop.makeSucceededVoidFuture()
@@ -276,6 +281,7 @@ struct ConnectionMigrationTests {
                 host: ConnectionMigrationTests.host,
                 port: 0,
                 logger: Logger(label: "Client"),
+                driverCheck: driverCheck,
                 udpChannelInitializer: { channel in
                     try channel.pipeline.syncOperations.addHandler(AddressSwitchHandler())
                     try channel.pipeline.syncOperations.addHandler(ShortHeaderRecorder())

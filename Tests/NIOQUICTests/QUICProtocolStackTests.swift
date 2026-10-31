@@ -26,7 +26,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class QUICProtocolStackTests: XCTestCase {
+final class QUICProtocolStackTests: StreamChannelsTestCase {
 
     private func buildClientChannel(
         logger: Logger,
@@ -1000,6 +1000,8 @@ final class QUICProtocolStackTests: XCTestCase {
     }
 
     func testServerSendRetry() async throws {
+        // Only the SwiftNetwork driver sends Retry: the server falls back to it.
+        self.fallsBackToSwiftNetwork = true
         // This test directy the server to send a retry in response to the client initial.
 
         let loggers = getChannelLoggers()
@@ -1064,6 +1066,8 @@ final class QUICProtocolStackTests: XCTestCase {
 
     func testServerUsingQlog() async throws {
         try XCTSkipUnless(QUIC.isQlogEnabled, "Qlog isn't enabled, skipping")
+        // Only the SwiftNetwork driver writes qlog: the server falls back to it.
+        self.fallsBackToSwiftNetwork = true
 
         let path = FileManager.default.temporaryDirectory
         let tag = UUID().uuidString
@@ -1232,6 +1236,24 @@ final class QUICProtocolStackTests: XCTestCase {
     // MARK: Stream concurrency limits
 
     /// Per-stream lifecycle for the two-stream concurrency helper.
+    /// Records the end of a stream's input.
+    private final class InputClosedRecorder: ChannelInboundHandler {
+        typealias InboundIn = ByteBuffer
+
+        let inputClosed: NIOLockedValueBox<Bool>
+
+        init(inputClosed: NIOLockedValueBox<Bool>) {
+            self.inputClosed = inputClosed
+        }
+
+        func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+            if event as? ChannelEvent == .inputClosed {
+                self.inputClosed.withLockedValue { $0 = true }
+            }
+            context.fireUserInboundEventTriggered(event)
+        }
+    }
+
     private struct TwoStreamState {
         enum StreamState {
             case unknown
@@ -1265,6 +1287,10 @@ final class QUICProtocolStackTests: XCTestCase {
     /// Returns `true` if stream 2 opened while stream 1 was still open (limit
     /// allowed concurrent streams); `false` if stream 2's open was blocked
     /// until stream 1 closed.
+    ///
+    /// Stream 1 is closed for this once the server finished it, which the client sees as the end
+    /// of its input: the server may hand its credit back then (RFC 9000 Section 4.6), before the
+    /// client's own close of stream 1 is done.
     private func openTwoStreamsConcurrently(maxBidiStreams: Int) async throws -> Bool {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
@@ -1288,6 +1314,9 @@ final class QUICProtocolStackTests: XCTestCase {
 
         let state = NIOLockedValueBox(TwoStreamState())
         let stream1AtStream2Open = NIOLockedValueBox<TwoStreamState.StreamState?>(nil)
+        // Set on the event loop when the server finished stream 1, read there when stream 2 opens.
+        let stream1FinishedByServer = NIOLockedValueBox(false)
+        let stream1FinishedAtStream2Open = NIOLockedValueBox<Bool?>(nil)
 
         // Promises that the work tasks complete when they finish — the same
         // synchronization primitive used by `ChannelHierarchyTests`.
@@ -1311,7 +1340,10 @@ final class QUICProtocolStackTests: XCTestCase {
             // Open stream 1 but don't close it yet.
             let stream1 = try await connection.createBidirectionalStream { si in
                 si.channel.eventLoop.makeCompletedFuture {
-                    try NIOAsyncChannel(
+                    try si.channel.pipeline.syncOperations.addHandler(
+                        InputClosedRecorder(inputClosed: stream1FinishedByServer)
+                    )
+                    return try NIOAsyncChannel(
                         wrappingChannelSynchronously: si.channel,
                         configuration: .init(
                             isOutboundHalfClosureEnabled: true,
@@ -1327,7 +1359,10 @@ final class QUICProtocolStackTests: XCTestCase {
             group.addTask {
                 do {
                     let stream2 = try await connection.createBidirectionalStream { si in
-                        si.channel.eventLoop.makeCompletedFuture {
+                        stream1FinishedAtStream2Open.withLockedValue {
+                            $0 = stream1FinishedByServer.withLockedValue { $0 }
+                        }
+                        return si.channel.eventLoop.makeCompletedFuture {
                             try NIOAsyncChannel(
                                 wrappingChannelSynchronously: si.channel,
                                 configuration: .init(
@@ -1375,7 +1410,8 @@ final class QUICProtocolStackTests: XCTestCase {
             try await stream2Done.futureResult.get()
 
             group.cancelAll()
-            return stream1AtStream2Open.withLockedValue { $0 } == .open
+            XCTAssertNotNil(stream1AtStream2Open.withLockedValue { $0 })
+            return stream1FinishedAtStream2Open.withLockedValue { $0 } == false
         }
 
         try await clientChannel.close().get()

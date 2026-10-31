@@ -23,7 +23,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class QUICHandlerTests: XCTestCase {
+final class QUICHandlerTests: StreamChannelsTestCase {
     private static let statelessResetKey = [UInt8](repeating: 0x5A, count: 32)
 
     private var eventLoop: EmbeddedEventLoop!
