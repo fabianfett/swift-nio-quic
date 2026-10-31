@@ -113,6 +113,29 @@ final class TestStreamOperations<Consumer: QUICStreamConsumer & ~Copyable>: QUIC
         }
     }
 
+    /// The peer sent RESET\_STREAM on stream `id`: what wasn't read is dropped, as a connection
+    /// does (RFC 9000 Section 3.2).
+    func peerResets(_ id: QUICStreamID, code: QUICApplicationErrorCode) {
+        self.streams[id]?.inbound = []
+        if let table = self.table, let handle = table.handle(forID: id) {
+            table.peerResetStream(handle, code: code)
+        }
+    }
+
+    /// The peer sent STOP\_SENDING on stream `id`, which a connection answers with RESET\_STREAM.
+    func peerStopsSending(_ id: QUICStreamID, code: QUICApplicationErrorCode) {
+        if let table = self.table, let handle = table.handle(forID: id) {
+            table.peerStoppedSending(handle, code: code)
+        }
+    }
+
+    /// Both directions of stream `id` are done, and the connection forgot it.
+    func streamCloses(_ id: QUICStreamID) {
+        if let table = self.table, let handle = table.handle(forID: id) {
+            table.streamDisconnected(handle, error: nil)
+        }
+    }
+
     /// The peer allows `count` more streams of a kind: queued ones open.
     func raiseLimit(bidirectional: Bool, by count: Int) {
         if bidirectional {

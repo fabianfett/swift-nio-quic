@@ -416,6 +416,19 @@ extension QUICStreamTable where Consumer: ~Copyable {
         return try body(&stream, &consumerState.pointee!)  // checked above
     }
 
+    /// Runs `body` on the consumer's state of every stream that has one, in slot order.
+    ///
+    /// `body` must not reach the table: collect what it needs, and act on it afterwards.
+    func forEachStreamState(_ body: (inout Consumer.StreamState) -> Void) {
+        var index = QUICStreamHandle.Index.first
+        while index.rawValue < self._transportStates.allocated {
+            if let transport = self._transportStates.pointer(at: index), transport.pointee.hasState {
+                body(&self._consumerStates.pointer(at: index).pointee!)
+            }
+            index.advance()
+        }
+    }
+
     /// The direction of a stream from its ID and this endpoint's role.
     private func direction(of id: QUICStreamID) -> QUICStreamDirection {
         switch id.type {
