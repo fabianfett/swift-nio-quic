@@ -13,7 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import NIOCore
-@_spi(Essentials) import SwiftNetwork
+@_spi(Essentials) import QUICStateMachine
 
 /// What a ``StateMachineTimerQueue`` calls once the deadline it armed is due.
 @available(anyAppleOS 26, *)

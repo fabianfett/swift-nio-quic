@@ -12,12 +12,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
+@_spi(Essentials) @_spi(ProtocolProvider) import QUICStateMachine
 
 @available(anyAppleOS 26, *)
 extension NIOQUIC.QUICConnectionID {
-    /// Creates a NIOQUIC connection ID from a SwiftNetwork connection ID.
-    init(_ connectionID: SwiftNetwork.QUICConnectionID) {
+    /// Creates a NIOQUIC connection ID from a QUICStateMachine connection ID.
+    init(_ connectionID: QUICStateMachine.QUICConnectionID) {
         self.init(
             bytes: connectionID.connectionIDStorage,
             length: UInt8(connectionID.length)
@@ -26,8 +26,8 @@ extension NIOQUIC.QUICConnectionID {
 }
 
 @available(anyAppleOS 26, *)
-extension SwiftNetwork.QUICConnectionID {
-    /// Creates a SwiftNetwork connection ID from a NIOQUIC connection ID.
+extension QUICStateMachine.QUICConnectionID {
+    /// Creates a QUICStateMachine connection ID from a NIOQUIC connection ID.
     init(_ connectionID: NIOQUIC.QUICConnectionID) {
         self.init(
             storage: connectionID.bytes,

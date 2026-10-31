@@ -16,11 +16,11 @@ import DequeModule
 import Logging
 import NIOCore
 import NIOQUICHelpers
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
+@_spi(Essentials) @_spi(ProtocolProvider) import QUICStateMachine
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
 
-/// A QUIC connection driven directly from NIO through SwiftNetwork's `QUICConnectionCore`, without
-/// the SwiftNetwork framework.
+/// A QUIC connection driven directly from NIO through the `QUICConnectionCore` of
+/// swift-network-evolution's QUICStateMachine, without the SwiftNetwork framework.
 ///
 /// Inbound datagrams are decrypted in place in their `ByteBuffer`s, the outbound datagrams of a
 /// drain are written back to back into one `ByteBuffer` (see ``DatagramBatch``), and the timer is a
@@ -302,13 +302,22 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private static var minimumPMTUDMTU: Int { 1280 }
 
     /// The size of the IP and UDP headers of a datagram to `address`: 28 bytes over IPv4, 48 over
-    /// IPv6. An IPv4-mapped IPv6 address goes over IPv4.
+    /// IPv6. An IPv4-mapped IPv6 address (RFC 4291 Section 2.5.5.2) goes over IPv4.
     private static func ipUDPHeaderSize(to address: SocketAddress) -> Int {
-        // SwiftNetwork's endpoint for an IPv4-mapped address is the IPv4 address.
-        if case .v6 = address.addressEndpointType {
+        switch address {
+        case .v4:
+            return 28
+        case .v6(let address):
+            let words = withUnsafeBytes(of: address.address.sin6_addr) {
+                $0.loadUnaligned(as: (UInt32, UInt32, UInt32, UInt32).self)
+            }
+            if words.0 == 0, words.1 == 0, words.2 == UInt32(0x0000_ffff).bigEndian {
+                return 28
+            }
             return 48
+        case .unixDomainSocket:
+            preconditionFailure("QUIC runs over UDP")
         }
-        return 28
     }
 
     static func client(
@@ -330,8 +339,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         let core = QUICConnectionCore(
             clientWith: coreConfiguration,
-            localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
-            destinationConnectionID: SwiftNetwork.QUICConnectionID(8),
+            localConnectionID: QUICStateMachine.QUICConnectionID(sourceConnectionID),
+            destinationConnectionID: QUICStateMachine.QUICConnectionID(8),
             now: Self.now
         )
         let connection = StateMachineQUICConnection(
@@ -371,10 +380,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         )
         let core = QUICConnectionCore(
             serverWith: coreConfiguration,
-            localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
-            originalDestinationConnectionID: SwiftNetwork.QUICConnectionID(originalDestinationConnectionID),
-            peerConnectionID: peerConnectionID.map { SwiftNetwork.QUICConnectionID($0) }
-                ?? SwiftNetwork.QUICConnectionID(0),
+            localConnectionID: QUICStateMachine.QUICConnectionID(sourceConnectionID),
+            originalDestinationConnectionID: QUICStateMachine.QUICConnectionID(originalDestinationConnectionID),
+            peerConnectionID: peerConnectionID.map { QUICStateMachine.QUICConnectionID($0) }
+                ?? QUICStateMachine.QUICConnectionID(0),
             now: Self.now
         )
         let connection = StateMachineQUICConnection(

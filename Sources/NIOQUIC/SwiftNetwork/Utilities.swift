@@ -13,23 +13,6 @@
 //===----------------------------------------------------------------------===//
 
 import NIOQUICHelpers
-@_spi(Essentials) import SwiftNetwork
-
-@available(anyAppleOS 26, *)
-extension NetworkDuration {
-    init(duration: Duration) {
-        let components = duration.components
-        let secondsComponentNanos = components.seconds.multipliedReportingOverflow(by: 1_000_000_000)
-        let attosecondsComponentNanos = components.attoseconds / 1_000_000_000
-        let combinedNanos = secondsComponentNanos.partialValue.addingReportingOverflow(attosecondsComponentNanos)
-
-        if !secondsComponentNanos.overflow, !combinedNanos.overflow, combinedNanos.partialValue <= Int64.max {
-            self = Self.nanoseconds(combinedNanos.partialValue)
-        } else {
-            self = Self.nanoseconds(Int64.max)
-        }
-    }
-}
 
 /// Generator for IDs with a numeric value that cannot be accessed from the `ID` type. IDs are backed by
 /// a `Counter` that must conform to `FixedWidthInteger` and `Hashable`. The internal ID will
