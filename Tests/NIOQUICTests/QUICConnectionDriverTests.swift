@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Logging
+import NIOEmbedded
 import Testing
 
 @testable import NIOQUIC
@@ -63,6 +65,29 @@ struct QUICConnectionDriverTests {
         for configuration in [keepalive, versionNegotiation, packetSize, noDatagrams, keyLog] {
             #expect(QUICConnectionDriver.stateMachineSupports(configuration))
         }
+    }
+
+    /// Handlers whose streams are stream channels default to the driver of those with stream
+    /// consumers: the state machine, unless `NIOQUIC_DRIVER` says otherwise.
+    @Test(arguments: [Role.client, .server])
+    @available(anyAppleOS 26, *)
+    func streamChannelsDefaultToTheConsumersDriver(role: Role) throws {
+        try #require(QUICConnectionDriver._forTesting_streamChannelsDriver.withLock { $0 } == nil)
+        #expect(QUICConnectionDriver.defaultForStreamChannels(for: role) == QUICConnectionDriver.default(for: role))
+
+        let channel = EmbeddedChannel()
+        defer { _ = try? channel.finish() }
+        let handler = QUICHandler<QUICStreamChannels>(
+            channel: channel,
+            quicConfiguration: Self.configuration,
+            asyncVerifier: nil,
+            authenticator: nil,
+            logger: Logger(label: "test"),
+            inboundConnectionInitializer: { channel, _ in channel.eventLoop.makeSucceededVoidFuture() },
+            inboundStreamInitializer: { channel in channel.eventLoop.makeSucceededVoidFuture() },
+            noMoreConnections: {}
+        )
+        #expect(handler.connectionDriver == QUICConnectionDriver.default(for: .client))
     }
 
     /// Every configuration property is either implemented by the state machine driver or checked

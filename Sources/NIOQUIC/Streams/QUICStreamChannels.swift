@@ -19,6 +19,11 @@ import NIOQUICHelpers
 ///
 /// The handler makes it for connections whose streams are surfaced as child channels, see
 /// ``QUICHandler``: it can't be made otherwise.
+///
+/// A stream channel reads from its stream only while a `read()` is pending, so the peer's flow
+/// control limits hold it back while the application doesn't read. Its writes are queued on the
+/// stream until they can be sent, and it is always writable: it doesn't stop accepting writes when
+/// the peer's flow control limits are reached yet.
 @available(anyAppleOS 26, *)
 public struct QUICStreamChannels: QUICStreamConsumer {
     /// The channel of a stream.

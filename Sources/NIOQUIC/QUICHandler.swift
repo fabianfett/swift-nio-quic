@@ -1652,26 +1652,15 @@ enum QUICConnectionDriver: Hashable, Sendable {
         configuration.qLogConfiguration == nil && !configuration.sendRetry
     }
 
-    /// The default for the stream channels of a role, behind the `NIOQUIC_DRIVER` switch while
-    /// the state machine driver learns them: ``swiftNetwork``, unless the variable is
-    /// `state-machine`, which selects ``stateMachine`` for both roles, or `state-machine-server` or
-    /// `state-machine-client`, which select it for one role.
+    /// The default for the stream channels of a role: as for stream consumers, see
+    /// ``default(for:)``.
     static func defaultForStreamChannels(for role: Role) -> Self {
         #if DEBUG
         if let driver = Self._forTesting_streamChannelsDriver.withLock({ $0 }) {
             return driver
         }
         #endif
-        switch Self.setting {
-        case "state-machine":
-            return .stateMachine
-        case "state-machine-server":
-            return role == .server ? .stateMachine : .swiftNetwork
-        case "state-machine-client":
-            return role == .client ? .stateMachine : .swiftNetwork
-        default:
-            return .swiftNetwork
-        }
+        return Self.default(for: role)
     }
 
     #if DEBUG
