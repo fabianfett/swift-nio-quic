@@ -26,7 +26,9 @@ import NIOQUICHelpers
 /// drain are written back to back into one `ByteBuffer` (see ``DatagramBatch``), and the timer is a
 /// slot in the ``StateMachineTimerQueue`` of the connection's handler.
 @available(anyAppleOS 26, *)
-final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>: StateMachineTimerTarget {
+final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>: StateMachineTimerTarget,
+    QUICStreamOperations
+{
     private var core: QUICConnectionCore
     let role: Role
     let localAddress: SocketAddress

@@ -814,16 +814,18 @@ extension QUICStreamCore {
     }
 }
 
-// MARK: - State machine backed operations
+// MARK: - Operations backed
 
-/// The stream operations for a stream a ``StateMachineQUICConnection`` drives. They make the same
-/// state transitions as the `SwiftNetwork` ones; only the calls into the stack differ.
+/// The stream operations for a stream on ``QUICStreamOperations``, as those of a
+/// ``StateMachineQUICConnection``. They make the same state transitions as the `SwiftNetwork`
+/// ones; only the calls into the stack differ.
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// Hands the stream's readable bytes to `body`. See ``read(minContiguous:withEventContext:_:)``.
-    mutating func read<Consumer: QUICStreamConsumer & ~Copyable>(
+    /// Hands the stream's readable bytes to `body` until it stops consuming them. See
+    /// ``read(minContiguous:withEventContext:_:)``.
+    mutating func read(
         minContiguous: Int,
-        from stateMachine: StateMachineQUICConnection<Consumer>,
+        from operations: some QUICStreamOperations,
         id: QUICStreamID,
         _ body: (_ span: borrowing RawSpan) -> Int
     ) -> QUICStreamReadOutcome {
@@ -845,19 +847,26 @@ extension QUICStreamCore {
         var delivered = 0
         var leftOver = false
         var reachedEnd = false
-        _ = stateMachine.read(id) { bytes, isFinished in
-            let available = bytes.byteCount
+        // The stack hands over all contiguous bytes at once. What `body` leaves is handed over
+        // again, as on the `SwiftNetwork` path, until `body` takes nothing more.
+        while true {
             var consumed = 0
-            if available > 0 && (available >= contiguous || isFinished) {
-                let wanted = body(bytes)
-                assert(wanted >= 0, "body(_:) claimed to read negative bytes")
-                assert(wanted <= available, "body(_:) claimed to read more bytes than available")
-                consumed = min(max(wanted, 0), available)
+            let found: Void? = operations.read(id) { bytes, isFinished in
+                let available = bytes.byteCount
+                if available > 0 && (available >= contiguous || isFinished) {
+                    let wanted = body(bytes)
+                    assert(wanted >= 0, "body(_:) claimed to read negative bytes")
+                    assert(wanted <= available, "body(_:) claimed to read more bytes than available")
+                    consumed = min(max(wanted, 0), available)
+                }
+                leftOver = consumed < available
+                reachedEnd = isFinished && !leftOver
+                return (consumed, ())
             }
-            delivered = consumed
-            leftOver = consumed < available
-            reachedEnd = isFinished && !leftOver
-            return (consumed, ())
+            delivered &+= consumed
+            if found == nil || consumed == 0 || !leftOver {
+                break
+            }
         }
 
         if delivered > 0 {
@@ -879,18 +888,13 @@ extension QUICStreamCore {
     }
 
     /// How many bytes the stream will accept right now. See ``writableBytes(in:)``.
-    func writableBytes<Consumer: QUICStreamConsumer & ~Copyable>(
-        on stateMachine: StateMachineQUICConnection<Consumer>
-    ) -> Int {
+    func writableBytes(on operations: some QUICStreamOperations) -> Int {
         guard let id = self.id, !self.state.isSendFinished else { return 0 }
-        return stateMachine.writableBytes(id)
+        return operations.writableBytes(id)
     }
 
-    /// Hands queued writes to the state machine. See ``flush(fin:in:)``.
-    mutating func flush<Consumer: QUICStreamConsumer & ~Copyable>(
-        fin: Bool,
-        to stateMachine: StateMachineQUICConnection<Consumer>
-    ) throws {
+    /// Hands queued writes to `operations`. See ``flush(fin:in:)``.
+    mutating func flush(fin: Bool, to operations: some QUICStreamOperations) throws {
         if self.pendingWrites.isEmpty && !fin { return }
 
         var dropWritesOnRefusal = true
@@ -952,7 +956,7 @@ extension QUICStreamCore {
         var outgoing = self.pendingWrites.drainArray()
         outgoing.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
             if !refused, let bytes = frame.bytes, bytes.byteCount > 0 {
-                refused = stateMachine.write(bytes, to: id, fin: false) < bytes.byteCount
+                refused = operations.write(bytes, to: id, fin: false) < bytes.byteCount
             }
             frame.finalize(success: !refused)
             return .removeFrameAndContinue
@@ -962,15 +966,12 @@ extension QUICStreamCore {
             throw NetworkError.posix(ENOTCONN)
         }
         if carriesFin {
-            stateMachine.finish(id)
+            operations.finish(id)
         }
     }
 
     /// Resets the send side. See ``sendResetStream(code:in:)``.
-    mutating func sendResetStream<Consumer: QUICStreamConsumer & ~Copyable>(
-        code: QUICApplicationErrorCode,
-        on stateMachine: StateMachineQUICConnection<Consumer>
-    ) {
+    mutating func sendResetStream(code: QUICApplicationErrorCode, on operations: some QUICStreamOperations) {
         let action: QUICStreamStateMachine.LocalResetAction
         do {
             action = try self.state.localReset(applicationErrorCode: code)
@@ -981,7 +982,7 @@ extension QUICStreamCore {
         case .sendReset:
             self.pendingWrites.finalizeAllFramesAsFailed()
             if let id = self.id {
-                stateMachine.resetStream(id, code: code)
+                operations.resetStream(id, code: code)
             }
         case .ignore(.alreadyFinished):
             ()
@@ -991,10 +992,7 @@ extension QUICStreamCore {
     }
 
     /// Closes the receive side. See ``sendStopSending(code:in:)``.
-    mutating func sendStopSending<Consumer: QUICStreamConsumer & ~Copyable>(
-        code: QUICApplicationErrorCode,
-        on stateMachine: StateMachineQUICConnection<Consumer>
-    ) {
+    mutating func sendStopSending(code: QUICApplicationErrorCode, on operations: some QUICStreamOperations) {
         let action: QUICStreamStateMachine.CloseReadSideAction
         do {
             action = try self.state.closeReadSide()
@@ -1006,7 +1004,7 @@ extension QUICStreamCore {
             self.undeliveredReads.finalizeAllFramesAsFailed()
             self.finPending = false
             if let id = self.id {
-                stateMachine.stopSending(id, code: code)
+                operations.stopSending(id, code: code)
             }
         case .ignoreAlreadyClosed:
             ()
@@ -1033,10 +1031,7 @@ extension QUICStreamCore {
     }
 
     /// Tears the stream down. Whatever direction is still open is aborted in the state machine.
-    mutating func close<Consumer: QUICStreamConsumer & ~Copyable>(
-        on stateMachine: StateMachineQUICConnection<Consumer>,
-        id: QUICStreamID
-    ) {
+    mutating func close(on operations: some QUICStreamOperations, id: QUICStreamID) {
         let sendOpen = !self.state.isSendFinished
         let receiveOpen = !self.state.isReceiveClosed
         switch self.state.close(reason: .clean) {
@@ -1046,10 +1041,10 @@ extension QUICStreamCore {
             ()
         }
         if sendOpen {
-            stateMachine.resetStream(id, code: QUICApplicationErrorCode(0)!)
+            operations.resetStream(id, code: QUICApplicationErrorCode(0)!)
         }
         if receiveOpen {
-            stateMachine.stopSending(id, code: QUICApplicationErrorCode(0)!)
+            operations.stopSending(id, code: QUICApplicationErrorCode(0)!)
         }
         self.abandonLocally()
         self.finPending = false

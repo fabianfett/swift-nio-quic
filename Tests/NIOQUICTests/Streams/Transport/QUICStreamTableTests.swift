@@ -108,12 +108,12 @@ private struct Boom: Error {}
 struct QUICStreamTableTests {
     @available(anyAppleOS 26, *)
     private static func makeTable(role: Role = .client) -> QUICStreamTable<TestConsumer> {
-        QUICStreamTable(role: role)
+        TestStreamOperations.makeTable(role: role).0
     }
 
     @available(anyAppleOS 26, *)
     private static func makeRecordingTable(role: Role = .client) -> QUICStreamTable<RecordingConsumer> {
-        QUICStreamTable(role: role)
+        TestStreamOperations.makeTable(role: role).0
     }
 
     // MARK: - ID indexing
@@ -538,6 +538,123 @@ struct QUICStreamTableTests {
     }
 
     @available(anyAppleOS 26, *)
+    @Test(arguments: [Role.client, .server], [true, false])
+    func openAssignsAnIDAndReportsTheStreamOpened(role: Role, bidirectional: Bool) throws {
+        let (table, operations) = TestStreamOperations<RecordingConsumer>.makeTable(role: role)
+        defer { table.retireAnchor() }
+        var consumer = RecordingConsumer()
+
+        let type: QUICStreamType
+        switch (role, bidirectional) {
+        case (.client, true): type = .clientInitiatedBidirectional
+        case (.client, false): type = .clientInitiatedUnidirectional
+        case (.server, true): type = .serverInitiatedBidirectional
+        case (.server, false): type = .serverInitiatedUnidirectional
+        }
+        let first = try table.open(type, state: .init(madeAt: 1))
+        let second = try table.open(type, state: .init(madeAt: 2))
+
+        let firstID = try #require(table.withStream(handle: first) { stream, _ in stream.id } ?? nil)
+        let secondID = try #require(table.withStream(handle: second) { stream, _ in stream.id } ?? nil)
+        #expect(QUICStreamType(firstID) == type)
+        #expect(secondID.rawValue == firstID.rawValue + 4)
+        #expect(table.handle(forID: firstID) == first)
+        #expect(operations[firstID] != nil)
+
+        table.drain(into: &consumer)
+        #expect(consumer.sightings.map(\.handle) == [first, second])
+        #expect(consumer.sightings.allSatisfy { $0.events == .opened })
+        #expect(consumer.madeStates == 0)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func openBeyondTheStreamLimitWaitsForTheLimitToRise() throws {
+        let (table, operations) = TestStreamOperations<RecordingConsumer>.makeTable(
+            role: .client,
+            bidirectionalLimit: 1
+        )
+        defer { table.retireAnchor() }
+        var consumer = RecordingConsumer()
+
+        let first = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
+        let second = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 2))
+        #expect(table.withStream(handle: second) { stream, _ in stream.id } == .some(nil))
+        #expect(operations.pendingOpens.map(\.handle) == [second])
+
+        // A flush before the ID arrives is refused, and keeps what was written.
+        table.withStream(handle: second) { stream, _ in
+            stream.write(ByteBuffer(string: "early"))
+            #expect(throws: (any Error).self) { try stream.flush() }
+        }
+
+        table.drain(into: &consumer)
+        #expect(consumer.sightings.map(\.handle) == [first])
+
+        operations.raiseLimit(bidirectional: true, by: 1)
+        let id = try #require(table.withStream(handle: second) { stream, _ in stream.id } ?? nil)
+        #expect(id == 4)
+        try table.withStream(handle: second) { stream, _ in try stream.flush(fin: true) }
+        #expect(operations[id]?.outboundString == "early")
+        #expect(operations[id]?.finished == true)
+
+        table.drain(into: &consumer)
+        #expect(consumer.sightings.map(\.handle) == [first, second])
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func vacatingAStreamWaitingForTheLimitCancelsItsOpen() throws {
+        let (table, operations) = TestStreamOperations<RecordingConsumer>.makeTable(
+            role: .client,
+            bidirectionalLimit: 0
+        )
+        defer { table.retireAnchor() }
+
+        let handle = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
+        #expect(operations.pendingOpens.count == 1)
+        table.vacateSlot(handle)
+        #expect(operations.pendingOpens.isEmpty)
+        #expect(table.count == 0)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func openAfterCloseAllThrowsAndAddsNothing() {
+        let table = Self.makeRecordingTable(role: .client)
+        var consumer = RecordingConsumer()
+        table.closeAll(error: nil, disconnect: nil, into: &consumer)
+
+        #expect(throws: QUICError.invalidStreamState) {
+            _ = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
+        }
+        #expect(table.count == 0)
+    }
+
+    @available(anyAppleOS 26, *)
+    @Test
+    func closingAStreamStopsBothDirectionsLeftOpen() throws {
+        let (table, operations) = TestStreamOperations<RecordingConsumer>.makeTable(role: .client)
+        defer { table.retireAnchor() }
+
+        let handle = try table.open(.clientInitiatedBidirectional, state: .init(madeAt: 1))
+        let id = try #require(table.withStream(handle: handle) { stream, _ in stream.id } ?? nil)
+        table.vacateSlot(handle)
+
+        #expect(operations[id]?.resetCode == QUICApplicationErrorCode(0))
+        #expect(operations[id]?.stopSendingCode == QUICApplicationErrorCode(0))
+    }
+}
+
+/// The tests of a table on the `SwiftNetwork` stack. They go with it.
+@Suite
+struct QUICStreamTableSwiftNetworkTests {
+    @available(anyAppleOS 26, *)
+    private static func makeRecordingTable(role: Role = .client) -> QUICStreamTable<RecordingConsumer> {
+        QUICStreamTable(role: role)
+    }
+
+    @available(anyAppleOS 26, *)
     @Test
     func openWithoutAConnectionBehindTheTableThrows() {
         let table = Self.makeRecordingTable(role: .client)
@@ -551,7 +668,7 @@ struct QUICStreamTableTests {
 
     @available(anyAppleOS 26, *)
     @Test
-    func openAfterCloseAllThrowsAndAddsNothing() {
+    func openAfterCloseAllThrowsAndAddsNothingOnTheStack() {
         let table = Self.makeRecordingTable(role: .client)
         table.opener = .unreachable(context: table.context)
         var consumer = RecordingConsumer()

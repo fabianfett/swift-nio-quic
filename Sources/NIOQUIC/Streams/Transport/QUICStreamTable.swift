@@ -125,17 +125,28 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         let anchor: EventContextAnchor
     }
 
-    /// The `SwiftNetwork` stack, or `nil` if a ``StateMachineQUICConnection`` drives the streams.
-    private let swiftNetwork: SwiftNetworkBacking?
+    /// What carries the table's streams.
+    enum Backend {
+        /// The `SwiftNetwork` stack.
+        case swiftNetwork(SwiftNetworkBacking)
+        /// A connection driving the streams through its `QUICConnectionCore`. Held strongly;
+        /// ``retireAnchor()`` breaks the cycle with the connection.
+        case stateMachine(StateMachineQUICConnection<Consumer>)
+        /// Operations without a connection behind them, for tests. Held strongly, as above.
+        case test(any QUICStreamOperations)
+        /// A table not on the `SwiftNetwork` stack after ``retireAnchor()``: it has nothing to
+        /// run its streams on.
+        case closed
+    }
 
-    /// The connection driving the streams through its `QUICConnectionCore`, or `nil` if they run on
-    /// the `SwiftNetwork` stack.
-    ///
-    /// Held strongly; ``retireAnchor()`` breaks the cycle with the connection.
-    var stateMachine: StateMachineQUICConnection<Consumer>?
+    /// What carries the table's streams.
+    private(set) var backend: Backend
 
-    /// Whether a state machine backed table was closed.
-    private var stateMachineClosed = false
+    /// The `SwiftNetwork` stack, or `nil` if the streams don't run on it.
+    private var swiftNetwork: SwiftNetworkBacking? {
+        guard case .swiftNetwork(let backing) = self.backend else { return nil }
+        return backing
+    }
 
     /// Context for the `SwiftNetwork` stack.
     var context: NetworkContext { self.swiftNetwork!.context }
@@ -147,26 +158,30 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     var anchor: EventContextAnchor { self.swiftNetwork!.anchor }
 
     /// Creates a table whose streams a ``StateMachineQUICConnection`` drives.
-    init(role: Role, stateMachine: StateMachineQUICConnection<Consumer>) {
-        self._transportStates = QUICStreamSlots()
-        self._consumerStates = QUICStreamConsumerStates()
-        self._ready = []
-        self._needsState = []
-        self._byID = QUICStreamIDDictionary()
-        self._byFlowIdentifier = [:]
-        self._pendingAttachIdentifier = InstanceIdentifier()
-        self._pendingAttachLinkage = nil
-        self._outputPending = false
-        self.opener = nil
-        self.inReadLoop = false
-        self.outOfBandDrainRequested = false
-        self.role = role
-        self.swiftNetwork = nil
-        self.stateMachine = stateMachine
+    convenience init(role: Role, stateMachine: StateMachineQUICConnection<Consumer>) {
+        self.init(role: role, backend: .stateMachine(stateMachine))
+    }
+
+    /// Creates a table whose streams run on `operations`, without a connection: for tests.
+    convenience init(role: Role, operations: any QUICStreamOperations) {
+        self.init(role: role, backend: .test(operations))
     }
 
     /// Creates a table. Must be called with no event context held: it registers the table's anchor.
-    init(role: Role, context: NetworkContext, callouts: QUICCallouts) {
+    convenience init(role: Role, context: NetworkContext, callouts: QUICCallouts) {
+        self.init(
+            role: role,
+            backend: .swiftNetwork(
+                SwiftNetworkBacking(
+                    context: context,
+                    callouts: callouts,
+                    anchor: EventContextAnchor(context: context)
+                )
+            )
+        )
+    }
+
+    private init(role: Role, backend: Backend) {
         self._transportStates = QUICStreamSlots()
         self._consumerStates = QUICStreamConsumerStates()
         self._ready = []
@@ -180,12 +195,7 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         self.inReadLoop = false
         self.outOfBandDrainRequested = false
         self.role = role
-        self.swiftNetwork = SwiftNetworkBacking(
-            context: context,
-            callouts: callouts,
-            anchor: EventContextAnchor(context: context)
-        )
-        self.stateMachine = nil
+        self.backend = backend
     }
 
     deinit {
@@ -219,10 +229,14 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// Whether the table has closed: its anchor is retired, and it takes no new streams.
     var isClosed: Bool {
-        if let swiftNetwork = self.swiftNetwork {
+        switch self.backend {
+        case .swiftNetwork(let swiftNetwork):
             return swiftNetwork.anchor.identifier.isNone
+        case .stateMachine, .test:
+            return false
+        case .closed:
+            return true
         }
-        return self.stateMachineClosed
     }
 }
 
@@ -650,9 +664,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// state for the stream only once that acquisition has ended: the state's deinit is consumer code.
     func vacateSlot(_ handle: QUICStreamHandle) {
         let state = self.takeConsumerState(for: handle)
-        if let stateMachine = self.stateMachine {
-            self._remove(handle: handle, stateMachine: stateMachine)
-        } else {
+        switch self.backend {
+        case .stateMachine(let connection):
+            self._remove(handle: handle, operations: connection)
+        case .test(let operations):
+            self._remove(handle: handle, operations: operations)
+        case .swiftNetwork, .closed:
             self.withEventContext { eventContext in
                 self._remove(handle: handle, in: &eventContext)
             }
@@ -693,16 +710,16 @@ extension QUICStreamTable where Consumer: ~Copyable {
         self._consumerStates.removeValue(at: handle.index)
     }
 
-    /// Closes a slot's stream in the state machine and vacates the slot.
-    private func _remove(handle: QUICStreamHandle, stateMachine: StateMachineQUICConnection<Consumer>) {
+    /// Closes a slot's stream on `operations` and vacates the slot.
+    private func _remove(handle: QUICStreamHandle, operations: some QUICStreamOperations) {
         guard let transport = self._transportStates.pointer(for: handle) else { return }
 
         if let id = transport.pointee.core.id {
             let removed = self._byID.removeValue(forID: id)
             assert(removed == handle)
-            transport.pointee.core.close(on: stateMachine, id: id)
+            transport.pointee.core.close(on: operations, id: id)
         } else {
-            stateMachine.cancelPendingOpen(handle)
+            operations.cancelPendingOpen(handle)
             transport.pointee.core.abandonLocally()
         }
 
@@ -781,12 +798,14 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Retires the table's anchor, after which its operations can't acquire the event context.
     /// Idempotent.
     func retireAnchor() {
-        if let swiftNetwork = self.swiftNetwork {
+        switch self.backend {
+        case .swiftNetwork(let swiftNetwork):
             swiftNetwork.anchor.retire(through: swiftNetwork.callouts)
-        } else {
-            self.stateMachineClosed = true
-            // Break the cycle with the connection.
-            self.stateMachine = nil
+        case .stateMachine, .test:
+            // Breaks the cycle with the connection.
+            self.backend = .closed
+        case .closed:
+            ()
         }
     }
 }
@@ -815,61 +834,79 @@ extension QUICStreamTable where Consumer: ~Copyable {
             id.map {
                 min(minContiguous, self.receiveWindows.largestMinContiguous(for: $0, role: self.role))
             } ?? minContiguous
-        if let stateMachine = self.stateMachine {
+        switch self.backend {
+        case .stateMachine(let connection):
             guard let id else { return .nothingAvailable }
-            return transport.pointee.core.read(minContiguous: minContiguous, from: stateMachine, id: id, body)
+            return transport.pointee.core.read(minContiguous: minContiguous, from: connection, id: id, body)
+        case .test(let operations):
+            guard let id else { return .nothingAvailable }
+            return transport.pointee.core.read(minContiguous: minContiguous, from: operations, id: id, body)
+        case .swiftNetwork, .closed:
+            return transport.pointee.core.read(
+                minContiguous: minContiguous,
+                withEventContext: { pull in self.withEventContext(pull) },
+                body
+            )
         }
-        return transport.pointee.core.read(
-            minContiguous: minContiguous,
-            withEventContext: { pull in self.withEventContext(pull) },
-            body
-        )
     }
 
     /// How many bytes the stream `transport` belongs to will accept right now.
     @usableFromInline
     func writableBytes(_ transport: UnsafeMutablePointer<QUICStreamTransportState>) -> Int {
-        if let stateMachine = self.stateMachine {
-            return transport.pointee.core.writableBytes(on: stateMachine)
-        }
-        return self.withEventContext { eventContext in
-            transport.pointee.core.writableBytes(in: &eventContext)
+        switch self.backend {
+        case .stateMachine(let connection):
+            return transport.pointee.core.writableBytes(on: connection)
+        case .test(let operations):
+            return transport.pointee.core.writableBytes(on: operations)
+        case .swiftNetwork, .closed:
+            return self.withEventContext { eventContext in
+                transport.pointee.core.writableBytes(in: &eventContext)
+            }
         }
     }
 
     /// Writes the queued data of the stream `transport` belongs to.
     @usableFromInline
     func flush(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, fin: Bool) throws {
-        if let stateMachine = self.stateMachine {
-            try transport.pointee.core.flush(fin: fin, to: stateMachine)
-            return
-        }
-        try self.withEventContext { eventContext in
-            try transport.pointee.core.flush(fin: fin, in: &eventContext)
+        switch self.backend {
+        case .stateMachine(let connection):
+            try transport.pointee.core.flush(fin: fin, to: connection)
+        case .test(let operations):
+            try transport.pointee.core.flush(fin: fin, to: operations)
+        case .swiftNetwork, .closed:
+            try self.withEventContext { eventContext in
+                try transport.pointee.core.flush(fin: fin, in: &eventContext)
+            }
         }
     }
 
     /// Resets the send side of the stream `transport` belongs to.
     @usableFromInline
     func sendResetStream(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
-        if let stateMachine = self.stateMachine {
-            transport.pointee.core.sendResetStream(code: code, on: stateMachine)
-            return
-        }
-        self.withEventContext { eventContext in
-            transport.pointee.core.sendResetStream(code: code, in: &eventContext)
+        switch self.backend {
+        case .stateMachine(let connection):
+            transport.pointee.core.sendResetStream(code: code, on: connection)
+        case .test(let operations):
+            transport.pointee.core.sendResetStream(code: code, on: operations)
+        case .swiftNetwork, .closed:
+            self.withEventContext { eventContext in
+                transport.pointee.core.sendResetStream(code: code, in: &eventContext)
+            }
         }
     }
 
     /// Closes the receive side of the stream `transport` belongs to.
     @usableFromInline
     func sendStopSending(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
-        if let stateMachine = self.stateMachine {
-            transport.pointee.core.sendStopSending(code: code, on: stateMachine)
-            return
-        }
-        self.withEventContext { eventContext in
-            transport.pointee.core.sendStopSending(code: code, in: &eventContext)
+        switch self.backend {
+        case .stateMachine(let connection):
+            transport.pointee.core.sendStopSending(code: code, on: connection)
+        case .test(let operations):
+            transport.pointee.core.sendStopSending(code: code, on: operations)
+        case .swiftNetwork, .closed:
+            self.withEventContext { eventContext in
+                transport.pointee.core.sendStopSending(code: code, in: &eventContext)
+            }
         }
     }
 }

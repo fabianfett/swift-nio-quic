@@ -15,65 +15,69 @@
 #if DEBUG  // These tests rely on debug only API.
 
 import NIOCore
-import NIOEmbedded
 import NIOQUICHelpers
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 import Testing
 
-@_spi(Essentials) @_spi(ProtocolProvider) @testable import NIOQUIC
+@testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-extension QUICStreamCore {
-    fileprivate mutating func hold(_ chunks: [String]) {
-        var frames = FrameArray()
+private enum NoConsumer: QUICStreamConsumer {
+    typealias StreamState = Never
 
-        for chunk in chunks {
-            frames.add(frame: Frame(copyBuffer: Array(chunk.utf8)))
+    mutating func makeStreamState(_ stream: inout NIOQUIC.QUICStream<Self>) -> Never {
+        fatalError("no streams are made")
+    }
+
+    mutating func processStreams(_ streams: inout QUICStreamIterator<Self>) {}
+}
+
+/// A stream core on stream operations without a connection, as a state machine connection's.
+@available(anyAppleOS 26, *)
+private struct TestCore: ~Copyable {
+    static var id: QUICStreamID { 0 }
+
+    var core: QUICStreamCore
+    let operations: TestStreamOperations<NoConsumer>
+
+    /// A connected client bidirectional stream, or one waiting for its ID.
+    init(connected: Bool = true) {
+        self.operations = TestStreamOperations(role: .client)
+        if connected {
+            self.core = QUICStreamCore(id: nil)
+            _ = self.core.connected(id: Self.id, direction: .bidirectional)
+            // The peer's data arrives on stream 0.
+            self.operations.receive("", on: Self.id)
+        } else {
+            self.core = QUICStreamCore(id: nil)
         }
-
-        self._forTesting_addUndeliveredReads(frames)
     }
 
-    fileprivate var holdsNothing: Bool {
-        !self._forTesting_hasUndeliveredReads
+    /// The peer sent `chunks`, which the operations hold contiguously, as a connection does.
+    func hold(_ chunks: [String], fin: Bool = false) {
+        for chunk in chunks {
+            self.operations.receive(chunk, on: Self.id)
+        }
+        if fin {
+            self.operations.receive("", fin: true, on: Self.id)
+        }
     }
 
-    fileprivate mutating func expectFlushRefused(fin: Bool) {
+    var holdsNothing: Bool {
+        self.operations[Self.id]?.inbound.isEmpty ?? true
+    }
+
+    mutating func read(minContiguous: Int, _ body: (_ span: borrowing RawSpan) -> Int) -> QUICStreamReadOutcome {
+        self.core.read(minContiguous: minContiguous, from: self.operations, id: Self.id, body)
+    }
+
+    mutating func expectFlushRefused(fin: Bool) {
         do {
-            try withTestEventContext { eventContext in try self.flush(fin: fin, in: &eventContext) }
+            try self.core.flush(fin: fin, to: self.operations)
             Issue.record("Expected flush to be refused")
         } catch {
             ()  // Refused, as expected.
         }
     }
-
-    /// Reads, acquiring an event context for each pull from the stack.
-    fileprivate mutating func read(
-        minContiguous: Int,
-        _ body: (_ span: borrowing RawSpan) -> Int
-    ) -> QUICStreamReadOutcome {
-        self.read(minContiguous: minContiguous, withEventContext: { pull in withTestEventContext(pull) }, body)
-    }
-
-    fileprivate mutating func close(error: NetworkError?) {
-        withTestEventContext { eventContext in self.close(error: error, in: &eventContext) }
-    }
-}
-
-/// Runs `body` with an event context, entering the stack as an anchor on a fresh event-loop-backed
-/// context. These cores never attach, so nothing reaches the stack through it.
-@available(anyAppleOS 26, *)
-private func withTestEventContext<R, E: Error>(
-    _ body: (inout NetworkContext.EventContext) throws(E) -> R
-) throws(E) -> R {
-    let callouts = QUICCallouts()
-    let context = NetworkContext(
-        identifier: "QUICStreamCoreTests",
-        externalScheduler: EventLoopBackedScheduler(eventLoop: EmbeddedEventLoop(), callouts: callouts)
-    )
-    let anchor = EventContextAnchor(context: context)
-    defer { anchor.retire(through: callouts) }
-    return try callouts.enter(as: anchor, body)
 }
 
 @available(anyAppleOS 26, *)
@@ -88,117 +92,159 @@ struct QUICStreamCoreTests {
     @Test
     @available(anyAppleOS 26, *)
     func partialReadResumesAtOffset() {
-        var core = QUICStreamCore(id: nil)
-        core.hold(["abcdef"])
+        var stream = TestCore()
+        stream.hold(["abcdef"])
 
         var seen = [String]()
-        let outcome = core.read(minContiguous: 1) { span in
+        let outcome = stream.read(minContiguous: 1) { span in
             seen.append(span.utf8String)
             return 2  // consume 2 bytes
         }
 
         #expect(outcome == .read(6))
         #expect(seen == ["abcdef", "cdef", "ef"])
-
-        core.close(error: nil)
+        let nothingHeld = stream.holdsNothing
+        #expect(nothingHeld)
     }
 
     @Test
     @available(anyAppleOS 26, *)
     func declinedBytesAreHeldForTheNextRead() {
-        var core = QUICStreamCore(id: nil)
-        core.hold(["ab", "cd", "ef"])
+        var stream = TestCore()
+        stream.hold(["ab", "cd", "ef"])
 
         var seen = [String]()
         var calls = 0
 
-        let first = core.read(minContiguous: 1) { span in
+        let first = stream.read(minContiguous: 1) { span in
             seen.append(span.utf8String)
             calls += 1
             return calls == 1 ? 1 : 0
         }
 
         #expect(first == .read(1))
+        let needsAnotherVisit = stream.core.needsReadVisit
+        #expect(needsAnotherVisit)
 
-        let second = core.read(minContiguous: 1) { span in
+        let second = stream.read(minContiguous: 1) { span in
             seen.append(span.utf8String)
             return span.byteCount
         }
 
         #expect(second == .read(5))
-        #expect(seen == ["ab", "b", "b", "cd", "ef"])
-
-        let nothingHeld = core.holdsNothing
+        // The connection holds what arrived contiguously, so each call sees all that's left.
+        #expect(seen == ["abcdef", "bcdef", "bcdef"])
+        let nothingHeld = stream.holdsNothing
         #expect(nothingHeld)
-
-        core.close(error: nil)
     }
 
     @Test
     @available(anyAppleOS 26, *)
-    func coalescesAcrossFrames() {
-        var core = QUICStreamCore(id: nil)
-        core.hold(["ab", "cd", "ef"])
+    func waitsForTheContiguousBytesAskedFor() {
+        var stream = TestCore()
+        stream.hold(["ab"])
 
         var seen = [String]()
-        let first = core.read(minContiguous: 4) { span in
+        let tooFew = stream.read(minContiguous: 4) { span in
+            seen.append(span.utf8String)
+            return span.byteCount
+        }
+        #expect(tooFew == .nothingAvailable)
+        #expect(seen.isEmpty)
+
+        stream.hold(["cd", "ef"])
+        let first = stream.read(minContiguous: 4) { span in
             seen.append(span.utf8String)
             return 3
         }
 
+        // Three bytes are left, fewer than asked for: they wait for the next read.
         #expect(first == .read(3))
-
-        let needsAnotherVisit = core.needsReadVisit
+        let needsAnotherVisit = stream.core.needsReadVisit
         #expect(needsAnotherVisit)
 
-        let second = core.read(minContiguous: 1) { span in
+        let second = stream.read(minContiguous: 1) { span in
             seen.append(span.utf8String)
             return span.byteCount
         }
 
         #expect(second == .read(3))
-        #expect(seen == ["abcd", "d", "ef"])
+        #expect(seen == ["abcdef", "def"])
+    }
 
-        core.close(error: nil)
+    @Test
+    @available(anyAppleOS 26, *)
+    func shortRunIsHandedOverAtTheEndOfTheStream() {
+        var stream = TestCore()
+        stream.hold(["ab"], fin: true)
+
+        var seen = [String]()
+        let outcome = stream.read(minContiguous: 4) { span in
+            seen.append(span.utf8String)
+            return span.byteCount
+        }
+
+        #expect(outcome == .endOfStream(2))
+        #expect(seen == ["ab"])
+        let isReceiveOpen = stream.core.isReceiveOpen
+        #expect(!isReceiveOpen)
     }
 
     @Test
     @available(anyAppleOS 26, *)
     func readWithNothingHeld() {
-        var core = QUICStreamCore(id: nil)
+        var stream = TestCore()
 
-        let outcome = core.read(minContiguous: 1) { _ in
+        let outcome = stream.read(minContiguous: 1) { _ in
             Issue.record("read a stream with nothing held")
             return 0
         }
 
         #expect(outcome == .nothingAvailable)
-
-        core.close(error: nil)
     }
 
     @Test
     @available(anyAppleOS 26, *)
-    func closeFinalizesHeldFrames() {
-        var core = QUICStreamCore(id: nil)
-        core.hold(["ab", "cd"])
-        core.close(error: nil)
+    func closeStopsBothDirections() {
+        var stream = TestCore()
+        stream.hold(["ab", "cd"])
+        stream.core.close(on: stream.operations, id: TestCore.id)
 
-        let nothingHeld = core.holdsNothing
-        #expect(nothingHeld)
+        #expect(stream.operations[TestCore.id]?.resetCode == QUICApplicationErrorCode(0))
+        #expect(stream.operations[TestCore.id]?.stopSendingCode == QUICApplicationErrorCode(0))
+        let isSendOpen = stream.core.isSendOpen
+        #expect(!isSendOpen)
     }
 
     @Test(arguments: [true, false])
     @available(anyAppleOS 26, *)
     func flushOnStreamWIthoutIDIsRefused(fin: Bool) {
-        var core = QUICStreamCore(id: nil)
-        core.write(ByteBuffer(string: "hello"))
-        core.expectFlushRefused(fin: fin)
+        var stream = TestCore(connected: false)
+        stream.core.write(ByteBuffer(string: "hello"))
+        stream.expectFlushRefused(fin: fin)
 
-        let stillQueued = core._forTesting_hasPendingWrites
+        let stillQueued = stream.core._forTesting_hasPendingWrites
         #expect(stillQueued)
+        stream.core.abandonLocally()
+    }
 
-        core.close(error: nil)
+    @Test
+    @available(anyAppleOS 26, *)
+    func flushHandsTheWritesOverInOrder() throws {
+        var stream = TestCore()
+        stream.core.write(ByteBuffer(string: "hello "))
+        stream.core.withWritableSpan(count: 5) { span in
+            for (index, byte) in "world".utf8.enumerated() {
+                span.storeBytes(of: byte, toByteOffset: index, as: UInt8.self)
+            }
+            return 5
+        }
+        try stream.core.flush(fin: true, to: stream.operations)
+
+        #expect(stream.operations[TestCore.id]?.outboundString == "hello world")
+        #expect(stream.operations[TestCore.id]?.finished == true)
+        let stillQueued = stream.core._forTesting_hasPendingWrites
+        #expect(!stillQueued)
     }
 }
 
