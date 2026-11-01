@@ -13,7 +13,6 @@
 //===----------------------------------------------------------------------===//
 
 import NIOQUICHelpers
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
 /// The state of a stream recorded by the transport.
 @available(anyAppleOS 26, *)
@@ -33,13 +32,6 @@ struct QUICStreamTransportState: ~Copyable {
     @usableFromInline
     var core: QUICStreamCore
 
-    /// Pending events for this slot for `SwiftNetwork`.
-    var eventManager: ProtocolEventManager
-
-    /// The identifier of the flow this stream is attached to, which the table indexes it by. None
-    /// until the stream attaches.
-    var flowIdentifier: InstanceIdentifier
-
     /// Why the stream closed, as the consumer sees it.
     @usableFromInline
     var closeError: (any Error)?
@@ -51,9 +43,6 @@ struct QUICStreamTransportState: ~Copyable {
     /// The application error code sent by the peer in a STOP\_SENDING frame.
     @usableFromInline
     var stopSendingCode: QUICApplicationErrorCode?
-
-    /// Why the stream closed, as the stack and the peer see it.
-    var disconnectError: NetworkError?
 
     /// Set while a view over this slot is live.
     ///
@@ -77,12 +66,9 @@ struct QUICStreamTransportState: ~Copyable {
         self.events = []
         self.hasState = false
         self.closeError = nil
-        self.disconnectError = nil
         self.resetCode = nil
         self.stopSendingCode = nil
         self.core = consume core
-        self.eventManager = ProtocolEventManager()
-        self.flowIdentifier = InstanceIdentifier()
         self._isBorrowed = false
     }
 }

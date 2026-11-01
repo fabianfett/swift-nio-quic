@@ -26,8 +26,8 @@ struct PagedBuffer<Value: ~Copyable>: ~Copyable {
     /// The allocated pages.
     @usableFromInline
     var _pages: [UnsafeMutableRawPointer]
-    // Note: this is a raw pointer (rather than typed) because the buffer is accessed a lot via
-    // SwiftNetwork and that path is unspecialized. Using the unspecialized typed version would
+    // Note: this is a raw pointer (rather than typed) because the buffer is accessed a lot from
+    // unspecialized generic code. Using the unspecialized typed version would
     // require recovering the generic metadata for each array operation, which adds up.
 
     /// The number of slots handed out.

@@ -15,7 +15,7 @@
 #if DEBUG
 import NIOCore
 import NIOEmbedded
-@_spi(Essentials) import SwiftNetwork
+@_spi(Essentials) import QUICStateMachine
 import Testing
 
 @testable import NIOQUIC
@@ -162,6 +162,65 @@ struct StateMachineTimerQueueTests {
         #expect(target.slot != nil)
         eventLoop.advanceTime(to: Self.deadline(30))
         #expect(log.fired.map(\.at) == [Self.deadline(10), Self.deadline(20)])
+    }
+
+    /// A connection arms its next deadline from `timerFired()`, which the queue fires in a task of
+    /// its own.
+    @available(anyAppleOS 26, *)
+    @Test func aTargetArmingAgainFromTimerFiredFiresAgain() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let queue = StateMachineTimerQueue(eventLoop: eventLoop)
+        let log = Target.Log(eventLoop: eventLoop)
+        let target = Target("target", log: log)
+        target.onFire = {
+            if log.fired.count < 3 {
+                Self.arm(target, at: Int64(log.fired.count) * 100 + 10, in: queue)
+            }
+        }
+        Self.arm(target, at: 10, in: queue)
+
+        eventLoop.advanceTime(to: Self.deadline(10))
+        #expect(log.fired.map(\.at) == [Self.deadline(10)])
+        #expect(queue._forTesting_isTaskScheduled)
+        eventLoop.advanceTime(to: Self.deadline(1000))
+        #expect(log.fired.map(\.at) == [Self.deadline(10), Self.deadline(110), Self.deadline(210)])
+        #expect(!queue._forTesting_isTaskScheduled)
+        #expect(queue._forTesting_tasksScheduled == 3)
+    }
+
+    /// The loss recovery timer moves its deadline later on nearly every packet: that schedules no
+    /// NIO task, only the early firing does once. A slot cancelled after its deadline moved later
+    /// doesn't fire at either.
+    @available(anyAppleOS 26, *)
+    @Test func pushingADeadlineOutSchedulesNoTask() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let queue = StateMachineTimerQueue(eventLoop: eventLoop)
+        let log = Target.Log(eventLoop: eventLoop)
+        let target = Target("target", log: log)
+        var wanted: Int64 = 0
+        for step in 1...20 {
+            wanted = 100 + Int64(step) * 10
+            Self.arm(target, at: wanted, in: queue)
+        }
+        let cancelled = Target("cancelled", log: log)
+        Self.arm(cancelled, at: 150, in: queue)
+        Self.arm(cancelled, at: 300, in: queue)
+        queue.cancel(try #require(cancelled.slot))
+        #expect(queue._forTesting_tasksScheduled == 1)
+
+        // The first deadline fires early, and the target arms for what is left, as a connection
+        // does.
+        target.onFire = {
+            if log.eventLoop.now < Self.deadline(wanted) {
+                Self.arm(target, at: wanted, in: queue)
+            }
+        }
+        eventLoop.advanceTime(to: Self.deadline(110))
+        #expect(log.fired.map(\.at) == [Self.deadline(110)])
+        #expect(queue._forTesting_tasksScheduled == 2)
+        eventLoop.advanceTime(to: Self.deadline(1000))
+        #expect(log.fired.map(\.at) == [Self.deadline(110), Self.deadline(300)])
+        #expect(queue._forTesting_tasksScheduled == 2)
     }
 
     @available(anyAppleOS 26, *)

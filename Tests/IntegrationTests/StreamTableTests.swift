@@ -864,7 +864,7 @@ struct StreamTableTests {
             try await channel.eventLoop.submit {
                 channel.transportView.forceClose()
             }.get()
-            // Completes once the channel has torn down, which retires the table's anchor.
+            // Completes once the channel has torn down, which closes the table.
             try await channel.closeFuture.get()
 
             // The stream closed with the connection: its handle no longer resolves, so there is

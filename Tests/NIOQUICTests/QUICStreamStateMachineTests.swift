@@ -697,13 +697,13 @@ struct QUICStreamStateMachineTests {
     @available(anyAppleOS 26, *)
     @Test("receiveData and receiveFin work in pendingID for optimistic reads")
     func optimisticReadsInPendingID() throws {
-        // receiveData returns .bufferData in pendingID because SwiftNetwork
-        // can deliver data before the connected event (optimistic reads).
+        // receiveData returns .bufferData in pendingID: data can arrive before the
+        // stream has its ID (optimistic reads).
         var sm1 = QUICStreamStateMachine()
         try sm1.receiveData().requireBufferData()
 
-        // receiveFin returns .markAllDataReceived in pendingID because SwiftNetwork
-        // can deliver FIN before the connected event (optimistic reads). The early
+        // receiveFin returns .markAllDataReceived in pendingID: a FIN can arrive
+        // before the stream has its ID (optimistic reads). The early
         // FIN is replayed into the receive sub-SM on streamConnected.
         var sm2 = QUICStreamStateMachine()
         guard case .markAllDataReceived = try sm2.receiveFin(finalSize: 0) else {

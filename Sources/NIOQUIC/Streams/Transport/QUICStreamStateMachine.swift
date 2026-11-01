@@ -1013,9 +1013,9 @@ extension QUICStreamStateMachine.State {
             }
 
         case .pendingID(var pending):
-            // Direction isn't known yet in pendingID — SwiftNetwork can deliver
-            // FIN before the connected event. Direction is validated when the
-            // stream connects and replays the FIN into the receive sub-SM.
+            // Direction isn't known yet in pendingID: a FIN can arrive before
+            // the stream has its ID. Direction is validated when the stream
+            // connects and replays the FIN into the receive sub-SM.
             pending.earlyFinFinalSize = finalSize
             self = .pendingID(pending)
             return .markAllDataReceived(finalSize: finalSize)
@@ -1042,9 +1042,8 @@ extension QUICStreamStateMachine.State {
             }
 
         case .pendingID(let pending):
-            // SwiftNetwork can deliver data before the connected event fires
-            // (e.g. optimistic reads from start(fromNewFlowHandler:)).
-            // Allow buffering — the receive sub-SM will track state once connected.
+            // Data can arrive before the stream has its ID. Allow buffering —
+            // the receive sub-SM will track state once connected.
             self = .pendingID(pending)
             return .bufferData
 

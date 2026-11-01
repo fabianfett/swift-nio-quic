@@ -789,7 +789,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 guard let table = self.streamTable,
                     let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
                 else { continue }
-                table.streamDisconnected(handle, error: nil)
+                table.streamDisconnected(handle)
             case .closing(let reason):
                 // The connection carries no more data: tell the channel and its streams now,
                 // not after the closing or draining period (RFC 9000 Section 10.2). The core

@@ -21,7 +21,7 @@ import NIOQUICHelpers
 /// streams opened get IDs up to a stream limit and queue beyond it, reads hand over all contiguous
 /// bytes at once, and writes, FINs, resets and STOP\_SENDINGs are recorded.
 ///
-/// Holds its table strongly; `QUICStreamTable.retireAnchor()` breaks the cycle.
+/// Holds its table strongly; `QUICStreamTable.releaseBackend()` breaks the cycle.
 @available(anyAppleOS 26, *)
 final class TestStreamOperations<Consumer: QUICStreamConsumer & ~Copyable>: QUICStreamOperations {
     /// What the peer sent on a stream, and what was sent to it.
@@ -132,7 +132,7 @@ final class TestStreamOperations<Consumer: QUICStreamConsumer & ~Copyable>: QUIC
     /// Both directions of stream `id` are done, and the connection forgot it.
     func streamCloses(_ id: QUICStreamID) {
         if let table = self.table, let handle = table.handle(forID: id) {
-            table.streamDisconnected(handle, error: nil)
+            table.streamDisconnected(handle)
         }
     }
 

@@ -154,14 +154,13 @@ extension QUICStream where Consumer: ~Copyable {
     ///
     /// - Parameter fin: Whether to finish the send side.
     /// - Throws: ``QUICError/invalidStreamState`` if the send side can't take the queued data: the
-    ///   stack hasn't assigned the stream its ID yet, in which case the data stays queued and the
+    ///   connection hasn't assigned the stream its ID yet, in which case the data stays queued and the
     ///   flush can be repeated after the ``QUICStreamEvents/opened`` visit; the stream has no send
     ///   side; or FIN or RESET\_STREAM was sent already, in which case the data is dropped.
     ///   ``QUICError/streamWriteFailed`` if the connection refused the data, for example because it
     ///   is closing.
     @inlinable
     public mutating func flush(fin: Bool = false) throws {
-        self.table.markOutputPending()
         try self.table.flush(self.transport, fin: fin)
     }
 }
@@ -175,7 +174,6 @@ extension QUICStream where Consumer: ~Copyable {
     /// - Parameter code: The application error code to send in RESET\_STREAM.
     @inlinable
     public mutating func sendResetStream(code: QUICApplicationErrorCode) {
-        self.table.markOutputPending()
         self.table.sendResetStream(self.transport, code: code)
     }
 
@@ -184,7 +182,6 @@ extension QUICStream where Consumer: ~Copyable {
     /// - Parameter code: The application error code to send in STOP\_SENDING.
     @inlinable
     public mutating func sendStopSending(code: QUICApplicationErrorCode) {
-        self.table.markOutputPending()
         self.table.sendStopSending(self.transport, code: code)
     }
 }

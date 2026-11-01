@@ -442,16 +442,16 @@ extension QUICConnectionChannel.ConnectionView where Consumer: ~Copyable {
     /// The connection associated a new ID with itself, update the routing table so that the new
     /// ID is routed to this connection.
     ///
-    /// Only updates the routing table, so it may be called with the event context held. The
-    /// connection then reports a successful association with ``connectionIDAssociated(_:)``.
+    /// Only updates the routing table, so it may be called while the connection processes its
+    /// core's events. The connection then reports a successful association with ``connectionIDAssociated(_:)``.
     func associate(_ newID: QUICConnectionID) -> Bool {
         self._channel._registrar.associate(newID)
     }
 
     /// The connection retired the given ID, update the routing table to drop the retired ID.
     ///
-    /// Only updates the routing table, so it may be called with the event context held. The
-    /// connection then reports a successful retirement with ``connectionIDRetired(_:)``.
+    /// Only updates the routing table, so it may be called while the connection processes its
+    /// core's events. The connection then reports a successful retirement with ``connectionIDRetired(_:)``.
     func retire(_ id: QUICConnectionID) -> Bool {
         self._channel._registrar.retire(id)
     }
@@ -934,12 +934,10 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     private func closeStreamTable(error: (any Error)?) {
         guard let table = self._table, !table.isClosed else { return }
         if self._consumer != nil {
-            table.closeAll(error: error, disconnect: nil, into: &self._consumer!)
+            table.closeAll(error: error, into: &self._consumer!)
         } else {
-            table.retireAnchor()
+            table.releaseBackend()
         }
-        // Drop the opener so new streams can't be created.
-        table.opener = nil
         if let streamChannels = self._streamChannels {
             streamChannels.deliver()
             streamChannels.tableClosed()

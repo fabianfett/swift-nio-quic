@@ -14,13 +14,12 @@
 
 import NIOCore
 import NIOQUICHelpers
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
 /// The transport state for a stream.
 @available(anyAppleOS 26, *)
 @usableFromInline
 struct QUICStreamCore: ~Copyable {
-    /// The ID of the stream assigned by `SwiftNetwork`, `nil` if it hasn't been assigned yet
+    /// The ID of the stream assigned by the connection, `nil` if it hasn't been assigned yet
     /// (e.g. is locally opened).
     @usableFromInline
     private(set) var id: QUICStreamID?
@@ -34,11 +33,8 @@ struct QUICStreamCore: ~Copyable {
     /// received all inbound data (as each read must also go through the state machine).
     private var finPending: Bool
 
-    /// Writes that haven't yet been emitted to the stack, in order.
+    /// Writes that haven't yet been handed to the connection, in order.
     private var pendingWrites: [ByteBuffer]
-
-    /// Data received from `SwiftNetwork` which the application hasn't consumed yet.
-    private var undeliveredReads: FrameArray
 
     /// Whether a read left bytes in the stream that the consumer may still want.
     @usableFromInline
@@ -50,55 +46,16 @@ struct QUICStreamCore: ~Copyable {
         self._needsReadVisit
     }
 
-    /// The handle used to talk to the SwiftNetwork stack.
-    private var handle: SwiftNetworkStreamHandle
-
-    /// The identifier every linkage call is made "from".
-    private var identifier: InstanceIdentifier
-
-    #if DEBUG
-    /// Whether attach has been called yet.
-    private var hasAttached: Bool = false
-    #endif
-
-    /// Temporary space for coalescing into when the consumer asks for reads to be coalesced and
-    /// the leading frame doesn't contain enough bytes.
-    private var coalescedBytes: [UInt8]
-
-    /// Creates a stream core which is not yet wired to the stack.
+    /// Creates a stream core.
     ///
-    /// - Parameter id: The stream ID, if the stack has already assigned one.
+    /// - Parameter id: The stream ID, if the connection has already assigned one.
     @usableFromInline
     init(id: QUICStreamID?) {
         self.id = id
         self.state = QUICStreamStateMachine()
-        self.handle = SwiftNetworkStreamHandle()
-        self.identifier = InstanceIdentifier()
         self.pendingWrites = []
-        self.undeliveredReads = FrameArray()
         self.finPending = false
-        self.coalescedBytes = []
         self._needsReadVisit = false
-    }
-
-    /// Attaches this stream core to the stack.
-    mutating func attach(identifier: InstanceIdentifier, linkage: BaseOutboundStreamLinkage) {
-        #if DEBUG
-        assert(!self.hasAttached, "\(#function) called more than once")
-        self.hasAttached = true
-        #endif
-        self.identifier = identifier
-        self.handle = SwiftNetworkStreamHandle(linkage: linkage)
-    }
-
-    /// The stack's metadata for this stream, or `nil` if it is detached.
-    func metadata(in eventContext: inout NetworkContext.EventContext) -> ProtocolMetadata<QUICProtocol>? {
-        switch self.handle.invokeGetMetadata() {
-        case .proceed(let linkage):
-            return linkage.invokeGetMetadata(for: self.identifier, in: &eventContext) as ProtocolMetadata<QUICProtocol>?
-        case .ignore:
-            return nil
-        }
     }
 
     /// Whether more data can be written to the stream.
@@ -113,10 +70,10 @@ struct QUICStreamCore: ~Copyable {
         !self.state.isReceiveClosed
     }
 
-    /// Records the ID the stack assigned and resolves the stream's direction.
+    /// Records the ID the connection assigned and resolves the stream's direction.
     ///
     /// - Parameters:
-    ///   - id: The stream ID the stack assigned.
+    ///   - id: The stream ID the connection assigned.
     ///   - direction: The direction implied by the ID and the local role, which only the
     ///     connection knows.
     /// - Returns: The state machine's action for the transition.
@@ -140,7 +97,7 @@ extension QUICStreamCore {
         let action: QUICStreamStateMachine.ReceiveResetStreamAction
 
         do {
-            // The stack owns reassembly, so there is no final size to assert here.
+            // The connection owns reassembly, so there is no final size to assert here.
             action = try self.state.receiveResetStream(applicationErrorCode: code, finalSize: 0)
         } catch {
             return  // Closed, or a direction with no receive side.
@@ -157,136 +114,23 @@ extension QUICStreamCore {
             ()  // RESET_STREAM is not acted on twice.
         }
     }
-
-    /// Records the peer's STOP\_SENDING and answers it with RESET\_STREAM.
-    ///
-    /// - Parameter code: The application error code the peer sent.
-    mutating func receiveStopSending(
-        code: QUICApplicationErrorCode,
-        in eventContext: inout NetworkContext.EventContext
-    ) {
-        let action: QUICStreamStateMachine.ReceiveStopSendingAction
-
-        do {
-            action = try self.state.receiveStopSending(applicationErrorCode: code)
-        } catch {
-            return  // Not connected, or a direction with no send side.
-        }
-
-        switch action {
-        case .sendReset:
-            self.abortSendSideForStopSending(code: code, in: &eventContext)
-        case .sendResetAndCloseStream:
-            self.abortSendSideForStopSending(code: code, in: &eventContext)
-        case .ignore(.alreadyFinished):
-            ()  // The send side finished cleanly; STOP_SENDING has nothing to stop.
-        case .ignore(.alreadyReset):
-            ()  // RESET_STREAM has already gone out.
-        }
-    }
-
-    /// Answers a STOP\_SENDING with RESET\_STREAM, dropping what was queued.
-    private mutating func abortSendSideForStopSending(
-        code: QUICApplicationErrorCode,
-        in eventContext: inout NetworkContext.EventContext
-    ) {
-        self.pendingWrites.removeAll()
-        self.abortOutbound(error: NetworkError(quicApplicationError: code.rawValue), in: &eventContext)
-    }
 }
 
 // MARK: - Reading
 
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// Hands the stream's inbound bytes to `body`.
-    ///
-    /// `body` returns the number of bytes that it consumed from the span. Bytes which weren't read
-    /// are held until the next read. This function will return `endOfStream` if the stream is half
-    /// closed.
-    ///
-    /// - Parameters:
-    ///   - minContiguous: The shortest run of contiguous bytes to hand to `body`. Data is
-    ///     coalesced to reach it; `1` never coalesces. If there aren't enough bytes available then
-    ///     and the peer hasn't yet sent FIN then `body` won't be called. Note that the when the
-    ///     peer sends FIN then `body` may be called with fewer bytes than `minContiguous`.
-    ///   - withEventContext: Runs its argument with the event context. `read` calls it for each pull
-    ///     from the stack and calls `body` outside it, so `body` runs without the context held.
-    ///   - body: Provided a contiguous block of bytes received from the remote peer, returning how
-    ///     many of them it consumed. May be called more then once for each call to `read`.
-    /// - Returns: The outcome of the read.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    mutating func read(
-        minContiguous: Int,
-        withEventContext: (_ pull: (inout NetworkContext.EventContext) -> Int) -> Int,
-        _ body: (_ span: borrowing RawSpan) -> Int
-    ) -> QUICStreamReadOutcome {
-        self._needsReadVisit = false
-
-        let contiguous = max(minContiguous, 1)
-        var totalDelivered = 0
-        var totalRead = 0
-
-        while true {
-            let askedForBytes: Bool
-            let bytesRead: Int
-
-            switch self.state.attemptRead() {
-            case .proceedWithRead:
-                askedForBytes = true
-                bytesRead = withEventContext { eventContext in self.fillUndeliveredReads(in: &eventContext) }
-                totalRead &+= bytesRead
-
-            case .doNotRead:
-                // Receive side closed: only what is already held here can still be handed over.
-                askedForBytes = false
-                bytesRead = 0
-            }
-
-            // Deliver the bytes.
-            totalDelivered &+= self.deliver(minContiguous: contiguous, body)
-
-            if askedForBytes && bytesRead == 0 {
-                self.confirmFin()
-            }
-
-            // If no bytes were read or there are undelivered reads then there's no point in asking
-            // for more data: the consumer stopped reading.
-            if bytesRead == 0 || !self.undeliveredReads.isEmpty {
-                break
-            }
-        }
-
-        let outcome: QUICStreamReadOutcome
-        if self.undeliveredReads.isEmpty && self.state.hasReceivedFin {
-            self.consumeEndOfStream()
-            outcome = .endOfStream(totalDelivered)
-        } else if totalDelivered > 0 {
-            outcome = .read(totalDelivered)
-        } else {
-            outcome = .nothingAvailable
-        }
-
-        // Bytes are leftover: the stream should be marked as needing another visit.
-        if totalDelivered > 0 && !self.undeliveredReads.isEmpty {
-            self._needsReadVisit = true
-        }
-
-        return outcome
-    }
-
     /// Hands a FIN to the state machine, but only once all data has been handed over to the
     /// consumer.
     private mutating func confirmFin() {
-        guard self.finPending && self.undeliveredReads.isEmpty && self.state.isConnected else {
+        guard self.finPending && self.state.isConnected else {
             return
         }
 
         self.finPending = false
 
         do {
-            // The stack owns reassembly, so there is no final size to assert here.
+            // The connection owns reassembly, so there is no final size to assert here.
             switch try self.state.receiveFin(finalSize: 0) {
             case .markAllDataReceived:
                 ()
@@ -298,179 +142,6 @@ extension QUICStreamCore {
         } catch {
             ()  // Closed, or a direction with no receive side.
         }
-    }
-
-    /// Pulls whatever the stack has and holds it for the consumer.
-    ///
-    /// - Returns: The number of bytes the stack handed over.
-    private mutating func fillUndeliveredReads(in eventContext: inout NetworkContext.EventContext) -> Int {
-        var pulled = self.receiveFromStack(in: &eventContext)
-        if pulled.isEmpty { return 0 }
-
-        let bufferData: Bool
-
-        if pulled.unclaimedLength > 0 {
-            do {
-                switch try self.state.receiveData() {
-                case .bufferData:
-                    bufferData = true
-                case .doNotBuffer(.allDataReceived):
-                    // Data past the final size the peer committed to. Only reachable once the
-                    // FIN has been confirmed, so this shouldn't be possible.
-                    assertionFailure("stream data arrived after all data was received")
-                    bufferData = false
-                case .doNotBuffer(.streamReset):
-                    assertionFailure("stream data arrived after the stream was reset")
-                    bufferData = false
-                }
-            } catch {
-                bufferData = false  // Closed, or a direction with no receive side.
-            }
-        } else {
-            bufferData = false
-        }
-
-        var bytesStored = 0
-        var sawFin = false
-
-        pulled.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
-            if frame.connectionComplete {
-                sawFin = true
-            }
-
-            let length = frame.unclaimedLength
-
-            if bufferData && length > 0 {
-                bytesStored &+= length
-                return .continueIterating
-            } else {
-                // Drop empty frames (or if we didn't expect frames: they still need finalizing).
-                frame.finalize(success: true)
-                return .removeFrameAndContinue
-            }
-        }
-
-        if sawFin {
-            self.finPending = true
-        }
-
-        // This replaces 'undeliveredReads' if empty and appends otherwise.
-        self.undeliveredReads.add(frames: pulled)
-
-        return bytesStored
-    }
-
-    private func receiveFromStack(in eventContext: inout NetworkContext.EventContext) -> FrameArray {
-        let received: FrameArray?
-
-        switch self.handle.invokeReceiveStreamData() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                received = try linkage.invokeReceiveStreamData(
-                    minimumBytes: 1,
-                    maximumBytes: .max,
-                    for: self.identifier,
-                    in: &eventContext
-                )
-            } catch {
-                // Nothing readable: the stack reports what went wrong as a disconnect event
-                // rather than through this call.
-                received = nil
-            }
-
-        case .handleViolation:
-            received = nil  // Detached: the stack has finished with this stream.
-        }
-
-        switch consume received {
-        case .some(let frames):
-            return frames
-        case .none:
-            return FrameArray()
-        }
-    }
-
-    /// Hands the held frames to `body` until it stops consuming or they run out.
-    private mutating func deliver(
-        minContiguous: Int,
-        _ body: (_ span: borrowing RawSpan) -> Int
-    ) -> Int {
-        var delivered = 0
-        var available = self.undeliveredReads.unclaimedLength
-
-        while !self.undeliveredReads.isEmpty {
-            if available < minContiguous && !(self.finPending || self.state.hasReceivedFin) {
-                // Not enough bytes left.
-                break
-            }
-
-            let effectiveReadLength = min(minContiguous, available)
-            let firstLength = self.undeliveredReads.peekFirstFrame { $0.unclaimedLength }
-            let consumed: Int
-
-            if firstLength >= effectiveReadLength {
-                consumed = self.undeliveredReads.peekFirstFrame { frame -> Int in
-                    if let bytes = frame.bytes {
-                        return body(bytes)
-                    } else {
-                        return 0
-                    }
-                }
-            } else {
-                consumed = self.coalesceAndDeliver(bytes: effectiveReadLength, body)
-            }
-
-            if consumed <= 0 {
-                assert(consumed == 0, "body(_:) claimed to read negative bytes")
-                // The consumer took nothing, hold on to the bytes.
-                break
-            }
-
-            assert(consumed <= available, "body(_:) claimed to read more bytes than available")
-            let claimed = min(consumed, available)
-            _ = self.undeliveredReads.claim(fromStart: claimed, removeClaimedFrames: true)
-
-            delivered &+= claimed
-            available &-= claimed
-        }
-
-        return delivered
-    }
-
-    /// Copies frames into a buffer until there are `bytes` contiguous bytes, then hands them
-    /// to `body`.
-    private mutating func coalesceAndDeliver(
-        bytes: Int,
-        _ body: (_ span: borrowing RawSpan) -> Int
-    ) -> Int {
-        // Move out of 'self' for the fill: Swift 6.3 and earlier fail with a compilation error
-        // otherwise.
-        var coalesced: [UInt8] = []
-        swap(&coalesced, &self.coalescedBytes)
-        coalesced.removeAll(keepingCapacity: true)
-        coalesced.reserveCapacity(bytes)
-
-        self.undeliveredReads.iterateImmutableFrames { frame -> Bool in
-            let wanted = bytes &- coalesced.count
-            if wanted == 0 { return false }
-
-            if let source = frame.span {
-                let slice = source.extracting(0..<min(source.count, wanted))
-                slice.withUnsafeBufferPointer { pointer in
-                    coalesced.append(contentsOf: pointer)
-                }
-            }
-
-            return true
-        }
-
-        // Put back the buffer.
-        swap(&coalesced, &self.coalescedBytes)
-
-        let consumed = body(self.coalescedBytes.span.bytes)
-        assert(consumed >= 0, "body(_:) claimed to read negative bytes")
-        assert(consumed <= self.coalescedBytes.count, "body(_:) claimed to read more bytes than available")
-        return consumed
     }
 
     /// Moves the receive side to its terminal state.
@@ -491,8 +162,8 @@ extension QUICStreamCore {
                 ()
             }
         } catch {
-            // Not connected: a FIN which arrived before the stack assigned an ID is replayed into
-            // the receive side when it does, so there is nothing to consume yet.
+            // Not connected: a FIN which arrived before the connection assigned an ID is replayed
+            // into the receive side when it does, so there is nothing to consume yet.
         }
     }
 }
@@ -501,28 +172,6 @@ extension QUICStreamCore {
 
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// How many bytes the stack will take right now, which is advisory: a write past it is buffered
-    /// rather than refused.
-    ///
-    /// Note that this returns `0` until the stack has assigned the stream its ID, which is not the
-    /// same as no room: writes may be queued before then, but flushing them is refused until the
-    /// ID arrives.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    func writableBytes(in eventContext: inout NetworkContext.EventContext) -> Int {
-        switch self.handle.invokeSendStreamData() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                return try linkage.invokeGetOutboundStreamDataRoomAvailable(for: self.identifier, in: &eventContext)
-            } catch {
-                return 0  // Not connected, or the stack has finished with the send side.
-            }
-
-        case .handleViolation:
-            return 0
-        }
-    }
-
     /// Queues bytes filled in place by `body`.
     ///
     /// - Parameters:
@@ -582,7 +231,7 @@ extension QUICStreamCore {
             refused = true
             switch error {
             case .notConnected:
-                // The stack hasn't assigned an ID yet, so nothing can have finished the send side,
+                // The connection hasn't assigned an ID yet, so nothing can have finished the send side,
                 // refuse the flush but keep the pending writes, the flush can be retried later.
                 dropWritesOnRefusal = false
             case .wrongDirection:
@@ -618,203 +267,40 @@ extension QUICStreamCore {
         if self.pendingWrites.isEmpty && !carriesFin { return nil }
         return carriesFin
     }
-
-    /// Hands buffered writes queued to the `SwiftNetwork`.
-    ///
-    /// - Parameter fin: Whether to finish the send side.
-    /// - Throws: As ``beginFlush(fin:)``, or what the stack throws if it rejected the write.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    mutating func flush(fin: Bool, in eventContext: inout NetworkContext.EventContext) throws {
-        guard let carriesFin = try self.beginFlush(fin: fin) else { return }
-
-        switch self.handle.invokeSendStreamData() {
-        case .proceed(let linkage):
-            var outgoing = FrameArray()
-            for var buffer in self.pendingWrites {
-                buffer.withUnsafeMutableReadableBytesWithStorageManagement2 { buffer, owner in
-                    outgoing.add(frame: Frame(customBuffer: buffer, owner: owner))
-                }
-            }
-            self.pendingWrites.removeAll(keepingCapacity: true)
-            if carriesFin {
-                Self.markFin(&outgoing)
-            }
-            try linkage.invokeSendStreamData(outgoing, from: self.identifier, in: &eventContext)
-
-        case .handleViolation(let reason):
-            self.pendingWrites.removeAll()
-            throw SwiftNetworkStreamHandle.violationError(operation: "invokeSendStreamData", reason: reason)
-        }
-    }
-
-    /// Sets the FIN flag on the last frame of `frames`, or adds an empty frame.
-    private static func markFin(_ frames: inout FrameArray) {
-        if frames.isEmpty {
-            var frame = Frame(count: 0)
-            frame.connectionComplete = true
-            frames.add(frame: frame)
-        } else {
-            // This is dumb: FrameArray should make it possible to do this without iterating.
-            let last = frames.count &- 1
-            var index = 0
-            frames.iterateMutableFrames { frame -> Bool in
-                if index == last {
-                    frame.connectionComplete = true
-                }
-                index &+= 1
-                return true
-            }
-        }
-    }
 }
 
 // MARK: - Closing
 
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// Resets the send side of the stream.
-    ///
-    /// - Parameter code: The application error code to send in RESET\_STREAM.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    mutating func sendResetStream(code: QUICApplicationErrorCode, in eventContext: inout NetworkContext.EventContext) {
-        let action: QUICStreamStateMachine.LocalResetAction
-
-        do {
-            action = try self.state.localReset(applicationErrorCode: code)
-        } catch {
-            return  // Not connected: there is no send side on the wire to reset.
-        }
-
-        switch action {
-        case .sendReset:
-            // RESET_STREAM abandons the stream's data, so nothing still queued is going out.
-            self.pendingWrites.removeAll()
-            self.abortOutbound(error: NetworkError(quicApplicationError: code.rawValue), in: &eventContext)
-        case .ignore(.alreadyFinished):
-            ()  // Send side finished cleanly: RESET_STREAM would contradict the FIN.
-        case .ignore(.alreadyReset):
-            ()  // RESET_STREAM is not sent twice.
-        }
-    }
-
-    /// Closes the receive side of the stream.
-    ///
-    /// - Parameter code: The application error code to send in STOP_SENDING.
-    @_spi(Essentials) @_spi(ProtocolProvider)
-    @usableFromInline
-    mutating func sendStopSending(code: QUICApplicationErrorCode, in eventContext: inout NetworkContext.EventContext) {
-        let action: QUICStreamStateMachine.CloseReadSideAction
-
-        do {
-            action = try self.state.closeReadSide()
-        } catch {
-            return  // Not connected: there is no receive side on the wire to stop.
-        }
-
-        switch action {
-        case .markReadClosed:
-            // Nothing will read what is held: the receive side is closed to the consumer as of
-            // this call.
-            self.undeliveredReads.finalizeAllFramesAsFailed()
-            self.finPending = false
-            self.abortInbound(error: NetworkError(quicApplicationError: code.rawValue), in: &eventContext)
-        case .ignoreAlreadyClosed:
-            // The peer already finished; STOP_SENDING has nothing to stop.
-            ()
-        case .deliverPeerResetError:
-            // The peer already reset the stream; it has stopped sending.
-            ()
-        }
-    }
-
-    /// Tears the stream down: closes the state machine, detaches from the stack, and finalizes
-    /// everything still held in either direction.
-    ///
-    /// - Parameter error: The error to disconnect with, or `nil` for a clean close.
-    mutating func close(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
-        switch self.state.close(reason: error == nil ? .clean : .error) {
-        case .close:
-            ()
-        case .ignoreAlreadyClosed:
-            ()
-        }
-
-        switch self.handle.invokeDisconnect() {
-        case .proceed(let linkage):
-            linkage.invokeDisconnect(error: error, for: self.identifier, in: &eventContext)
-        case .ignore:
-            ()  // Already detached.
-        }
-
-        switch self.handle.invokeDetach() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeDetach(for: self.identifier, in: &eventContext)
-            } catch {
-                ()  // The stack has already let go of its side.
-            }
-        case .skipAlreadyDetached:
-            ()
-        }
-
-        self.abandonLocally()
-        self.finPending = false
-        self.coalescedBytes = []
-        // Detached: nothing is sent from this stream any more.
-        self.identifier = InstanceIdentifier()
-    }
-
-    /// Finalizes whatever is still queued locally, without touching the stack.
-    ///
-    /// `close(error:in:)` ends with it, once the stream has detached. `QUICStreamTable.deinit` calls
-    /// it on its own, because it has no event context to detach with: only a stream that never
-    /// reached the stack is expected there. One still attached means the table was never closed, a
-    /// teardown bug: its registered event manager traps when it's released (see
-    /// `QUICStreamTable.deinit`). Finalizing the queued frames is not optional: an un-finalized
-    /// `Frame` traps in its own `deinit`.
+    /// Drops whatever is still queued locally, without telling the connection.
     mutating func abandonLocally() {
         self.pendingWrites.removeAll()
-        self.undeliveredReads.finalizeAllFramesAsFailed()
-    }
-
-    private func abortInbound(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
-        switch self.handle.invokeAbortInbound() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeAbortInbound(error: error, for: self.identifier, in: &eventContext)
-            } catch {
-                ()  // The stack has already torn the receive side down.
-            }
-        case .ignore:
-            ()  // Detached: there is nothing to abort.
-        }
-    }
-
-    private func abortOutbound(error: NetworkError?, in eventContext: inout NetworkContext.EventContext) {
-        switch self.handle.invokeAbortOutbound() {
-        case .proceed(let linkage):
-            do throws(NetworkError) {
-                try linkage.invokeAbortOutbound(error: error, for: self.identifier, in: &eventContext)
-            } catch {
-                ()  // The stack has already torn the send side down.
-            }
-        case .ignore:
-            ()  // Detached: there is nothing to abort.
-        }
     }
 }
 
-// MARK: - Operations backed
+// MARK: - Operations
 
 /// The stream operations for a stream on ``QUICStreamOperations``, as those of a
-/// ``StateMachineQUICConnection``. They make the same state transitions as the `SwiftNetwork`
-/// ones; only the calls into the stack differ.
+/// ``StateMachineQUICConnection``.
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// Hands the stream's readable bytes to `body` until it stops consuming them. See
-    /// ``read(minContiguous:withEventContext:_:)``.
+    /// Hands the stream's readable bytes to `body` until it stops consuming them.
+    ///
+    /// `body` returns the number of bytes that it consumed from the span. Bytes which weren't read
+    /// are held until the next read. This function will return `endOfStream` if the stream is half
+    /// closed.
+    ///
+    /// - Parameters:
+    ///   - minContiguous: The shortest run of contiguous bytes to hand to `body`; `1` hands over
+    ///     any. If there aren't enough bytes available and the peer hasn't yet sent FIN then
+    ///     `body` won't be called. Once the peer sent FIN, `body` may be called with fewer bytes
+    ///     than `minContiguous`.
+    ///   - operations: The operations that hold the stream's bytes.
+    ///   - id: The stream's ID.
+    ///   - body: Provided a contiguous block of bytes received from the remote peer, returning how
+    ///     many of them it consumed. May be called more then once for each call to `read`.
+    /// - Returns: The outcome of the read.
     mutating func read(
         minContiguous: Int,
         from operations: some QUICStreamOperations,
@@ -827,7 +313,7 @@ extension QUICStreamCore {
         case .proceedWithRead:
             break
         case .doNotRead:
-            // Receive side closed: the stack holds nothing more for the consumer.
+            // Receive side closed: the connection holds nothing more for the consumer.
             if self.state.hasReceivedFin {
                 self.consumeEndOfStream()
                 return .endOfStream(0)
@@ -839,8 +325,8 @@ extension QUICStreamCore {
         var delivered = 0
         var leftOver = false
         var reachedEnd = false
-        // The stack hands over all contiguous bytes at once. What `body` leaves is handed over
-        // again, as on the `SwiftNetwork` path, until `body` takes nothing more.
+        // The connection hands over all contiguous bytes at once. What `body` leaves is handed
+        // over again, until `body` takes nothing more.
         while true {
             var consumed = 0
             let found: Void? = operations.read(id) { bytes, isFinished in
@@ -879,13 +365,18 @@ extension QUICStreamCore {
         return .nothingAvailable
     }
 
-    /// How many bytes the stream will accept right now. See ``writableBytes(in:)``.
+    /// How many bytes the stream will accept right now, which is advisory: a write past it is
+    /// buffered rather than refused.
+    ///
+    /// Note that this returns `0` until the connection has assigned the stream its ID, which is not
+    /// the same as no room: writes may be queued before then, but flushing them is refused until the
+    /// ID arrives.
     func writableBytes(on operations: some QUICStreamOperations) -> Int {
         guard let id = self.id, !self.state.isSendFinished else { return 0 }
         return operations.writableBytes(id)
     }
 
-    /// Hands queued writes to `operations`. See ``flush(fin:in:)``.
+    /// Hands queued writes to `operations`.
     ///
     /// - Throws: As ``beginFlush(fin:)``, or ``QUICError/streamWriteFailed`` if the connection
     ///   refused the bytes, in which case the rest of the queue is dropped.
@@ -916,7 +407,8 @@ extension QUICStreamCore {
         }
     }
 
-    /// Resets the send side. See ``sendResetStream(code:in:)``.
+    /// Resets the send side, dropping what is still queued: RESET\_STREAM abandons the stream's
+    /// data.
     mutating func sendResetStream(code: QUICApplicationErrorCode, on operations: some QUICStreamOperations) {
         let action: QUICStreamStateMachine.LocalResetAction
         do {
@@ -937,7 +429,7 @@ extension QUICStreamCore {
         }
     }
 
-    /// Closes the receive side. See ``sendStopSending(code:in:)``.
+    /// Closes the receive side.
     mutating func sendStopSending(code: QUICApplicationErrorCode, on operations: some QUICStreamOperations) {
         let action: QUICStreamStateMachine.CloseReadSideAction
         do {
@@ -947,7 +439,6 @@ extension QUICStreamCore {
         }
         switch action {
         case .markReadClosed:
-            self.undeliveredReads.finalizeAllFramesAsFailed()
             self.finPending = false
             if let id = self.id {
                 operations.stopSending(id, code: code)
@@ -959,7 +450,7 @@ extension QUICStreamCore {
         }
     }
 
-    /// Records the peer's STOP\_SENDING for a stream whose stack already answered it with
+    /// Records the peer's STOP\_SENDING for a stream whose connection already answered it with
     /// RESET\_STREAM.
     mutating func receiveStopSendingAnsweredByStack(code: QUICApplicationErrorCode) {
         do {
@@ -994,38 +485,15 @@ extension QUICStreamCore {
         }
         self.abandonLocally()
         self.finPending = false
-        self.coalescedBytes = []
     }
 }
 
 #if DEBUG
 @available(anyAppleOS 26, *)
 extension QUICStreamCore {
-    /// Adds `frames` to the undelivered reads, as though the stack had just handed them over.
-    mutating func _forTesting_addUndeliveredReads(_ frames: consuming FrameArray) {
-        self.undeliveredReads.add(frames: frames)
-    }
-
-    /// Whether any frame the stack handed over is still undelivered.
-    var _forTesting_hasUndeliveredReads: Bool {
-        !self.undeliveredReads.isEmpty
-    }
-
-    /// Whether any written frame is still queued for a flush.
+    /// Whether any write is still queued for a flush.
     var _forTesting_hasPendingWrites: Bool {
         !self.pendingWrites.isEmpty
     }
 }
 #endif  // DEBUG
-
-extension NIOCore.ByteBuffer {
-    fileprivate mutating func withUnsafeMutableReadableBytesWithStorageManagement2<T>(
-        _ body: (UnsafeMutableRawBufferPointer, AnyObject) throws -> T
-    ) rethrows -> T {
-        try self.withUnsafeReadableBytesWithStorageManagement { ptr, owner in
-            let _ = owner.retain()
-            let unwrappedOwner = owner.takeRetainedValue()
-            return try body(UnsafeMutableRawBufferPointer(mutating: ptr), unwrappedOwner)
-        }
-    }
-}

@@ -14,8 +14,8 @@
 
 import NIOQUICHelpers
 
-/// What a stream table's streams do on the connection that carries them, unless they run on the
-/// `SwiftNetwork` stack: open, read, write, finish, reset and stop.
+/// What a stream table's streams do on the connection that carries them: open, read, write,
+/// finish, reset and stop.
 ///
 /// A ``StateMachineQUICConnection`` does them on its `QUICConnectionCore`. Tests do them without a
 /// connection.

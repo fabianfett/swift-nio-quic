@@ -68,7 +68,7 @@ private final class Harness: QUICStreamChannelGroupDelegate {
 
     /// The connection closed with `error`, as the connection channel closes it.
     func closeConnection(error: (any Error)?) {
-        self.table.closeAll(error: error, disconnect: nil, into: &self.consumer)
+        self.table.closeAll(error: error, into: &self.consumer)
         self.group.deliver()
         self.group.tableClosed()
     }
