@@ -272,6 +272,34 @@ struct StateMachineConnectionIDTests {
         }
     }
 
+    /// A connection remembers the connection IDs it retired last, to refuse issuing them again
+    /// (RFC 9000 Section 5.1.1), but no more than twice the spares it issues: it forgets the
+    /// oldest.
+    @available(anyAppleOS 26, *)
+    @Test
+    func onlyTheConnectionIDsRetiredLastAreRemembered() async throws {
+        let recording = StreamRecording()
+        let retired = (0..<(2 * StateMachineQUICConnection<RecordConsumer>.spareConnectionIDs + 1)).map { _ in
+            Self.randomConnectionID()
+        }
+
+        try await withConsumerPair(
+            client: RecordConsumer(recording: recording),
+            server: EchoConsumer()
+        ) { pair in
+            let client = pair.clientConnection.channel
+            try await client.eventLoop.submit {
+                let connection = Self.stateMachineConnection(client, as: RecordConsumer.self)
+                for connectionID in retired {
+                    connection._forTesting_addRetiredConnectionID(connectionID)
+                }
+            }.get()
+
+            let remembered = try await Self.retiredConnectionIDs(of: client, as: RecordConsumer.self)
+            #expect(remembered == Array(retired.dropFirst()))
+        }
+    }
+
     /// The peer retiring the last connection ID that routes to the connection doesn't make it
     /// unreachable: the ID keeps routing until another one does, and is retired then.
     @available(anyAppleOS 26, *)
