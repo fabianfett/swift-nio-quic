@@ -125,14 +125,15 @@ struct ConnectionMigrationTests {
         try await Self.withConnectedPeers { peers in
             let packet = try await peers.unauthenticatedPacket()
 
-            // Every new address makes the server set up a path, which SwiftNetwork then probes.
+            // Packets from new addresses that don't authenticate must not move the connection
+            // (RFC 9000 Section 9).
             for _ in 0..<addressCount {
                 let spoofer = try await DatagramBootstrap(group: peers.eventLoopGroup)
                     .bind(host: Self.host, port: 0)
                     .get()
                 try await spoofer.writeAndFlush(AddressedEnvelope(remoteAddress: peers.serverAddress, data: packet))
             }
-            // Let SwiftNetwork's migration timer fire.
+            // Give the server time to act on them.
             try await Task.sleep(for: .seconds(1))
 
             #expect(peers.serverConnectionChannel.remoteAddress == peers.clientChannel.localAddress)

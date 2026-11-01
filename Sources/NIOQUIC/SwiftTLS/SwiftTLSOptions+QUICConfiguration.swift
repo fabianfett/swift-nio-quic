@@ -15,9 +15,7 @@
 import Crypto
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
 
-/// The TLS options of a QUIC connection's handshake, for either driver: the state machine driver
-/// hands them to the connection core, the SwiftNetwork driver wraps them in its TLS protocol
-/// options.
+/// The TLS options of a QUIC connection's handshake, which the connection hands to its core.
 ///
 /// The connection sets `quicTransportParameters` itself, so these leave them out.
 @available(anyAppleOS 26, *)
@@ -95,8 +93,7 @@ extension SwiftTLSOptions {
         self.init()
         self.applicationProtocols = config.applicationProtocols
         self.serverName = serverName
-        // `SwiftTLSOptions()` negotiates secp384r1, SwiftNetwork's TLS options x25519; the
-        // configuration's group, x25519 by default, applies to both drivers.
+        // `SwiftTLSOptions()` negotiates secp384r1; the configuration's group is x25519 by default.
         self.keyExchangeGroup = config.keyExchangeGroup.swiftTLSKeyExchangeGroup
     }
 }

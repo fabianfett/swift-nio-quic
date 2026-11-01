@@ -158,7 +158,7 @@ extension QUICStream where Consumer: ~Copyable {
     ///   flush can be repeated after the ``QUICStreamEvents/opened`` visit; the stream has no send
     ///   side; or FIN or RESET\_STREAM was sent already, in which case the data is dropped.
     ///   ``QUICError/streamWriteFailed`` if the connection refused the data, for example because it
-    ///   is closing. On the `SwiftNetwork` driver, also what its stack throws.
+    ///   is closing.
     @inlinable
     public mutating func flush(fin: Bool = false) throws {
         self.table.markOutputPending()

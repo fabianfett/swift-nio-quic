@@ -529,9 +529,9 @@ final class IntegrationTests: XCTestCase {
     }
 
     func testIdleTimeout() async throws {
-        // Once the connection goes idle for longer than the negotiated max_idle_timeout,
-        // SwiftNetwork times it out and reports ETIMEDOUT through the disconnected event. The
-        // connection channel must act on that: go inactive and complete its close future.
+        // Once the connection goes idle for longer than the negotiated max_idle_timeout, it times
+        // out (RFC 9000 Section 10.1). The connection channel must act on that: go inactive and
+        // complete its close future.
         let idleTimeout: Duration = .seconds(2)
 
         let (_, serverChannel, serverMultiplexer, clientMultiplexer) =

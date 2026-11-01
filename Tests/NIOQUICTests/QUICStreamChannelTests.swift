@@ -387,8 +387,7 @@ struct QUICStreamChannelTests {
         let written = channel.write(ByteBuffer(string: "hello "))
         channel.write(ByteBuffer(string: "world"), promise: nil)
         #expect(harness.operations[0]?.outbound.isEmpty == true)
-        // As on the `SwiftNetwork` driver, a write succeeds once it's queued, and the channel
-        // stays writable.
+        // A write succeeds once it's queued, and the channel stays writable.
         try written.wait()
         #expect(channel.isWritable)
 

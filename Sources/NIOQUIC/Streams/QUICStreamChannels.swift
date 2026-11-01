@@ -97,7 +97,7 @@ final class QUICStreamChannelGroup {
     /// Runs the inbound stream initializer. Held strongly until the table closes, as `parent`.
     var delegate: (any QUICStreamChannelGroupDelegate)?
 
-    /// The `autoRead` option stream channels start with: on, as on the `SwiftNetwork` driver.
+    /// The `autoRead` option stream channels start with: on.
     var autoRead = true
 
     /// Channels with events a drain recorded, which ``deliver()`` fires.

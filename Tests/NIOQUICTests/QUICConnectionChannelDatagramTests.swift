@@ -183,16 +183,6 @@ struct QUICConnectionChannelDatagramTests {
         }
     }
 
-    @available(anyAppleOS 26, *)
-    @Test("A datagram flow error is fired as an errorCaught")
-    func datagramErrorIsFiredAsErrorCaught() throws {
-        try Self.withChannel { channel, _, recorder in
-            channel.connectionView.datagramError(TestError())
-            #expect(recorder.errors.count == 1)
-            #expect(recorder.errors.first is TestError)
-        }
-    }
-
     // MARK: - Teardown
 
     @available(anyAppleOS 26, *)
@@ -304,4 +294,3 @@ final class DatagramRecorder: ChannelInboundHandler, Sendable {
     }
 }
 
-private struct TestError: Error {}

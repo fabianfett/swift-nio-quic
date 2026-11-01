@@ -113,15 +113,14 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private let baseDatagramSize: Int
 
     /// The connection IDs a connection issues once its handshake completed, besides the
-    /// handshake's, if the peer's `active_connection_id_limit` takes them; as many as the
-    /// SwiftNetwork driver issues.
+    /// handshake's, if the peer's `active_connection_id_limit` takes them.
     static var spareConnectionIDs: Int { 8 }
 
     /// The retired connection IDs a connection remembers to refuse issuing them again.
     private static var rememberedRetiredConnectionIDs: Int { 2 * Self.spareConnectionIDs }
 
-    /// The `active_connection_id_limit` a connection advertises (RFC 9000 Section 18.2), as the
-    /// SwiftNetwork driver does: the peer may issue that many connection IDs to the connection.
+    /// The `active_connection_id_limit` a connection advertises (RFC 9000 Section 18.2): the peer
+    /// may issue that many connection IDs to the connection.
     static var activeConnectionIDLimit: UInt64 { 64 }
 
     /// Whether `processEvents()` runs: it handles the events the core reports meanwhile, also
@@ -241,8 +240,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.rememberRetiredConnectionID(connectionID)
     }
 
-    /// Forgets `connectionID` as if the peer retired it, but keeps routing it, as the SwiftNetwork
-    /// driver does. The last one waits for another one to route, as in
+    /// Forgets `connectionID` as if the peer retired it, but keeps routing it. The last one waits for another one to route, as in
     /// `retireLocalConnectionID(_:)`.
     func _forTesting_removeLocalConnectionID(_ connectionID: QUICConnectionID) {
         guard let index = self.localConnectionIDs.firstIndex(of: connectionID) else { return }
@@ -368,8 +366,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         coreConfiguration.initialMaxStreamsBidirectional = UInt64(configuration.initialMaxStreamsBidi)
         coreConfiguration.initialMaxStreamsUnidirectional = UInt64(configuration.initialMaxStreamsUni)
         coreConfiguration.maxIdleTimeout = NetworkDuration(duration: configuration.maxIdleTimeout)
-        // As on the SwiftNetwork driver, keepalives never close the connection: the idle timeout
-        // does once they go unanswered.
+        // Keepalives never close the connection: the idle timeout does once they go unanswered.
         coreConfiguration.keepAliveInterval = configuration.keepAliveInterval.map(NetworkDuration.init(duration:))
         // Initial packets are padded to the configured size, and no packet is larger. Every QUIC
         // path carries 1200 bytes (RFC 9000 Section 14).
@@ -390,20 +387,20 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             }
         }
         // A `max_datagram_frame_size` of zero is the same as none: no DATAGRAM frames (RFC 9221
-        // Section 3). The SwiftNetwork driver sends at most 65535.
+        // Section 3). A connection sends at most 65535.
         let maxDatagramFrameSize = UInt16(clamping: configuration.maxDatagramFrameSize)
         coreConfiguration.maxDatagramFrameSize = maxDatagramFrameSize > 0 ? UInt64(maxDatagramFrameSize) : nil
         // Spread each congestion window over the RTT rather than sending it in one burst (RFC
         // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
-        // Off by default, as on the SwiftNetwork driver, which never paces for NIOQUIC.
+        // Off by default.
         coreConfiguration.pacingEnabled = configuration.pacePackets
-        // The peer may issue as many connection IDs as to a SwiftNetwork driver connection
-        // (RFC 9000 Section 5.1.1). The driver issues its own, see `issueSpareConnectionIDs()`.
+        // The peer may issue up to this many connection IDs (RFC 9000 Section 5.1.1). The
+        // connection issues its own, see `issueSpareConnectionIDs()`.
         coreConfiguration.activeConnectionIDLimit = Self.activeConnectionIDLimit
         // A peer that migrates sends to one of the connection's spare connection IDs (RFC 9000
         // Section 9.5), which the handler routes, and the server follows it to its new address.
         // Zero-length connection IDs have no spares: the peer must not migrate then (RFC 9000
-        // Section 18.2), as on the SwiftNetwork driver. It may still rebind, which keeps the
+        // Section 18.2). It may still rebind, which keeps the
         // connection ID.
         coreConfiguration.disableActiveMigration = localConnectionID.length == 0
         #if QLOG_ENABLED
@@ -531,8 +528,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     // MARK: qlog
 
     /// Starts the qlog, if configured, with the transport parameters the connection sends. Without
-    /// the `QlogOutput` trait of swift-network-evolution there is no qlog, as on the SwiftNetwork
-    /// driver.
+    /// the `QlogOutput` trait of swift-network-evolution there is no qlog.
     private func startQLog(_ configuration: QLogConfiguration?) {
         #if QLOG_ENABLED
         guard let configuration else { return }
@@ -726,8 +722,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .connected:
                 if !self.reportedHandshake {
                     self.reportedHandshake = true
-                    // As the SwiftNetwork driver does, hand over the peer's advertised frame size;
-                    // the core refuses a payload that doesn't fit a packet.
+                    // Hand over the peer's advertised frame size; the core refuses a payload
+                    // that doesn't fit a packet.
                     self.channelView?.handshakeCompleted(
                         peerMaxDatagramFrameSize: self.core.peerMaxDatagramFrameSize
                     )
@@ -1115,9 +1111,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self.closedLocally = true
         self.core.close(errorCode: UInt64(errorCode), isApplication: isApplicationClose, reason: reason, now: Self.now)
         self.rescheduleTimer()
-        // As the SwiftNetwork connection does, report the close right away: the channel drains the
-        // CONNECTION_CLOSE and fires inactive once this returns. The core keeps answering the peer
-        // for the closing period on its own timer.
+        // Report the close right away: the channel drains the CONNECTION_CLOSE and fires
+        // inactive once this returns. The core keeps answering the peer for the closing period on
+        // its own timer.
         if !self.reportedClose {
             self.reportedClose = true
             self.channelView?.connectionClosed(error: nil)

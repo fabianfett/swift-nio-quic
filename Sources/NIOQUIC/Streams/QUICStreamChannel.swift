@@ -18,7 +18,7 @@ import Synchronization
 
 /// The `Channel` of a QUIC stream on a stream table, as ``QUICStreamChannels`` makes them.
 ///
-/// It behaves as the `SwiftNetwork` driver's stream channels do:
+/// It behaves as follows:
 ///
 /// - Reads are on demand: bytes are read from the stream only while a `read()` is pending, and
 ///   stay in the connection otherwise, so flow control holds the peer back (RFC 9000 Section 4).
@@ -300,7 +300,7 @@ extension QUICStreamChannel {
     }
 
     /// Runs the inbound initializer for this stream, driving the pipeline state machine and
-    /// surfacing the stream once it is ready, as on the `SwiftNetwork` driver.
+    /// surfacing the stream once it is ready.
     ///
     /// - Returns: A future that completes when an asynchronous initializer finishes, or `nil`
     ///   when there was nothing to wait for. The connection holds `channelInactive` until then.
@@ -427,7 +427,7 @@ extension QUICStreamChannel {
 @available(anyAppleOS 26, *)
 extension QUICStreamChannel {
     /// Fires the bytes read as a `channelRead`, then the end of the input or the peer's reset,
-    /// then `channelReadComplete`, as on the `SwiftNetwork` driver.
+    /// then `channelReadComplete`.
     private func streamRead(_ state: State) {
         let hasReadData = state.bufferedReadData.readableBytes > 0
         if hasReadData {
@@ -711,7 +711,7 @@ extension QUICStreamChannel: ChannelCore {
     func write0(_ data: NIOAny, promise: EventLoopPromise<Void>?) {
         let state = self._state.value
         let buffer = self.unwrapData(data, as: ByteBuffer.self)
-        // As on the `SwiftNetwork` driver, a write succeeds once it's queued.
+        // A write succeeds once it's queued.
         _ = self.withStream(state) { stream in
             stream.write(buffer)
         }
@@ -721,7 +721,7 @@ extension QUICStreamChannel: ChannelCore {
     func flush0() {
         let state = self._state.value
         _ = self.withStream(state) { stream in
-            // A send side that is gone drops the writes, as on the `SwiftNetwork` driver.
+            // A send side that is gone drops the writes.
             try? stream.flush()
         }
     }

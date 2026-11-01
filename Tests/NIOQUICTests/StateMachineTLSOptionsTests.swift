@@ -15,12 +15,11 @@
 import Crypto
 import Foundation
 import NIOCore
-@_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
+@_spi(Essentials) @_spi(ProtocolProvider) import QUICStateMachine
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
 import Testing
 
-// NIOQUIC's extension of SwiftNetwork's TLS options is in the SPI group of the type it extends.
-@_spi(ProtocolProvider) @testable import NIOQUIC
+@testable import NIOQUIC
 
 /// The state machine connections in these tests are never created.
 @available(anyAppleOS 26, *)
@@ -34,50 +33,7 @@ private struct NoConsumer: QUICStreamConsumer {
     }
 }
 
-/// What a handshake depends on in `SwiftTLSOptions`, which isn't `Equatable`.
-@available(anyAppleOS 26, *)
-private struct TLSOptionsSummary: Equatable {
-    var serverName: String?
-    var applicationProtocols: [String]?
-    var keyExchangeGroup: SwiftTLSOptions.KeyExchangeGroup
-    var supportedCipherSuites: [SwiftTLSOptions.CipherSuite]
-    var quicTransportParameters: [UInt8]?
-    var trustedRawPublicKeyCertificates: [[UInt8]]?
-    var trustedRawPublicKeyP256PublicKeyCount: Int?
-    var hasPrivateKey: Bool
-    var rawPrivateKey: [UInt8]?
-    var enableEarlyData: Bool
-    var sessionState: [UInt8]?
-    var newSessionTicketRequestCount: UInt8
-    var resumedSessionTicketRequestCount: UInt8
-    var clientAuthRequired: Bool
-    var hasExternalPSK: Bool
-    var verifierCertificateTypes: [CertificateType]?
-    var authenticatorCertificateTypes: [CertificateType]?
-
-    init(_ options: SwiftTLSOptions) {
-        self.serverName = options.serverName
-        self.applicationProtocols = options.applicationProtocols
-        self.keyExchangeGroup = options.keyExchangeGroup
-        self.supportedCipherSuites = options.supportedCipherSuites
-        self.quicTransportParameters = options.quicTransportParameters
-        self.trustedRawPublicKeyCertificates = options.trustedRawPublicKeyCertificates
-        self.trustedRawPublicKeyP256PublicKeyCount = options.trustedRawPublicKeyP256PublicKeys?.count
-        self.hasPrivateKey = options.privateKey != nil
-        self.rawPrivateKey = options.rawPrivateKey
-        self.enableEarlyData = options.enableEarlyData
-        self.sessionState = options.sessionState
-        self.newSessionTicketRequestCount = options.newSessionTicketRequestCount
-        self.resumedSessionTicketRequestCount = options.resumedSessionTicketRequestCount
-        self.clientAuthRequired = options.clientAuthRequired
-        self.hasExternalPSK = options.externalPSK != nil
-        self.verifierCertificateTypes = options.asyncVerifier?.availableCertificateTypes
-        self.authenticatorCertificateTypes = options.asyncAuthenticator?.supportedCertificateTypes
-    }
-}
-
-/// The state machine driver hands the core the TLS options the SwiftNetwork driver wraps in its
-/// TLS protocol options, so both drivers run the same handshake.
+/// The TLS options a connection hands its core.
 @Suite(.timeLimit(.minutes(1)))
 struct StateMachineTLSOptionsTests {
     @available(anyAppleOS 26, *)
@@ -93,69 +49,52 @@ struct StateMachineTLSOptionsTests {
         Array(try P256.Signing.PublicKey.fromDERFile(p256PublicKeyPath).derRepresentation)
     }
 
-    /// The TLS options of a client on either driver.
+    /// The TLS options of a client.
     @available(anyAppleOS 26, *)
     private static func clientOptions(
         _ configuration: QUICConfiguration,
         serverName: String,
         asyncVerifier: NIOQUIC.AsyncVerifier?
-    ) throws -> (stateMachine: QUICConnectionCore.Configuration, swiftNetwork: TLSProtocol.Options) {
-        let stateMachine = try Connection.clientCoreConfiguration(
+    ) throws -> QUICConnectionCore.Configuration {
+        try Connection.clientCoreConfiguration(
             configuration,
             sourceConnectionID: NIOQUIC.QUICConnectionID(bytes: [1, 2, 3, 4, 5, 6, 7, 8].span),
             serverName: serverName,
             asyncVerifier: asyncVerifier,
             remoteAddress: try Self.remoteAddress()
         )
-        let swiftNetwork = try TLSProtocol.Options.clientOptions(
-            from: configuration,
-            asyncVerifier: asyncVerifier,
-            serverName: serverName
-        )
-        return (stateMachine, swiftNetwork)
     }
 
-    /// The TLS options of a server on either driver.
+    /// The TLS options of a server.
     @available(anyAppleOS 26, *)
     private static func serverOptions(
         _ configuration: QUICConfiguration,
         authenticator: Authenticator?
-    ) throws -> (stateMachine: QUICConnectionCore.Configuration, swiftNetwork: TLSProtocol.Options) {
-        let stateMachine = try Connection.serverCoreConfiguration(
+    ) throws -> QUICConnectionCore.Configuration {
+        try Connection.serverCoreConfiguration(
             configuration,
             sourceConnectionID: NIOQUIC.QUICConnectionID(bytes: [1, 2, 3, 4, 5, 6, 7, 8].span),
             statelessResetTokenGenerator: .defaultWithAutoGeneratedKey,
             authenticator: authenticator,
             remoteAddress: try Self.remoteAddress()
         )
-        let swiftNetwork = try TLSProtocol.Options.serverOptions(
-            from: configuration,
-            authConfig: try #require(configuration.authenticationConfiguration),
-            authenticator: authenticator,
-            serverName: try #require(configuration.serverName)
-        )
-        return (stateMachine, swiftNetwork)
     }
 
     /// What every connection's TLS options have: the configured ALPN, server name and key
-    /// exchange group, SwiftTLS's default cipher suite, no 0-RTT, and no transport parameters,
-    /// which the connection adds.
+    /// exchange group, SwiftTLS's default cipher suite and session tickets, no 0-RTT, and no
+    /// transport parameters, which the connection adds.
     @available(anyAppleOS 26, *)
     private static func expectCommonOptions(
-        _ options: (stateMachine: QUICConnectionCore.Configuration, swiftNetwork: TLSProtocol.Options),
+        _ options: QUICConnectionCore.Configuration,
         applicationProtocols: [String],
         serverName: String,
         keyExchangeGroup: SwiftTLSOptions.KeyExchangeGroup,
         sourceLocation: SourceLocation = #_sourceLocation
     ) {
-        let tls = options.stateMachine.tls
-        #expect(
-            TLSOptionsSummary(tls) == TLSOptionsSummary(options.swiftNetwork.tlsOptions),
-            sourceLocation: sourceLocation
-        )
+        let tls = options.tls
+        let defaults = SwiftTLSOptions()
         #expect(tls.applicationProtocols == applicationProtocols, sourceLocation: sourceLocation)
         #expect(tls.serverName == serverName, sourceLocation: sourceLocation)
-        #expect(options.swiftNetwork.serverName == serverName, sourceLocation: sourceLocation)
         #expect(tls.keyExchangeGroup == keyExchangeGroup, sourceLocation: sourceLocation)
         #expect(tls.supportedCipherSuites == [.AES256GCM_SHA384], sourceLocation: sourceLocation)
         #expect(tls.quicTransportParameters == nil, sourceLocation: sourceLocation)
@@ -163,12 +102,19 @@ struct StateMachineTLSOptionsTests {
         #expect(tls.sessionState == nil, sourceLocation: sourceLocation)
         #expect(!tls.clientAuthRequired, sourceLocation: sourceLocation)
         #expect(tls.externalPSK == nil, sourceLocation: sourceLocation)
-        #expect(options.stateMachine.resumedTransportParameters == nil, sourceLocation: sourceLocation)
-        #expect(options.swiftNetwork.resumedQUICTransportParameters == nil, sourceLocation: sourceLocation)
+        #expect(
+            tls.newSessionTicketRequestCount == defaults.newSessionTicketRequestCount,
+            sourceLocation: sourceLocation
+        )
+        #expect(
+            tls.resumedSessionTicketRequestCount == defaults.resumedSessionTicketRequestCount,
+            sourceLocation: sourceLocation
+        )
+        #expect(options.resumedTransportParameters == nil, sourceLocation: sourceLocation)
     }
 
-    /// The configuration's key exchange group is x25519 by default, which SwiftNetwork's TLS
-    /// options default to but `SwiftTLSOptions()` doesn't.
+    /// The configuration's key exchange group is x25519 by default, which `SwiftTLSOptions()`
+    /// isn't.
     @available(anyAppleOS 26, *)
     @Test
     func aClientWithRawPublicKeysNegotiatesTheConfiguredGroup() throws {
@@ -192,7 +138,7 @@ struct StateMachineTLSOptionsTests {
                 serverName: "example.com",
                 keyExchangeGroup: expected
             )
-            let tls = options.stateMachine.tls
+            let tls = options.tls
             #expect(tls.trustedRawPublicKeyCertificates == [try Self.p256PublicKey()])
             #expect(tls.rawPrivateKey == nil)
             #expect(tls.privateKey == nil)
@@ -218,12 +164,11 @@ struct StateMachineTLSOptionsTests {
             serverName: "example.com",
             keyExchangeGroup: .x25519
         )
-        let tls = options.stateMachine.tls
+        let tls = options.tls
         #expect(tls.trustedRawPublicKeyCertificates == nil)
         #expect(tls.asyncAuthenticator == nil)
-        let stateMachineVerifier = try #require(tls.asyncVerifier)
-        let swiftNetworkVerifier = try #require(options.swiftNetwork.tlsOptions.asyncVerifier)
-        #expect(stateMachineVerifier.availableCertificateTypes == [.x509])
+        let tlsVerifier = try #require(tls.asyncVerifier)
+        #expect(tlsVerifier.availableCertificateTypes == [.x509])
 
         // Without verification anything goes; otherwise the verifier refuses what isn't X.509
         // right away, before it would wait for its `run()`.
@@ -235,8 +180,7 @@ struct StateMachineTLSOptionsTests {
         )
         let expected: SwiftTLS.VerificationResult =
             verification == .noVerification ? .valid : .invalid(reason: "unsupported certificate type")
-        #expect(stateMachineVerifier.verifyHandshake(info) == expected)
-        #expect(swiftNetworkVerifier.verifyHandshake(info) == expected)
+        #expect(tlsVerifier.verifyHandshake(info) == expected)
     }
 
     /// Without a verification configuration a client trusts nothing; one verifying certificates
@@ -269,7 +213,7 @@ struct StateMachineTLSOptionsTests {
             serverName: "example.com",
             keyExchangeGroup: .x25519
         )
-        let tls = options.stateMachine.tls
+        let tls = options.tls
         #expect(tls.trustedRawPublicKeyCertificates == nil)
         #expect(tls.asyncVerifier == nil)
     }
@@ -295,7 +239,7 @@ struct StateMachineTLSOptionsTests {
             serverName: "example.com",
             keyExchangeGroup: .secp256
         )
-        let tls = options.stateMachine.tls
+        let tls = options.tls
         #expect(tls.trustedRawPublicKeyCertificates == [try Self.p256PublicKey()])
         let privateKey = try P256.Signing.PrivateKey.fromDERFile(p256PrivateKeyPath)
         #expect(tls.rawPrivateKey == Array(privateKey.rawRepresentation))
@@ -331,7 +275,7 @@ struct StateMachineTLSOptionsTests {
             serverName: "example.com",
             keyExchangeGroup: .x25519
         )
-        let tls = options.stateMachine.tls
+        let tls = options.tls
         #expect(tls.asyncAuthenticator?.supportedCertificateTypes == [.x509])
         #expect(tls.trustedRawPublicKeyCertificates == nil)
         #expect(tls.rawPrivateKey == nil)

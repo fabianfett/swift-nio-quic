@@ -1017,3 +1017,15 @@ extension QUICStreamCore {
     }
 }
 #endif  // DEBUG
+
+extension NIOCore.ByteBuffer {
+    fileprivate mutating func withUnsafeMutableReadableBytesWithStorageManagement2<T>(
+        _ body: (UnsafeMutableRawBufferPointer, AnyObject) throws -> T
+    ) rethrows -> T {
+        try self.withUnsafeReadableBytesWithStorageManagement { ptr, owner in
+            let _ = owner.retain()
+            let unwrappedOwner = owner.takeRetainedValue()
+            return try body(UnsafeMutableRawBufferPointer(mutating: ptr), unwrappedOwner)
+        }
+    }
+}

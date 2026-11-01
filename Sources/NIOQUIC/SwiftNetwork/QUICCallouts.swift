@@ -166,26 +166,6 @@ final class QUICCallouts {
 /// point that acquires the event context itself. See ``QUICCallouts``.
 @available(anyAppleOS 26, *)
 enum QUICCallout {
-    /// The stream channel became active: `channelRegistered`, then `channelActive`.
-    case streamActive(QUICChannelStreamHandler)
-    /// The stream channel's buffered inbound bytes, as a `channelRead`.
-    case streamRead(QUICChannelStreamHandler)
-    /// The end of a burst of reads on the stream channel: `channelReadComplete`, then auto-read.
-    case streamReadComplete(QUICChannelStreamHandler)
-    /// `ChannelEvent.inputClosed` on the stream channel.
-    case streamInputClosed(QUICChannelStreamHandler)
-    /// `QUICStopSendingEvent` on the stream channel.
-    case streamStopSending(QUICChannelStreamHandler, code: NIOQUICHelpers.QUICApplicationErrorCode)
-    /// `errorCaught` on the stream channel.
-    case streamError(QUICChannelStreamHandler, any Error)
-    /// The stream channel closed: its close promise, `errorCaught` if there's an error, then
-    /// `channelInactive` and `channelUnregistered` if it was active.
-    case streamClosed(QUICChannelStreamHandler, promise: EventLoopPromise<Void>?, error: (any Error)?)
-    /// A locally opened stream's outcome, for whoever opened it.
-    case streamReady(
-        (Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>) -> Void,
-        Result<(streamID: QUICStreamID, handler: QUICChannelStreamHandler), any Error>
-    )
     /// Completes a promise.
     case completePromise(EventLoopPromise<Void>, Result<Void, any Error>)
     /// A call into the connection channel.
@@ -196,22 +176,6 @@ enum QUICCallout {
 
     func run(through callouts: QUICCallouts) {
         switch self {
-        case .streamActive(let stream):
-            stream.deliverActive()
-        case .streamRead(let stream):
-            stream.deliverRead()
-        case .streamReadComplete(let stream):
-            stream.deliverReadComplete()
-        case .streamInputClosed(let stream):
-            stream.deliverInputClosed()
-        case .streamStopSending(let stream, let code):
-            stream.deliverStopSending(code: code)
-        case .streamError(let stream, let error):
-            stream.deliverError(error)
-        case .streamClosed(let stream, let promise, let error):
-            stream.deliverClose(promise: promise, error: error)
-        case .streamReady(let onStreamReady, let result):
-            onStreamReady(result)
         case .completePromise(let promise, let result):
             promise.completeWith(result)
         case .connection(let connection, let callout):

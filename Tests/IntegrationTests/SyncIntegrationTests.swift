@@ -378,7 +378,7 @@ final class TestProtocolViolationServerHandler: ChannelInboundHandler {
 ///
 /// Poisons its own connection's retired SCID set, then announces the same SCID.
 /// `handleAssociateConnectionID` runs on the client side (it's triggered by the local
-/// SwiftNetwork creating the SCID), so it finds the ID in `retiredSCIDs` and triggers
+/// connection issuing the SCID), so it finds the ID in `retiredSCIDs` and triggers
 /// the protocol violation close.
 @available(anyAppleOS 26, *)
 final class TestProtocolViolationClientHandler: ChannelInboundHandler {
@@ -433,7 +433,7 @@ final class TestProtocolViolationClientHandler: ChannelInboundHandler {
 
         // Connection is established. First poison, then announce the same SCID.
         // handleAssociateConnectionID runs on the client side (triggered by the local
-        // SwiftNetwork creating the SCID), so it will find X in retiredSCIDs.
+        // connection issuing the SCID), so it will find X in retiredSCIDs.
         self.announcedSCID = true
 
         context.channel.parent!.triggerUserOutboundEvent(
@@ -2304,9 +2304,7 @@ final class SyncIntegrationTests: XCTestCase {
     /// only half-closes the output side and keeps reads open.
     /// Without opting in, received STOP_SENDING tears down the whole channel.
     ///
-    /// Note: ideally we'd also verify data reception on the read side, but SwiftNetwork
-    /// currently zombifies the stream when `stopSending` closes the read side, preventing
-    /// further outbound frames even though the write side is still open.
+    /// Note: this doesn't verify data reception on the read side yet.
     func testReceivedStopSendingWithOptInHalfClosesOutput() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
@@ -2394,12 +2392,4 @@ final class SyncIntegrationTests: XCTestCase {
         try await serverChannel.close()
         try await clientConnectionChannel.close()
     }
-
-    /// Reproducer: SwiftNetwork zombifies a stream's write side when the read side is closed
-    /// via `stopSending()`, even though RFC 9000 §3.1 says send and receive are independent.
-    ///
-    /// Scenario: Server opens a bidirectional stream with the client. The server calls
-    /// `stopSending()` (closing its read/input side), then writes data on the same stream.
-    /// The write "succeeds" at the NIO level but the data never reaches the client because
-    /// SwiftNetwork marks the stream as a zombie when the read side is closed.
 }

@@ -68,8 +68,8 @@ struct StateMachineCoreConfigurationTests {
     }
 
     /// A connection tells its peer not to migrate only if it has no spare connection IDs, which
-    /// zero-length ones don't (RFC 9000 Sections 9.5 and 18.2). It takes as many connection IDs
-    /// as the SwiftNetwork driver does, and issues its own.
+    /// zero-length ones don't (RFC 9000 Sections 9.5 and 18.2). It takes up to 64 connection IDs,
+    /// and issues its own.
     @available(anyAppleOS 26, *)
     @Test(arguments: [0, 8])
     func onlyConnectionsWithoutConnectionIDsDisableActiveMigration(connectionIDLength: Int) throws {

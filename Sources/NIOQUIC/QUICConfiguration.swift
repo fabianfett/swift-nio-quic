@@ -93,12 +93,12 @@ public struct InitialPacketSize: Sendable, Hashable {
     /// Send UDP payloads as large as the datagram that carried the client's first Initial packet,
     /// but at most `maximum` bytes.
     ///
-    /// Connections driven by the state machine then probe for larger payloads, up to `maximum`,
+    /// Connections then probe for larger payloads, up to `maximum`,
     /// with path MTU discovery once the handshake is confirmed (RFC 9000, § 14.3, RFC 8899): a
     /// padded probe goes out while enough stream data waits to make up for it, and the connection
     /// sends payloads of its size once the peer acknowledged it. The search covers MTUs of 1280
     /// bytes and more, so a `maximum` below 1252 bytes over IPv4 (1232 bytes over IPv6) has nothing
-    /// to probe for. Connections driven by SwiftNetwork keep the size they start with.
+    /// to probe for.
     ///
     /// NOTE: Probing needs the don't fragment bit (see ``QUICDontFragment``). Without it, the
     /// network fragments a probe larger than the path MTU instead of dropping it, the probe is
@@ -204,20 +204,18 @@ public struct QUICConfiguration: Sendable {
     /// The maximum UDP payload size the connection sends from its first packet on. Defaults to
     /// 1200 bytes, the minimum every QUIC path must support (RFC 9000, Section 14). Initial packets are
     /// padded to this size, and the connection never lowers its maximum packet size below it. With
-    /// ``InitialPacketSize/matchingClientInitial(upTo:)``, state machine connections probe for larger
+    /// ``InitialPacketSize/matchingClientInitial(upTo:)``, connections probe for larger
     /// packets later.
     ///
     /// NOTE: Only raise it if the whole path and the peer support it. Values of 1200 or less have no effect.
     public var initialPacketSize: InitialPacketSize = .fixed(1200)
     /// Spread the packets of each congestion window over the round-trip time instead of sending them in one
     /// burst (RFC 9002, Section 7.7). Defaults to `false`.
-    ///
-    /// NOTE: Only connections driven by the state machine pace. Connections driven by SwiftNetwork ignore it.
     public var pacePackets: Bool = false
 
     /// The path to the file where the key log should be written to. Defaults to `nil`, no key log.
     ///
-    /// NOTE: Neither driver writes a key log yet, as SwiftTLS has no hook to export the secrets.
+    /// NOTE: Connections write no key log yet, as SwiftTLS has no hook to export the secrets.
     /// Connections accept the path and ignore it.
     public var keyLogPath: String?
     /// Configuration for qlog. Defaults to `nil`, no qlog.

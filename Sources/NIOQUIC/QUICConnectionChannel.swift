@@ -118,13 +118,9 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
     /// Whether the channel is currently in a read loop.
     private var _inReadLoop: Bool
 
-    /// A queue of streams pushed to the channel by the underlying connection. These are dequeued
-    /// at the end of the parent channel's read loop (in `_parentChannelReadComplete`).
-    private var _pendingStreams: Deque<(QUICStreamID, QUICChannelStreamHandler)>
-
     /// This flag tracks if QUIC datagrams were forwarded inbound on the connection channel during
     /// this tick. Part of the responsibility of the `QUICConnectionChannel` is accepting datagrams
-    /// from SwiftNetwork and sending them on the connection channel. At the end of a tick, it should
+    /// from the connection and sending them on the connection channel. At the end of a tick, it should
     /// only fire `channelReadComplete` after sending datagrams.
     private var _readDatagramsInThisTick: Bool
 
@@ -183,7 +179,6 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         self._readyPromise = nil
         self._isAllowedToDrain = true
         self._inReadLoop = false
-        self._pendingStreams = []
         self._datagramNegotiation = .waitingForPeerAdvertisement(earlyWrites: TinyArray())
         self._readDatagramsInThisTick = false
         self._streamChannels = nil
@@ -494,7 +489,7 @@ extension QUICConnectionChannel.ConnectionView where Consumer: ~Copyable {
     /// Drains the stream table from outside of a read-loop (waiting until the next read might not
     /// happen for some time.)
     func drainStreams() {
-        // Runs on the next loop tick to avoid re-entering SwiftNetwork.
+        // Runs on the next loop tick: the table asks for it while it records a stream's events.
         self._channel.eventLoop.assumeIsolated().execute {
             self._channel.drainStreamTable()
         }
@@ -514,11 +509,6 @@ extension QUICConnectionChannel.ConnectionView where Consumer: ~Copyable {
         self._channel.pipeline.syncOperations.fireChannelRead(NIOAny(datagram))
     }
 
-    /// The connection's datagram flow failed; fire the error into the pipeline.
-    func datagramError(_ error: any Error) {
-        self._channel.pipeline.syncOperations.fireErrorCaught(error)
-    }
-
     /// The connection closed spontaneously.
     ///
     /// Locally-requested closes do not arrive here, they go via
@@ -527,15 +517,6 @@ extension QUICConnectionChannel.ConnectionView where Consumer: ~Copyable {
     /// - Parameter error: The close error, or `nil` for a clean close.
     func connectionClosed(error: (any Error)?) {
         self._channel._connectionClosed(error: error)
-    }
-
-    /// Notify the channel that a peer-initiated inbound stream was created.
-    ///
-    /// - Parameters:
-    ///   - id: The stream's ID.
-    ///   - channel: The stream's handler.
-    func newInboundStream(id: QUICStreamID, channel: QUICChannelStreamHandler) {
-        self._channel._newInboundStream(streamID: id, channel: channel)
     }
 }
 
@@ -755,7 +736,7 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     /// reconcile's, which fires lifecycle events mid-batch when re-entered.
     ///
     /// Note this does not *set* `_isAllowedToDrain`: its own work (pop finalized packets, read
-    /// the state machine) never re-enters SwiftNetwork, so there is nothing new to suppress.
+    /// the state machine) never re-enters the channel, so there is nothing new to suppress.
     fileprivate func drainAndReconcileLifecycle() {
         self.eventLoop.assertInEventLoop()
 
@@ -786,8 +767,8 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     }
 
     /// Run `body` with the drain guard held, dropping any re-entrant `drainOutbound()`
-    /// SwiftNetwork fires while `body` runs (e.g. from `receivePacketsComplete()` finalizing
-    /// frames, or `close()` stopping the flow handler).
+    /// the connection fires while `body` runs (e.g. from `receivePacketsComplete()` processing
+    /// the core's events).
     ///
     /// The explicit drain after flushes whatever `body` finalized. Without this
     /// the re-entrant wake would run a nested `drainAndReconcileLifecycle()`
@@ -1045,7 +1026,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         self.drainAndReconcileLifecycle()
         self.drainStreamTable()
-        self.processPendingInboundStreams()
 
         // Only fire channelReadComplete after reading a datagram.
         if self._readDatagramsInThisTick {
@@ -1139,45 +1119,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     func setInboundStreamInitializer(_ initializer: QUICInboundStreamInitializer) {
         self.eventLoop.assertInEventLoop()
         self._streamInitializer = initializer
-    }
-
-    private func _newInboundStream(streamID: QUICStreamID, channel: QUICChannelStreamHandler) {
-        self.eventLoop.assertInEventLoop()
-        self._pendingStreams.append((streamID, channel))
-    }
-
-    /// Initialize inbound streams pushed during the current read batch, skipping any not yet
-    /// connected.
-    private func processPendingInboundStreams() {
-        self.eventLoop.assertInEventLoop()
-
-        while let (streamID, stream) = self._pendingStreams.popFirst() {
-            if stream.streamStateMachine.isConnected {
-                self.runInboundStreamInitializer(streamID: streamID, stream: stream)
-            }
-        }
-    }
-
-    private func runInboundStreamInitializer(
-        streamID: QUICStreamID,
-        stream: QUICChannelStreamHandler
-    ) {
-        self.eventLoop.assertInEventLoop()
-
-        self._lifecycle.willInitializeStream()
-
-        let initialized = stream.initializeInbound(
-            streamID: streamID,
-            initializer: self._streamInitializer
-        )
-
-        if let initialized {
-            initialized.assumeIsolated().whenComplete { _ in
-                self._streamInitializerDidComplete()
-            }
-        } else {
-            self._streamInitializerDidComplete()
-        }
     }
 
     /// The address of the remote peer, which follows the connection's active path, for the stream
@@ -1312,8 +1253,8 @@ extension QUICConnectionChannel where Consumer == QUICStreamChannels {
 
 @available(anyAppleOS 26, *)
 extension QUICConnectionChannel: QUICStreamChannelGroupDelegate where Consumer: ~Copyable {
-    /// Runs the inbound stream initializer on a stream channel which became active, as for the
-    /// `SwiftNetwork` driver's: `channelInactive` waits for it.
+    /// Runs the inbound stream initializer on a stream channel which became active:
+    /// `channelInactive` waits for it.
     func initializeInboundStream(_ channel: QUICStreamChannel) {
         self.eventLoop.assertInEventLoop()
         self._lifecycle.willInitializeStream()

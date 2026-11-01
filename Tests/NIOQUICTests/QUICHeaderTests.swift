@@ -69,7 +69,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "initial",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func initial(version: Int) throws {
         let connectionID = QUICConnectionID(
@@ -102,7 +102,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "zeroRTT",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func zeroRTT(version: Int) throws {
         let connectionID = QUICConnectionID(
@@ -127,7 +127,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "handshake",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func handshake(version: Int) throws {
         let connectionID = QUICConnectionID(
@@ -152,7 +152,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "retry",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func retry(version: Int) throws {
         let connectionID = QUICConnectionID(
@@ -213,7 +213,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "initial with zero-length SCID",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func initialWithZeroLengthSCID(version: Int) throws {
         let dcid = QUICConnectionID(
@@ -251,7 +251,7 @@ final class HeaderIDTests {
     @available(anyAppleOS 26, *)
     @Test(
         "initial with zero-length DCID and SCID",
-        arguments: [1]  // SwiftNetwork only supports QUIC version 1
+        arguments: [1]  // The state machine only supports QUIC version 1
     )
     func initialWithZeroLengthDCIDAndSCID(version: Int) throws {
         let zeroLengthCID = QUICConnectionID(

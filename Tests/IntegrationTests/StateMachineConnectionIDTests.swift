@@ -75,7 +75,7 @@ final class ConnectionIDEventRecorder: ChannelInboundHandler, Sendable {
 /// the connection ID requests of the connection channel.
 @Suite(.timeLimit(.minutes(1)))
 struct StateMachineConnectionIDTests {
-    /// The handshake's connection ID and the eight spares the SwiftNetwork driver issues too.
+    /// The handshake's connection ID and the eight spares the connection issues.
     private static let issuedConnectionIDs = 1 + 8
 
     @available(anyAppleOS 26, *)
