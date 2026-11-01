@@ -89,7 +89,6 @@ struct StateMachinePMTUDTests {
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<PatternResponder>?>(nil)
 
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             host: host,
             configureServer: { $0.initialPacketSize = size },
             inspectClientDatagram: { datagram in received.withLockedValue { $0.record(datagram) } },
@@ -158,7 +157,6 @@ struct StateMachinePMTUDTests {
         let upload = ByteBuffer(bytes: (0..<Self.transferSize).map { UInt8(truncatingIfNeeded: $0 % 251) })
 
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             // The server doesn't close the streams.
             initialMaxStreamsBidi: Self.streams * Self.maximumRounds,
             configureClient: { $0.initialPacketSize = size },

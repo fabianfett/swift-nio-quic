@@ -33,15 +33,12 @@ import XCTest
 ///     accepted connections. Defaults to a no-op.
 ///   - noMoreConnections: Called when the handler becomes inactive and no
 ///     further connections will be accepted.
-///   - driverCheck: The driver to serve the stream channels on, and the check of which ran;
-///     `nil` for the default.
 @available(anyAppleOS 26, *)
 func createServerChannel(
     eventLoopGroup: any EventLoopGroup,
     host: String,
     port: Int,
     logger: Logger,
-    driverCheck: StreamChannelsDriverCheck? = nil,
     maxDatagramFrameSize: Int = 65535,
     initialPacketSize: InitialPacketSize = .fixed(1200),
     udpChannelInitializer: @Sendable @escaping (any Channel) throws -> Void = { _ in },
@@ -68,7 +65,6 @@ func createServerChannel(
         port: port,
         quicConfiguration: quicConfiguration,
         logger: logger,
-        driverCheck: driverCheck,
         udpChannelInitializer: udpChannelInitializer,
         inboundConnectionInitializer: inboundConnectionInitializer,
         inboundStreamInitializer: inboundStreamInitializer,
@@ -87,7 +83,6 @@ func createClientChannel(
     host: String,
     port: Int,
     logger: Logger,
-    driverCheck: StreamChannelsDriverCheck? = nil,
     maxDatagramFrameSize: Int = 65535,
     initialPacketSize: Int = 1200,
     udpChannelInitializer: @Sendable @escaping (any Channel) throws -> Void = { _ in }
@@ -107,7 +102,6 @@ func createClientChannel(
         port: port,
         quicConfiguration: quicConfiguration,
         logger: logger,
-        driverCheck: driverCheck,
         udpChannelInitializer: udpChannelInitializer,
         inboundConnectionInitializer: { _, _ in fatalError() },
         inboundStreamInitializer: { $0.eventLoop.makeSucceededVoidFuture() },
@@ -122,7 +116,6 @@ private func createQUICChannel(
     port: Int,
     quicConfiguration: QUICConfiguration,
     logger: Logger,
-    driverCheck: StreamChannelsDriverCheck?,
     udpChannelInitializer: @Sendable @escaping (any Channel) throws -> Void,
     inboundConnectionInitializer:
         @Sendable @escaping (any Channel, NIOQUIC.QUICStreamCreator) -> EventLoopFuture<Void>,
@@ -144,7 +137,6 @@ private func createQUICChannel(
                 inboundStreamInitializer: inboundStreamInitializer,
                 noMoreConnections: noMoreConnections
             )
-            driverCheck?.configure(quicHandler)
             try channel.pipeline.syncOperations.addHandler(quicHandler)
             return channel
         }

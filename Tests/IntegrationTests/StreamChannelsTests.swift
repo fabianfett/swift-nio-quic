@@ -21,15 +21,14 @@ import Testing
 
 @testable import NIOQUIC
 
-/// Stream channels over a real connection, on each driver.
+/// Stream channels over a real connection.
 @Suite(.timeLimit(.minutes(1)))
 struct StreamChannelsTests {
     /// A connection channel that closes gracefully tells its stream channels first, so that they
     /// can finish.
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func aGracefulCloseQuiescesTheStreams(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func aGracefulCloseQuiescesTheStreams() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let host = "127.0.0.1"
         let serverConnection = eventLoopGroup.any().makePromise(of: (any Channel).self)
@@ -41,7 +40,6 @@ struct StreamChannelsTests {
             host: host,
             port: 0,
             logger: Logger(label: "Server"),
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, _ in
                 serverConnection.succeed(connectionChannel)
                 return connectionChannel.eventLoop.makeSucceededVoidFuture()
@@ -59,8 +57,7 @@ struct StreamChannelsTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: Logger(label: "Client"),
-            driverCheck: driverCheck
+            logger: Logger(label: "Client")
         ).get()
 
         let (_, streamCreator) = try await connectOutbound(
@@ -83,7 +80,6 @@ struct StreamChannelsTests {
 
         try await clientChannel.close()
         try await serverChannel.close()
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 }
 

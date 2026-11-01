@@ -12,7 +12,10 @@
 //
 //===----------------------------------------------------------------------===//
 
+import Foundation
+import Logging
 import NIOCore
+import NIOEmbedded
 @_spi(Essentials) @_spi(ProtocolProvider) import QUICStateMachine
 import Testing
 
@@ -125,5 +128,51 @@ struct StateMachineCoreConfigurationTests {
         #expect(try !recordsPacketEvents())
         configuration.qLogConfiguration = QLogConfiguration(path: "/tmp")
         #expect(try recordsPacketEvents() == QUIC.isQlogEnabled)
+    }
+
+    /// A server with a qlog accepts connections, with the `QlogOutput` trait or without.
+    @available(anyAppleOS 26, *)
+    @Test
+    func aServerWithAQLogAcceptsAConnection() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var configuration = QUICConfiguration.forServer(
+            serverName: "quic-test.local",
+            authenticationConfiguration: .rawPublicKeys(
+                publicKeyFilePath: p256PublicKeyPath,
+                privateKeyFilePath: p256PrivateKeyPath
+            ),
+            applicationProtocols: []
+        )
+        configuration.qLogConfiguration = QLogConfiguration(path: directory.path)
+        let channel = EmbeddedChannel()
+        channel.localAddress = try SocketAddress(ipAddress: "127.0.0.1", port: 1234)
+        let (handler, _) = try QUICHandler<QUICStreamChannels>.makeHandlerAndConnectionMultiplexer(
+            channel: channel,
+            quicConfiguration: configuration,
+            logger: Logger(label: "test"),
+            inboundStreamChannelInitializer: { $0.eventLoop.makeSucceededVoidFuture() }
+        )
+        try channel.pipeline.syncOperations.addHandler(handler)
+        defer { _ = try? channel.finish() }
+
+        var random = SystemRandomNumberGenerator()
+        var packet = QUICPackets.initial(
+            destinationID: .random(length: 8, using: &random),
+            sourceID: .random(length: 8, using: &random),
+            token: [],
+            version: 1
+        )
+        packet += [UInt8](repeating: 0, count: 1200 - packet.count)
+        channel.pipeline.fireChannelRead(
+            AddressedEnvelope(
+                remoteAddress: try SocketAddress(ipAddress: "127.0.0.1", port: 443),
+                data: ByteBuffer(bytes: packet)
+            )
+        )
+        channel.pipeline.fireChannelReadComplete()
+
+        #expect(handler._forTesting_connectionCount == 1)
     }
 }

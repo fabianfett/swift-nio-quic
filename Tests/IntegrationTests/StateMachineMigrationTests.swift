@@ -65,15 +65,12 @@ struct StateMachineMigrationTests {
     private static let host = "127.0.0.1"
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: [
-        Drivers(client: .stateMachine, server: .stateMachine),
-        Drivers(client: .swiftNetwork, server: .stateMachine),
-    ])
-    func aTransferContinuesWhenTheClientRebinds(drivers: Drivers) async throws {
+    @Test
+    func aTransferContinuesWhenTheClientRebinds() async throws {
         // One thread: the relay hands datagrams from one channel's pipeline to the other's synchronously.
         let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         do {
-            try await Self.transferWhileTheClientRebinds(drivers: drivers, eventLoopGroup: eventLoopGroup)
+            try await Self.transferWhileTheClientRebinds(eventLoopGroup: eventLoopGroup)
         } catch {
             try? await eventLoopGroup.shutdownGracefully()
             throw error
@@ -83,7 +80,6 @@ struct StateMachineMigrationTests {
 
     @available(anyAppleOS 26, *)
     private static func transferWhileTheClientRebinds(
-        drivers: Drivers,
         eventLoopGroup: MultiThreadedEventLoopGroup
     ) async throws {
         let chunkSize = 64 * 1024
@@ -98,7 +94,6 @@ struct StateMachineMigrationTests {
         }
 
         try await withConsumerPair(
-            drivers: drivers,
             eventLoopGroup: eventLoopGroup,
             // The server's packets to the old address are lost, so the client only sends again,
             // from its new address, once a keepalive is due.
@@ -174,7 +169,6 @@ struct StateMachineMigrationTests {
         }
 
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             eventLoopGroup: eventLoopGroup,
             configureClientPipeline: switchAddresses,
             client: RecordConsumer(recording: recording),
@@ -242,7 +236,6 @@ struct StateMachineMigrationTests {
         let recording = StreamRecording()
 
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             configureClientPipeline: { try $0.addHandler(ShortHeaderRecorder()) },
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(),

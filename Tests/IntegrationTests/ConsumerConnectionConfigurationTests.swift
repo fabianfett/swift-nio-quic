@@ -19,9 +19,7 @@ import Testing
 
 @testable import NIOQUIC
 
-/// Configuration options of connections that serve a stream consumer, on every driver pairing.
-/// `ConsumerPair.close` checks that each connection ran on the driver it was meant for, so these
-/// also check that the state machine driver accepts the configurations.
+/// Configuration options of connections that serve a stream consumer.
 @Suite(.timeLimit(.minutes(1)))
 struct ConsumerConnectionConfigurationTests {
     /// Adds a handler that hands every datagram the connection receives to `onDatagram`, which
@@ -51,12 +49,11 @@ struct ConsumerConnectionConfigurationTests {
 
     /// Datagrams (RFC 9221) reach the peer, and the peer's answers come back.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testDatagramsAreEchoed(drivers: Drivers) async throws {
+    @Test
+    func testDatagramsAreEchoed() async throws {
         let echoed = makePromise(of: ByteBuffer.self, timeout: .seconds(5))
 
         try await withConsumerPair(
-            drivers: drivers,
             client: EchoConsumer(),
             server: EchoConsumer(),
             onServerConnection: { connection in
@@ -74,10 +71,9 @@ struct ConsumerConnectionConfigurationTests {
 
     /// A peer which advertised no `max_datagram_frame_size` gets no datagrams: the write fails.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testDatagramsToAPeerWithoutDatagramSupportFail(drivers: Drivers) async throws {
+    @Test
+    func testDatagramsToAPeerWithoutDatagramSupportFail() async throws {
         try await withConsumerPair(
-            drivers: drivers,
             configureServer: { $0.maxDatagramFrameSize = 0 },
             client: EchoConsumer(),
             server: EchoConsumer(),
@@ -91,12 +87,11 @@ struct ConsumerConnectionConfigurationTests {
 
     /// A datagram larger than the peer's `max_datagram_frame_size` fails; smaller ones still work.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testDatagramsLargerThanThePeerAcceptsFail(drivers: Drivers) async throws {
+    @Test
+    func testDatagramsLargerThanThePeerAcceptsFail() async throws {
         let echoed = makePromise(of: ByteBuffer.self, timeout: .seconds(5))
 
         try await withConsumerPair(
-            drivers: drivers,
             configureServer: { $0.maxDatagramFrameSize = 256 },
             client: EchoConsumer(),
             server: EchoConsumer(),
@@ -120,8 +115,7 @@ struct ConsumerConnectionConfigurationTests {
     /// packet isn't sent; a server matching the client's Initial uses the client's size.
     @available(anyAppleOS 26, *)
     @Test(
-        arguments: Drivers.all,
-        [
+        arguments: [
             (InitialPacketSize.fixed(1200), 1350, [6]),
             (InitialPacketSize.fixed(1350), 1350, [1250, 6]),
             (InitialPacketSize.matchingClientInitial(upTo: 1500), 1350, [1250, 6]),
@@ -129,7 +123,6 @@ struct ConsumerConnectionConfigurationTests {
         ]
     )
     func testPacketsAreNoLargerThanTheInitialPacketSize(
-        drivers: Drivers,
         sizes: (server: InitialPacketSize, client: Int, expected: [Int])
     ) async throws {
         let marker = ByteBuffer(string: "marker")
@@ -137,7 +130,6 @@ struct ConsumerConnectionConfigurationTests {
         let received = NIOLockedValueBox<[Int]>([])
 
         try await withConsumerPair(
-            drivers: drivers,
             configureClient: { $0.initialPacketSize = .fixed(sizes.client) },
             configureServer: { $0.initialPacketSize = sizes.server },
             client: EchoConsumer(),
@@ -166,17 +158,15 @@ struct ConsumerConnectionConfigurationTests {
 
     /// Keepalives hold an otherwise idle connection open past its idle timeout.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testKeepalivesHoldAnIdleConnectionOpen(drivers: Drivers) async throws {
+    @Test
+    func testKeepalivesHoldAnIdleConnectionOpen() async throws {
         let recording = StreamRecording()
 
         // A keepalive has a second to arrive: on the shared loops other tests can delay it that long.
         try await withOwnEventLoops { eventLoopGroup in
             try await withConsumerPair(
-                drivers: drivers,
                 eventLoopGroup: eventLoopGroup,
                 maxIdleTimeout: .seconds(2),
-                // The SwiftNetwork driver counts keepalive intervals in whole seconds.
                 configureClient: { $0.keepAliveInterval = .seconds(1) },
                 client: RecordConsumer(recording: recording),
                 server: EchoConsumer(),
@@ -193,17 +183,16 @@ struct ConsumerConnectionConfigurationTests {
         }
     }
 
-    /// Connections with a key log path connect, on the driver they were meant for, and write no
-    /// key log: SwiftTLS doesn't export the secrets yet.
+    /// Connections with a key log path connect, and write no key log: SwiftTLS doesn't export the
+    /// secrets yet.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testConnectionsWithAKeyLogPathConnect(drivers: Drivers) async throws {
+    @Test
+    func testConnectionsWithAKeyLogPathConnect() async throws {
         let recording = StreamRecording()
         let keyLogPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("nio-quic-keylog-\(UUID().uuidString)").path
 
         try await withConsumerPair(
-            drivers: drivers,
             configureClient: { $0.keyLogPath = keyLogPath },
             configureServer: { $0.keyLogPath = keyLogPath },
             client: RecordConsumer(recording: recording),
@@ -219,13 +208,12 @@ struct ConsumerConnectionConfigurationTests {
 
     /// A client forcing Version Negotiation (RFC 9000 Section 6) still connects.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testAClientForcingVersionNegotiationConnects(drivers: Drivers) async throws {
+    @Test
+    func testAClientForcingVersionNegotiationConnects() async throws {
         let recording = StreamRecording()
         let versionNegotiations = NIOLockedValueBox(0)
 
         try await withConsumerPair(
-            drivers: drivers,
             configureClient: { $0.forceVersionNegotiation = true },
             inspectClientDatagram: { datagram in
                 // A long header with version 0 (RFC 9000 Section 17.2.1).

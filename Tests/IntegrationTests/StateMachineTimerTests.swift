@@ -74,7 +74,6 @@ struct StateMachineTimerTests {
     @Test func theConnectionsOfAHandlerShareOneTimer() async throws {
         let serverConnections = NIOLockedValueBox<[QUICStreamConnection<EchoConsumer>]>([])
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             client: EchoConsumer(),
             server: EchoConsumer(),
             onServerConnection: { connection in serverConnections.withLockedValue { $0.append(connection) } }
@@ -127,7 +126,6 @@ struct StateMachineTimerTests {
     @Test func aClosedUDPChannelReleasesTheTimers() async throws {
         let serverConnections = NIOLockedValueBox(0)
         let pair = try await makeConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             makeClientConsumer: { _ in EchoConsumer() },
             makeServerConsumer: { _ in
                 serverConnections.withLockedValue { $0 += 1 }

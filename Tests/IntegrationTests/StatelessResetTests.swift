@@ -31,11 +31,7 @@ struct StatelessResetTests {
     private static let maxIdleTimeout = Duration.seconds(10)
 
     @available(anyAppleOS 26, *)
-    private static func bindServer(
-        port: Int,
-        driver: QUICConnectionDriver,
-        drivers: NIOLockedValueBox<[QUICConnectionDriver?]>
-    ) async throws -> any Channel {
+    private static func bindServer(port: Int) async throws -> any Channel {
         let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
         let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
         let configuration = {
@@ -61,12 +57,8 @@ struct StatelessResetTests {
                     authenticator: nil,
                     logger: Logger(label: "Server"),
                     statelessResetTokenGenerator: .defaultWithUserProvidedKey(Self.statelessResetKey),
-                    makeConsumer: { connection in
-                        drivers.withLockedValue { $0.append(connection.driver) }
-                        return EchoConsumer()
-                    }
+                    makeConsumer: { _ in EchoConsumer() }
                 )
-                handler.connectionDriver = driver
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -74,28 +66,23 @@ struct StatelessResetTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func testAClientLearnsOfLostServerStateFromAStatelessReset(drivers: Drivers) async throws {
-        try await Self.clientLearnsOfLostServerState(drivers: drivers, sendingToASpare: false)
+    @Test
+    func testAClientLearnsOfLostServerStateFromAStatelessReset() async throws {
+        try await Self.clientLearnsOfLostServerState(sendingToASpare: false)
     }
 
     /// The token of a spare connection ID the server issued after the handshake resets the
     /// connection as well (RFC 9000 Section 10.3.1): the client switches to the spare before the
     /// server loses its state.
     @available(anyAppleOS 26, *)
-    @Test(arguments: [
-        Drivers(client: .stateMachine, server: .stateMachine),
-        Drivers(client: .swiftNetwork, server: .stateMachine),
-    ])
-    func testAStatelessResetForASpareConnectionIDResetsTheConnection(drivers: Drivers) async throws {
-        try await Self.clientLearnsOfLostServerState(drivers: drivers, sendingToASpare: true)
+    @Test
+    func testAStatelessResetForASpareConnectionIDResetsTheConnection() async throws {
+        try await Self.clientLearnsOfLostServerState(sendingToASpare: true)
     }
 
     @available(anyAppleOS 26, *)
-    private static func clientLearnsOfLostServerState(drivers: Drivers, sendingToASpare: Bool) async throws {
-        let serverDriver = QUICConnectionDriver(drivers.server)
-        let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
-        let server = try await Self.bindServer(port: 0, driver: serverDriver, drivers: serverDrivers)
+    private static func clientLearnsOfLostServerState(sendingToASpare: Bool) async throws {
+        let server = try await Self.bindServer(port: 0)
         let port = server.localAddress!.port!
 
         let recording = StreamRecording()
@@ -119,7 +106,6 @@ struct StatelessResetTests {
                     logger: Logger(label: "Client"),
                     makeConsumer: { _ in RecordConsumer(recording: recording) }
                 )
-                handler.connectionDriver = QUICConnectionDriver(drivers.client)
                 try channel.pipeline.syncOperations.addHandler(ShortHeaderRecorder())
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
@@ -135,8 +121,6 @@ struct StatelessResetTests {
                 )
             }
             .get()
-        #expect(connection.driver == QUICConnectionDriver(drivers.client))
-        #expect(serverDrivers.withLockedValue { $0 } == [serverDriver])
 
         func request() async throws -> QUICStreamHandle? {
             try await connection.withStreams { streams in
@@ -167,7 +151,7 @@ struct StatelessResetTests {
         // The server loses its state: closing its socket sends nothing, so the client doesn't
         // know. Its next incarnation, on the same port, has no state for the connection.
         try await server.close()
-        let restarted = try await Self.bindServer(port: port, driver: serverDriver, drivers: serverDrivers)
+        let restarted = try await Self.bindServer(port: port)
         defer { restarted.close(promise: nil) }
 
         let start = ContinuousClock.now
@@ -176,10 +160,7 @@ struct StatelessResetTests {
         let elapsed = ContinuousClock.now - start
 
         #expect(elapsed < Self.maxIdleTimeout / 2, "the client waited for its idle timeout: \(elapsed)")
-        // The SwiftNetwork driver reports the reset as a clean close.
-        if drivers.client == .stateMachine {
-            #expect(closed.last?.closeErrorDescription?.contains("stateless reset") == true)
-        }
+        #expect(closed.last?.closeErrorDescription?.contains("stateless reset") == true)
     }
 
     /// The server's connection ID in the last short header packet the client sent.

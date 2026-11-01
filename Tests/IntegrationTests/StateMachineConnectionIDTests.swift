@@ -75,8 +75,6 @@ final class ConnectionIDEventRecorder: ChannelInboundHandler, Sendable {
 /// the connection ID requests of the connection channel.
 @Suite(.timeLimit(.minutes(1)))
 struct StateMachineConnectionIDTests {
-    private static let drivers = Drivers(client: .stateMachine, server: .stateMachine)
-
     /// The handshake's connection ID and the eight spares the SwiftNetwork driver issues too.
     private static let issuedConnectionIDs = 1 + 8
 
@@ -161,7 +159,6 @@ struct StateMachineConnectionIDTests {
         }
 
         try await withConsumerPair(
-            drivers: Self.drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(),
             onServerConnection: captureConnection
@@ -206,8 +203,8 @@ struct StateMachineConnectionIDTests {
     /// A connection ID the connection channel asks for is issued to the peer and routed; once the
     /// peer retires it, it is no longer, and another one replaces it.
     @available(anyAppleOS 26, *)
-    @Test(arguments: Drivers.all)
-    func aRequestedConnectionIDIsIssuedAndRetired(drivers: Drivers) async throws {
+    @Test
+    func aRequestedConnectionIDIsIssuedAndRetired() async throws {
         let recording = StreamRecording()
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
         let captureConnection: @Sendable (QUICStreamConnection<EchoConsumer>) -> Void = { connection in
@@ -216,7 +213,6 @@ struct StateMachineConnectionIDTests {
         let requested = Self.randomConnectionID()
 
         try await withConsumerPair(
-            drivers: drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(),
             onServerConnection: captureConnection
@@ -238,12 +234,10 @@ struct StateMachineConnectionIDTests {
             #expect(events.first == .retired(requested))
             try await Self.roundTrip(pair, recording: recording)
 
-            if drivers.client == .stateMachine {
-                let afterwards = try await Self.localConnectionIDs(of: client, as: RecordConsumer.self)
-                #expect(afterwards.count == Self.issuedConnectionIDs + 1)
-                #expect(!afterwards.contains(requested))
-                #expect(try await Self.retiredConnectionIDs(of: client, as: RecordConsumer.self) == [requested])
-            }
+            let afterwards = try await Self.localConnectionIDs(of: client, as: RecordConsumer.self)
+            #expect(afterwards.count == Self.issuedConnectionIDs + 1)
+            #expect(!afterwards.contains(requested))
+            #expect(try await Self.retiredConnectionIDs(of: client, as: RecordConsumer.self) == [requested])
         }
     }
 
@@ -260,7 +254,6 @@ struct StateMachineConnectionIDTests {
         let reissued = Self.randomConnectionID()
 
         try await withConsumerPair(
-            drivers: Self.drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer(),
             onServerConnection: captureConnection
@@ -289,7 +282,6 @@ struct StateMachineConnectionIDTests {
         let second = Self.randomConnectionID()
 
         try await withConsumerPair(
-            drivers: Self.drivers,
             client: RecordConsumer(recording: recording),
             server: EchoConsumer()
         ) { pair in

@@ -100,7 +100,6 @@ struct StateMachinePacingTests {
         }
 
         try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             configureServer: { $0.pacePackets = true },
             // An RTT of 50 ms: the pacer sends a window per RTT, twice that in slow start.
             configureClientPipeline: { try $0.addHandler(InboundDelay(.milliseconds(50))) },

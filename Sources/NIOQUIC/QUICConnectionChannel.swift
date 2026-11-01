@@ -60,13 +60,8 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
 
     // **IMPORTANT:** see note at the top of this class about these fields.
 
-    /// The underlying SwiftNetwork-backed QUIC connection.
+    /// The underlying QUIC connection.
     private let _connection: Connection
-
-    /// The implementation that drives the connection. Safe from any thread: `_connection` is immutable.
-    var driver: QUICConnectionDriver? {
-        self._connection.driver
-    }
 
     #if DEBUG
     /// The state machine connection behind the channel, if it has one.
@@ -196,8 +191,6 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
         self._pipeline = ChannelPipeline(channel: self)
 
         switch connection {
-        case .live(let connection):
-            connection.setDriver(self)
         case .stateMachine(let connection):
             connection.setDriver(self)
         case .test:
@@ -1062,8 +1055,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         // Done producing data: exit read loop (which also flushes outbound data.)
         switch self._connection {
-        case .live(let connection):
-            connection.exitReadLoop()
         case .stateMachine(let connection):
             connection.exitReadLoop()
         case .test:
@@ -1107,39 +1098,13 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
     ) {
         self.eventLoop.assertInEventLoop()
 
-        switch self._connection {
-        case .live(let connection):
-            do {
-                try connection.addNewOutboundStreamInputHandler(
-                    streamType: type,
-                    connectionChannel: self
-                ) { result in
-                    switch result {
-                    case .success(let (streamID, stream)):
-                        stream.initializeOutbound(
-                            streamID: streamID,
-                            initializer: initializer,
-                            promise: promise
-                        )
-                    case .failure(let error):
-                        promise.fail(error)
-                    }
-                }
-            } catch {
-                // Invalid stream type.
-                promise.fail(error)
-            }
-
-        case .stateMachine, .test:
-            guard let streamChannels = self._streamChannels else {
-                // A consumer serves this connection's streams.
-                promise.fail(ChannelError.operationUnsupported)
-                return
-            }
-            // The table queues the stream until the peer allows another (RFC 9000 Section 4.6).
-            streamChannels.createOutboundStream(type: type, promise: promise, initializer: initializer)
+        guard let streamChannels = self._streamChannels else {
+            // A consumer serves this connection's streams.
+            promise.fail(ChannelError.operationUnsupported)
+            return
         }
-
+        // The table queues the stream until the peer allows another (RFC 9000 Section 4.6).
+        streamChannels.createOutboundStream(type: type, promise: promise, initializer: initializer)
     }
 
     func makeStreamCreator(role: Role) -> QUICStreamCreator {

@@ -89,30 +89,15 @@ protocol QUICConnectionProtocol {
 
 @available(anyAppleOS 26, *)
 extension QUICConnectionChannel where Consumer: ~Copyable {
-    /// The channel's connection, either the real SwiftNetwork-backed connection
-    /// (statically dispatched) or an existential test conformance.
+    /// The channel's connection, either the state machine connection (statically dispatched) or
+    /// an existential test conformance.
     enum Connection {
-        case live(SwiftNetworkQUICConnection<Consumer>)
         case stateMachine(StateMachineQUICConnection<Consumer>)
         case test(any QUICConnectionProtocol)
-
-        /// The implementation that drives the connection, `nil` for a test conformance.
-        var driver: QUICConnectionDriver? {
-            switch self {
-            case .live:
-                return .swiftNetwork
-            case .stateMachine:
-                return .stateMachine
-            case .test:
-                return nil
-            }
-        }
 
         /// Issues `connectionID` to the peer, for `QUICRequestAssociateSCIDEvent`.
         func requestAssociationOfConnectionID(_ connectionID: QUICConnectionID) throws {
             switch self {
-            case .live(let connection):
-                try connection.requestAssociationOfConnectionID(connectionID)
             case .stateMachine(let connection):
                 try connection.requestAssociationOfConnectionID(connectionID)
             case .test:
@@ -123,8 +108,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
         /// Retires one of the peer's connection IDs, for `QUICRequestRetireDCIDEvent`.
         func requestRetirementOfConnectionID(_ connectionID: QUICConnectionID) throws {
             switch self {
-            case .live(let connection):
-                try connection.requestRetirementOfConnectionID(connectionID)
             case .stateMachine(let connection):
                 try connection.requestRetirementOfConnectionID(connectionID)
             case .test:
@@ -135,8 +118,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
         #if DEBUG
         func _forTesting_addRetiredConnectionID(_ connectionID: QUICConnectionID) throws {
             switch self {
-            case .live(let connection):
-                connection._forTesting_addRetiredSCID(connectionID)
             case .stateMachine(let connection):
                 connection._forTesting_addRetiredConnectionID(connectionID)
             case .test:
@@ -146,8 +127,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         func _forTesting_localConnectionIDs() throws -> [QUICConnectionID] {
             switch self {
-            case .live(let connection):
-                return connection._forTesting_getActiveSCIDs()
             case .stateMachine(let connection):
                 return connection._forTesting_localConnectionIDs
             case .test:
@@ -157,8 +136,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
         func _forTesting_removeLocalConnectionID(_ connectionID: QUICConnectionID) throws {
             switch self {
-            case .live(let connection):
-                connection._forTesting_removeFromActiveSCIDs(connectionID)
             case .stateMachine(let connection):
                 connection._forTesting_removeLocalConnectionID(connectionID)
             case .test:
@@ -173,8 +150,6 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consumer: ~Copyable {
     var localAddress: SocketAddress {
         switch self {
-        case .live(let connection):
-            connection.localAddress
         case .stateMachine(let connection):
             connection.localAddress
         case .test(let connection):
@@ -184,8 +159,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     var remoteAddress: SendableAddress {
         switch self {
-        case .live(let connection):
-            connection.remoteAddress
         case .stateMachine(let connection):
             connection.remoteAddress
         case .test(let connection):
@@ -196,8 +169,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
     @discardableResult
     func receivePacket(_ envelope: AddressedEnvelope<ByteBuffer>) -> Int {
         switch self {
-        case .live(let connection):
-            connection.receivePacket(envelope)
         case .stateMachine(let connection):
             connection.receivePacket(envelope)
         case .test(let connection):
@@ -207,8 +178,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func receivePacketsComplete() {
         switch self {
-        case .live(let connection):
-            connection.receivePacketsComplete()
         case .stateMachine(let connection):
             connection.receivePacketsComplete()
         case .test(let connection):
@@ -218,8 +187,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func drainPacketsToSend(to transport: some QUICTransport) {
         switch self {
-        case .live(let connection):
-            connection.drainPacketsToSend(to: transport)
         case .stateMachine(let connection):
             connection.drainPacketsToSend(to: transport)
         case .test(let connection):
@@ -229,12 +196,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func close(isApplicationClose: Bool, errorCode: Int64, reason: String) -> Bool {
         switch self {
-        case .live(let connection):
-            return connection.close(
-                isApplicationClose: isApplicationClose,
-                errorCode: errorCode,
-                reason: reason
-            )
         case .stateMachine(let connection):
             return connection.close(
                 isApplicationClose: isApplicationClose,
@@ -252,8 +213,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func closeAllStreams() -> [EventLoopFuture<Void>] {
         switch self {
-        case .live(let connection):
-            connection.closeAllStreams()
         case .stateMachine(let connection):
             connection.closeAllStreams()
         case .test(let connection):
@@ -263,8 +222,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func writeDatagram(_ datagram: ByteBuffer) -> Bool {
         switch self {
-        case .live(let connection):
-            connection.writeDatagram(datagram)
         case .stateMachine(let connection):
             connection.writeDatagram(datagram)
         case .test(let connection):
@@ -274,8 +231,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func flushDatagrams() {
         switch self {
-        case .live(let connection):
-            connection.flushDatagrams()
         case .stateMachine(let connection):
             connection.flushDatagrams()
         case .test(let connection):
@@ -285,8 +240,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func quiesceStreams() {
         switch self {
-        case .live(let connection):
-            connection.quiesceStreams()
         case .stateMachine(let connection):
             connection.quiesceStreams()
         case .test(let connection):
@@ -296,8 +249,6 @@ extension QUICConnectionChannel.Connection: QUICConnectionProtocol where Consume
 
     func dropChannelReferences() {
         switch self {
-        case .live(let connection):
-            connection.dropChannelReferences()
         case .stateMachine(let connection):
             connection.dropChannelReferences()
         case .test:

@@ -32,9 +32,8 @@ struct DatagramTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func datagramRoundTrip(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func datagramRoundTrip() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -51,7 +50,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeCompletedFuture {
                     try connectionChannel.pipeline.syncOperations.addHandler(
@@ -81,8 +79,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         let (clientConnectionChannel, streamCreator) = try await connectOutbound(
@@ -112,14 +109,11 @@ struct DatagramTests {
 
         try await serverChannel.close()
         try await noMoreConnectionsPromise.futureResult.get()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func datagramRoundTripWaitingForReadComplete(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func datagramRoundTripWaitingForReadComplete() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -136,7 +130,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeCompletedFuture {
                     try connectionChannel.pipeline.syncOperations.addHandler(
@@ -166,8 +159,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         let (clientConnectionChannel, streamCreator) = try await connectOutbound(
@@ -197,14 +189,11 @@ struct DatagramTests {
 
         try await serverChannel.close()
         try await noMoreConnectionsPromise.futureResult.get()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func datagramsSentBeforeConnectionEstablishmentAreBuffered(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func datagramsSentBeforeConnectionEstablishmentAreBuffered() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -220,7 +209,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeCompletedFuture {
                     try connectionChannel.pipeline.syncOperations.addHandler(
@@ -241,8 +229,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         _ = try await connectOutbound(clientChannel, host: host, port: serverPort) { connectionChannel, _ in
@@ -260,14 +247,11 @@ struct DatagramTests {
 
         try await serverChannel.close()
         try await noMoreConnectionsPromise.futureResult.get()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func streamRoundTripWithDatagramsEnabled(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func streamRoundTripWithDatagramsEnabled() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -283,7 +267,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeSucceededVoidFuture()
             },
@@ -308,8 +291,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         let (_, streamCreator) = try await connectOutbound(clientChannel, host: host, port: serverPort)
@@ -334,14 +316,11 @@ struct DatagramTests {
 
         try await serverChannel.close()
         try await noMoreConnectionsPromise.futureResult.get()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func unidirectionalDatagramAdvertisement(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func unidirectionalDatagramAdvertisement() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -364,7 +343,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             maxDatagramFrameSize: .max,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeCompletedFuture {
@@ -397,7 +375,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.clientLogger,
-            driverCheck: driverCheck,
             maxDatagramFrameSize: 0
         ).get()
 
@@ -449,16 +426,13 @@ struct DatagramTests {
         #expect(errors.isEmpty, "unexpected error(s) on a connection channel: \(errors)")
 
         try await serverChannel.close()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     /// A datagram larger than the peer's advertised `max_datagram_frame_size` is rejected locally,
     /// before it reaches the transport; the connection stays open and unrelated writes still work.
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func oversizedDatagramIsDroppedAndConnectionStaysOpen(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func oversizedDatagramIsDroppedAndConnectionStaysOpen() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -484,7 +458,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             maxDatagramFrameSize: serverMaxDatagramFrameSize,
             inboundConnectionInitializer: { connectionChannel, streamCreator in
                 connectionChannel.eventLoop.makeCompletedFuture {
@@ -515,8 +488,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         let (clientConnectionChannel, streamCreator) = try await connectOutbound(
@@ -566,24 +538,19 @@ struct DatagramTests {
         #expect(errors.isEmpty, "unexpected error(s) on a connection channel: \(errors)")
 
         try await serverChannel.close()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
     @Test(
-        arguments: StreamChannelsDriverCheck.all,
-        [
+        arguments: [
             (InitialPacketSize.fixed(1200), [6]),
             (InitialPacketSize.fixed(1350), [1250, 6]),
         ]
     )
     func serverSendsLargeDatagramOnlyWithLargerInitialPacketSize(
-        driver: QUICConnectionDriver,
         sizes: (serverInitialPacketSize: InitialPacketSize, expectedSizes: [Int])
     ) async throws {
         let (serverInitialPacketSize, expectedSizes) = sizes
-        let driverCheck = StreamChannelsDriverCheck(driver)
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -601,7 +568,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             initialPacketSize: serverInitialPacketSize,
             inboundConnectionInitializer: { connectionChannel, _ in
                 connectionChannel.eventLoop.makeCompletedFuture {
@@ -631,7 +597,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.clientLogger,
-            driverCheck: driverCheck,
             initialPacketSize: 1350
         ).get()
 
@@ -661,14 +626,11 @@ struct DatagramTests {
         #expect(receivedSizes == expectedSizes)
 
         try await serverChannel.close()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func serverPacketSizeMatchesClientInitial(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func serverPacketSizeMatchesClientInitial() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -689,7 +651,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             initialPacketSize: .matchingClientInitial(upTo: 1500),
             inboundConnectionInitializer: { connectionChannel, _ in
                 connectionChannel.eventLoop.makeCompletedFuture {
@@ -717,7 +678,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.clientLogger,
-            driverCheck: driverCheck,
             initialPacketSize: 1350
         ).get()
 
@@ -755,8 +715,6 @@ struct DatagramTests {
         #expect(receivedSizes.sorted() == [6, 1250])
 
         try await serverChannel.close()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 
     /// Attaching a stream's flow needs no event context held, and a datagram's `channelRead` runs
@@ -765,9 +723,8 @@ struct DatagramTests {
     /// Unidirectional, because the first bidirectional stream a client opens reuses the stream the
     /// connection created up front, which attaches no new flow.
     @available(anyAppleOS 26, *)
-    @Test(arguments: StreamChannelsDriverCheck.all)
-    func streamOpenedFromADatagramReadOpens(driver: QUICConnectionDriver) async throws {
-        let driverCheck = StreamChannelsDriverCheck(driver)
+    @Test
+    func streamOpenedFromADatagramReadOpens() async throws {
         let eventLoopGroup = MultiThreadedEventLoopGroup.singleton
         let loggers = getChannelLoggers()
         let host = "127.0.0.1"
@@ -783,7 +740,6 @@ struct DatagramTests {
             host: host,
             port: 0,
             logger: loggers.serverLogger,
-            driverCheck: driverCheck,
             inboundConnectionInitializer: { connectionChannel, _ in
                 connectionChannel.eventLoop.makeCompletedFuture {
                     try connectionChannel.pipeline.syncOperations.addHandler(
@@ -808,8 +764,7 @@ struct DatagramTests {
             eventLoopGroup: eventLoopGroup,
             host: host,
             port: 0,
-            logger: loggers.clientLogger,
-            driverCheck: driverCheck
+            logger: loggers.clientLogger
         ).get()
 
         let (clientConnectionChannel, _) = try await connectOutbound(
@@ -837,8 +792,6 @@ struct DatagramTests {
 
         try await serverChannel.close()
         try await noMoreConnectionsPromise.futureResult.get()
-
-        driverCheck.expectConnectionsRanOnTheDriver()
     }
 }
 

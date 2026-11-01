@@ -24,7 +24,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class CertificateAuthTests: StreamChannelsTestCase {
+final class CertificateAuthTests: XCTestCase {
 
     private func buildClientChannel(
         address: String = "127.0.0.1",

@@ -79,11 +79,8 @@ struct StateMachineClosingTests {
     }
 
     @available(anyAppleOS 26, *)
-    @Test(arguments: [
-        Drivers(client: .stateMachine, server: .stateMachine),
-        Drivers(client: .stateMachine, server: .swiftNetwork),
-    ])
-    func thePeersApplicationCloseReachesTheConsumerAtOnce(drivers: Drivers) async throws {
+    @Test
+    func thePeersApplicationCloseReachesTheConsumerAtOnce() async throws {
         let recording = StreamRecording()
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
         let captureConnection: @Sendable (QUICStreamConnection<EchoConsumer>) -> Void = { connection in
@@ -92,7 +89,6 @@ struct StateMachineClosingTests {
 
         try await withOwnEventLoops { eventLoopGroup in
             try await withConsumerPair(
-                drivers: drivers,
                 eventLoopGroup: eventLoopGroup,
                 configureClientPipeline: Self.delayClientReads,
                 client: RecordConsumer(recording: recording),
@@ -147,7 +143,6 @@ struct StateMachineClosingTests {
             let start = ContinuousClock.now
             await #expect(throws: QUICConnectionError.self) {
                 let pair = try await makeConsumerPair(
-                    drivers: Drivers(client: .stateMachine, server: .stateMachine),
                     eventLoopGroup: eventLoopGroup,
                     configureClient: { configuration in
                         configuration.verificationConfiguration = .rawPublicKeys(publicKeyFilePath: keyURL.path)
@@ -173,7 +168,6 @@ struct StateMachineClosingTests {
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
         let recording = StreamRecording()
         var pair: ConsumerPair<RecordConsumer, EchoConsumer>? = try await makeConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             configureClientPipeline: Self.delayClientReads,
             makeClientConsumer: { _ in RecordConsumer(recording: recording) },
             makeServerConsumer: { connection in
@@ -224,7 +218,6 @@ struct StateMachineClosingTests {
         let serverConnection = NIOLockedValueBox<QUICStreamConnection<EchoConsumer>?>(nil)
         let recording = StreamRecording()
         let pair = try await makeConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             // The server's PINGs reach the client while it closes.
             configureServer: { $0.keepAliveInterval = .milliseconds(100) },
             configureClientPipeline: {

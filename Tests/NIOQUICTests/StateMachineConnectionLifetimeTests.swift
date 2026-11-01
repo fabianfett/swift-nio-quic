@@ -114,7 +114,6 @@ struct StateMachineConnectionLifetimeTests {
                         return IdleConsumer()
                     }
                 )
-                handler.connectionDriver = .stateMachine
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -130,7 +129,7 @@ struct StateMachineConnectionLifetimeTests {
                 )
             }
             .get()
-        #expect(connections.withLockedValue { $0?.driver } == .stateMachine)
+        #expect(connections.withLockedValue { $0 } != nil)
 
         try await Self.expectReleased(connections) { channel in channel.close() }
         await #expect(throws: (any Error).self) { try await connected.get() }
@@ -169,7 +168,6 @@ struct StateMachineConnectionLifetimeTests {
                         return IdleConsumer()
                     }
                 )
-                handler.connectionDriver = .stateMachine
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -232,7 +230,7 @@ struct StateMachineConnectionLifetimeTests {
         while connections.withLockedValue({ $0 == nil }) {
             try await Task.sleep(for: .milliseconds(10))
         }
-        #expect(connections.withLockedValue { $0?.driver } == .stateMachine)
+        #expect(connections.withLockedValue { $0 } != nil)
 
         try await Self.expectReleased(connections) { _ in server.close() }
     }

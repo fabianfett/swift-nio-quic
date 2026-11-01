@@ -278,7 +278,6 @@ struct StateMachineDatagramBatchTests {
         }
 
         return try await withConsumerPair(
-            drivers: Drivers(client: .stateMachine, server: .stateMachine),
             host: host,
             configureServer: { configuration in
                 configuration.pacePackets = paced

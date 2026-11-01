@@ -17,15 +17,13 @@ import Logging
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOEmbedded
-@_spi(Essentials) import SwiftNetwork
 import Synchronization
 import Testing
 
 @testable import NIOQUIC
 
 /// Unit tests for the connection channel's datagram (RFC 9221) I/O: the negotiation state machine
-/// over a `RecordingConnection`, and the connection-to-transport seam over a real
-/// `SwiftNetworkQUICConnection` with a `DatagramTestTransport`.
+/// over a `RecordingConnection`.
 @Suite
 struct QUICConnectionChannelDatagramTests {
 
@@ -209,96 +207,6 @@ struct QUICConnectionChannelDatagramTests {
             #expect(Self.failedChannelError(result) == .ioOnClosedChannel)
         }
     }
-
-    // MARK: - Connection to transport
-
-    @available(anyAppleOS 26, *)
-    @Test("The connection accepts datagram writes from start, which attaches its transport")
-    func connectionAcceptsWritesFromStart() throws {
-        try Self.withLiveConnection { connection, _, _ in
-            // The transport `start` attached buffers the write, although the handshake hasn't run.
-            #expect(connection.writeDatagram(ByteBuffer(string: "datagram")))
-            // Flushing before the flow is connected is a no-op rather than a trap.
-            connection.flushDatagrams()
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test("Installing a datagram transport closes the one it replaces")
-    func installingATransportClosesTheReplacedOne() throws {
-        try Self.withLiveConnection { connection, transport, _ in
-            guard case .live(let attached)? = connection._forTesting_getDatagramTransport() else {
-                Issue.record("Expected the transport `start` attached")
-                return
-            }
-            #expect(!attached.identifier.isNone)
-
-            connection.setDatagramTransport(.test(transport))
-
-            // Closing it detached its flow and unregistered it.
-            #expect(attached.identifier.isNone)
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test("The connection forwards writes and flushes to its datagram transport")
-    func connectionForwardsWritesToTransport() throws {
-        try Self.withLiveConnection { connection, transport, _ in
-            connection.setDatagramTransport(.test(transport))
-
-            let payload = ByteBuffer(string: "datagram")
-            #expect(connection.writeDatagram(payload))
-            #expect(transport.writtenDatagrams == [payload])
-            #expect(transport.flushCount == 0)
-
-            connection.flushDatagrams()
-            #expect(transport.flushCount == 1)
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test("A datagram the transport receives is fired as a channelRead on the connection channel")
-    func transportInboundDatagramReachesThePipeline() throws {
-        try Self.withLiveConnection { connection, transport, recorder in
-            connection.setDatagramTransport(.test(transport))
-
-            let payload = ByteBuffer(string: "inbound")
-            transport.deliverInbound(payload)
-            #expect(recorder.reads == [payload])
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test("An error the transport reports is fired as an errorCaught on the connection channel")
-    func transportErrorReachesThePipeline() throws {
-        try Self.withLiveConnection { connection, transport, recorder in
-            connection.setDatagramTransport(.test(transport))
-
-            transport.deliverError(TestError())
-            #expect(recorder.errors.count == 1)
-            #expect(recorder.errors.first is TestError)
-        }
-    }
-
-    @available(anyAppleOS 26, *)
-    @Test("Closing the connection closes its datagram transport")
-    func connectionCloseClosesTransport() throws {
-        try Self.withLiveConnection { connection, transport, _ in
-            connection.setDatagramTransport(.test(transport))
-            #expect(transport.closeCount == 0)
-
-            _ = connection.close(
-                isApplicationClose: false,
-                errorCode: QUICTransportErrorCode.noError.rawValue,
-                reason: ""
-            )
-            #expect(transport.closeCount == 1)
-
-            // The transport is dropped with the rest of the connection's state, so later writes are
-            // refused rather than handed to a detached flow.
-            #expect(!connection.writeDatagram(ByteBuffer(string: "after close")))
-        }
-    }
 }
 
 // MARK: - Test harness
@@ -331,61 +239,6 @@ extension QUICConnectionChannelDatagramTests {
         try promise.futureResult.wait()
 
         try body(channel, connection, recorder)
-    }
-
-    /// Builds a real `SwiftNetworkQUICConnection` and the connection channel driving it, with a
-    /// `DatagramRecorder` in the channel's pipeline and a `DatagramTestTransport` the body installs
-    /// via `setDatagramTransport(_:)`. Exercises the connection <-> transport seam without a real
-    /// SwiftNetwork datagram flow.
-    static func withLiveConnection(
-        body: (SwiftNetworkQUICConnection<QUICStreamChannels>, DatagramTestTransport, DatagramRecorder) throws -> Void
-    ) throws {
-        let privateKeyPath = Bundle.module.url(forResource: "privateKey", withExtension: "der")!.path
-        let publicKeyPath = Bundle.module.url(forResource: "publicKey", withExtension: "der")!.path
-
-        var rng: any RandomNumberGenerator = SystemRandomNumberGenerator()
-        let eventLoop = EmbeddedEventLoop()
-        let udpChannel = EmbeddedChannel(loop: eventLoop)
-
-        let connection = try SwiftNetworkQUICConnection<QUICStreamChannels>.server(
-            configuration: .forServer(
-                serverName: "quic-test.local",
-                authenticationConfiguration: .rawPublicKeys(
-                    publicKeyFilePath: publicKeyPath,
-                    privateKeyFilePath: privateKeyPath
-                ),
-                applicationProtocols: []
-            ),
-            sourceConnectionID: .random(using: &rng),
-            statelessResetTokenGenerator: .defaultWithAutoGeneratedKey,
-            authenticator: nil,
-            localAddress: try SocketAddress(ipAddress: "127.0.0.1", port: 1234),
-            remoteAddress: try SocketAddress(ipAddress: "127.0.0.1", port: 1234),
-            logger: Logger(label: "test"),
-            eventLoop: eventLoop
-        )
-
-        // Constructing the channel wires it into the connection via setDriver; the connection needs
-        // it to hand inbound datagrams and flow errors to the pipeline.
-        let channel = QUICConnectionChannel<QUICStreamChannels>(
-            udpChannel: udpChannel,
-            connection: .live(connection),
-            registrar: .test(RecordingRegistrar()),
-            transport: .test(RecordingTransport()),
-            isServer: true,
-            table: nil
-        )
-
-        let recorder = DatagramRecorder()
-        let promise = eventLoop.makePromise(of: Void.self)
-        channel.transportView.initialize(readyPromise: promise, handshakePromise: nil) {
-            $0.pipeline.addHandler(recorder)
-        }
-        try promise.futureResult.wait()
-
-        try body(connection, DatagramTestTransport(), recorder)
-
-        try udpChannel.close().wait()
     }
 
     /// Writes and flushes `buffer` on the channel, returning the write's future so the test can
@@ -422,47 +275,6 @@ extension QUICConnectionChannelDatagramTests {
     static func failedChannelError(_ future: EventLoopFuture<Void>) -> ChannelError? {
         guard case .failure(let error) = Self.outcome(future) else { return nil }
         return error as? ChannelError
-    }
-}
-
-/// A `QUICDatagramProtocol` test double: records outbound datagrams and lets tests inject inbound
-/// datagrams and errors back through the reader the connection installs.
-@available(anyAppleOS 26, *)
-final class DatagramTestTransport: QUICDatagramProtocol {
-    private(set) var writtenDatagrams: [ByteBuffer] = []
-    private(set) var flushCount = 0
-    private(set) var closeCount = 0
-    private var reader: SwiftNetworkQUICConnection<QUICStreamChannels>?
-
-    func write(datagram: ByteBuffer) -> Bool {
-        self.writtenDatagrams.append(datagram)
-        return true
-    }
-
-    func flush(in eventContext: inout NetworkContext.EventContext) {
-        self.flushCount += 1
-    }
-
-    func close(in eventContext: inout NetworkContext.EventContext) {
-        self.closeCount += 1
-        // Mirror the production transport: dropping the reader breaks the connection <-> transport
-        // cycle.
-        self.reader = nil
-    }
-
-    func setReader(connection: SwiftNetworkQUICConnection<QUICStreamChannels>) {
-        self.reader = connection
-    }
-
-    /// Test-only: simulate an inbound datagram arriving from the peer, as the production transport
-    /// hands it to the connection once the event context is released.
-    func deliverInbound(_ datagram: ByteBuffer) {
-        self.reader?.run(.datagramRead(datagram))
-    }
-
-    /// Test-only: simulate the transport reporting an error.
-    func deliverError(_ error: any Error) {
-        self.reader?.run(.datagramError(error))
     }
 }
 

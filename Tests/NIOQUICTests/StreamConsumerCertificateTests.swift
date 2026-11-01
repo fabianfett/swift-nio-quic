@@ -22,23 +22,6 @@ import Testing
 
 @testable import NIOQUIC
 
-@available(anyAppleOS 26, *)
-struct CertificateTestDrivers: Sendable, CustomTestStringConvertible {
-    var client: QUICConnectionDriver
-    var server: QUICConnectionDriver
-
-    static let all: [CertificateTestDrivers] = [
-        CertificateTestDrivers(client: .swiftNetwork, server: .swiftNetwork),
-        CertificateTestDrivers(client: .stateMachine, server: .stateMachine),
-        CertificateTestDrivers(client: .stateMachine, server: .swiftNetwork),
-        CertificateTestDrivers(client: .swiftNetwork, server: .stateMachine),
-    ]
-
-    var testDescription: String {
-        "client: \(self.client), server: \(self.server)"
-    }
-}
-
 /// Echoes every stream back once it has been read to its end.
 @available(anyAppleOS 26, *)
 private struct EchoServer: QUICStreamConsumer {
@@ -101,16 +84,14 @@ private struct ResponseCollector: QUICStreamConsumer {
     }
 }
 
-/// X.509 authentication for connections that serve a stream consumer, on every driver: the client
-/// verifies the server's chain asynchronously, through an ``AsyncVerifier``.
+/// X.509 authentication for connections that serve a stream consumer: the client verifies the server's chain asynchronously, through an ``AsyncVerifier``.
 @Suite(.timeLimit(.minutes(1)))
 struct StreamConsumerCertificateTests {
     @available(anyAppleOS 26, *)
     private static func serverChannel(
         certificates: TestCAFilePaths,
         serverName: String,
-        driver: QUICConnectionDriver,
-        acceptedDrivers: NIOLockedValueBox<[QUICConnectionDriver?]>
+        acceptedConnections: NIOLockedValueBox<Int>
     ) async throws -> any Channel {
         let configuration = QUICConfiguration.forServer(
             serverName: serverName,
@@ -132,12 +113,11 @@ struct StreamConsumerCertificateTests {
                         privateKeyFilePath: certificates.serverPrivateKeyFilePath
                     ),
                     logger: Logger(label: "Server"),
-                    makeConsumer: { connection in
-                        acceptedDrivers.withLockedValue { $0.append(connection.driver) }
+                    makeConsumer: { _ in
+                        acceptedConnections.withLockedValue { $0 += 1 }
                         return EchoServer()
                     }
                 )
-                handler.connectionDriver = driver
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -147,21 +127,19 @@ struct StreamConsumerCertificateTests {
     /// Connects with `trustRoots` as the only trust anchors, sends `request` and returns the
     /// response, or `nil` if the connection closed without one.
     ///
-    /// Checks that the client connection runs on `driver`, whether or not the handshake succeeds.
+    /// Checks that the client made one connection, whether or not the handshake succeeds.
     @available(anyAppleOS 26, *)
     private static func echo(
         _ request: String,
         to server: any Channel,
         serverName: String,
-        trustRoots: TestCAFilePaths,
-        driver: QUICConnectionDriver
+        trustRoots: TestCAFilePaths
     ) async throws -> String? {
         let (responses, continuation) = AsyncStream<ByteBuffer>.makeStream()
         // The consumer is made when the connection is created, before the handshake can fail.
-        let clientDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
+        let clientConnections = NIOLockedValueBox(0)
         defer {
-            let drivers = clientDrivers.withLockedValue { $0 }
-            #expect(drivers == [driver])
+            #expect(clientConnections.withLockedValue { $0 } == 1)
         }
         let configuration = QUICConfiguration.forClient(
             verificationConfiguration: .x509Certificates(trustRootsFilePath: trustRoots.trustStoreFilePath),
@@ -179,12 +157,11 @@ struct StreamConsumerCertificateTests {
                     ),
                     authenticator: nil,
                     logger: Logger(label: "Client"),
-                    makeConsumer: { connection in
-                        clientDrivers.withLockedValue { $0.append(connection.driver) }
+                    makeConsumer: { _ in
+                        clientConnections.withLockedValue { $0 += 1 }
                         return ResponseCollector(responses: continuation)
                     }
                 )
-                handler.connectionDriver = driver
                 try channel.pipeline.syncOperations.addHandler(handler)
                 return channel
             }
@@ -210,44 +187,40 @@ struct StreamConsumerCertificateTests {
         return nil
     }
 
-    @Test(arguments: CertificateTestDrivers.all)
+    @Test
     @available(anyAppleOS 26, *)
-    func aVerifiedServerEchoes(drivers: CertificateTestDrivers) async throws {
+    func aVerifiedServerEchoes() async throws {
         let certificates = try TestCertificates()
-        // Each case writes its own files: the cases run in parallel.
+        // Each test writes its own files: the tests run in parallel.
         let paths = try certificates.writeToTemp(fileTag: "aVerifiedServerEchoes-\(UUID())")
-        let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
+        let acceptedConnections = NIOLockedValueBox(0)
         let server = try await Self.serverChannel(
             certificates: paths,
             serverName: certificates.leafName,
-            driver: drivers.server,
-            acceptedDrivers: serverDrivers
+            acceptedConnections: acceptedConnections
         )
         let response = try await Self.echo(
             "ping",
             to: server,
             serverName: certificates.leafName,
-            trustRoots: paths,
-            driver: drivers.client
+            trustRoots: paths
         )
         try await server.close()
-        let acceptedDrivers = serverDrivers.withLockedValue { $0 }
-        #expect(!acceptedDrivers.isEmpty && acceptedDrivers.allSatisfy { $0 == drivers.server })
+        #expect(acceptedConnections.withLockedValue { $0 } > 0)
         #expect(response == "ping")
     }
 
-    @Test(arguments: CertificateTestDrivers.all)
+    @Test
     @available(anyAppleOS 26, *)
-    func aServerWithAnUntrustedChainIsRejected(drivers: CertificateTestDrivers) async throws {
+    func aServerWithAnUntrustedChainIsRejected() async throws {
         let certificates = try TestCertificates()
         let paths = try certificates.writeToTemp(fileTag: "aServerWithAnUntrustedChainIsRejected-\(UUID())")
         let otherRoots = try TestCertificates().writeToTemp(fileTag: "aServerWithAnUntrustedChainIsRejected-\(UUID())")
-        let serverDrivers = NIOLockedValueBox<[QUICConnectionDriver?]>([])
+        let acceptedConnections = NIOLockedValueBox(0)
         let server = try await Self.serverChannel(
             certificates: paths,
             serverName: certificates.leafName,
-            driver: drivers.server,
-            acceptedDrivers: serverDrivers
+            acceptedConnections: acceptedConnections
         )
         // The client's verifier rejects the chain, which fails the handshake with a TLS error
         // (RFC 9001 Section 4.8) and so the connection attempt.
@@ -256,13 +229,11 @@ struct StreamConsumerCertificateTests {
                 "ping",
                 to: server,
                 serverName: certificates.leafName,
-                trustRoots: otherRoots,
-                driver: drivers.client
+                trustRoots: otherRoots
             )
         }
         try await server.close()
-        let acceptedDrivers = serverDrivers.withLockedValue { $0 }
-        #expect(!acceptedDrivers.isEmpty && acceptedDrivers.allSatisfy { $0 == drivers.server })
+        #expect(acceptedConnections.withLockedValue { $0 } > 0)
         // A CRYPTO_ERROR (RFC 9000 Section 20.1), not some other failure such as a timeout.
         #expect(error?.isApplication == false)
         #expect(error.map { (0x100...0x1ff).contains($0.code) } == true, "\(String(describing: error))")

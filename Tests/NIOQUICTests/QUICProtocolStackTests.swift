@@ -26,7 +26,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class QUICProtocolStackTests: StreamChannelsTestCase {
+final class QUICProtocolStackTests: XCTestCase {
 
     private func buildClientChannel(
         logger: Logger,
@@ -1000,8 +1000,8 @@ final class QUICProtocolStackTests: StreamChannelsTestCase {
     }
 
     func testServerSendRetry() async throws {
-        // This test directs the server to send a retry in response to the client initial. On the
-        // state machine driver the handler sends it, and accepts the connection with its token.
+        // This test directs the server to send a retry in response to the client initial. The
+        // handler sends it, and accepts the connection with its token.
 
         let loggers = getChannelLoggers()
         let (serverChannel, serverMultiplexer) = try await buildServerChannel(
@@ -1062,14 +1062,12 @@ final class QUICProtocolStackTests: StreamChannelsTestCase {
             group.cancelAll()
         }
 
-        // The SwiftNetwork driver sends its own Retry.
         let (retries, connectionsAfterRetry) = try await serverChannel.eventLoop.submit {
             let handler = try serverChannel.pipeline.syncOperations.handler(type: QUICHandler<QUICStreamChannels>.self)
             return (handler._forTesting_retriesSent, handler._forTesting_connectionsAcceptedAfterRetry)
         }.get()
-        let handlerSendsRetry = self.streamChannelsDriver == .stateMachine
-        XCTAssertEqual(retries, handlerSendsRetry ? 1 : 0)
-        XCTAssertEqual(connectionsAfterRetry, handlerSendsRetry ? 1 : 0)
+        XCTAssertEqual(retries, 1)
+        XCTAssertEqual(connectionsAfterRetry, 1)
     }
 
     func testServerUsingQlog() async throws {

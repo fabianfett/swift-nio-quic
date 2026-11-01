@@ -64,7 +64,6 @@ private final class RetryServer {
     }
 
     init(
-        driver: QUICConnectionDriver = .stateMachine,
         connectionLimits: QUICConnectionLimits = .unlimited,
         connectionIDGenerator: any QUICConnectionID.Generator = QUICConnectionID.RandomGenerator()
     ) throws {
@@ -89,7 +88,6 @@ private final class RetryServer {
             logger: Logger(label: "Test"),
             connectionIDGenerator: connectionIDGenerator
         ) { _ in RetryTestConsumer() }
-        self.handler.connectionDriver = driver
         try self.channel.pipeline.syncOperations.addHandler(self.handler)
     }
 
@@ -373,7 +371,7 @@ struct QUICHandlerRetryTests {
     @Test(.timeLimit(.minutes(1)))
     @available(anyAppleOS 26, *)
     func retriesTakeNoAdmissionSlots() throws {
-        let server = try RetryServer(driver: .stateMachine, connectionLimits: .perHandler(activeLimit: 1))
+        let server = try RetryServer(connectionLimits: .perHandler(activeLimit: 1))
         let clientConnectionID = server.randomConnectionID()
         // Several Retries, for one connection.
         var retries: [RetryServer.Retry] = []
@@ -396,7 +394,7 @@ struct QUICHandlerRetryTests {
     @Test(.timeLimit(.minutes(1)))
     @available(anyAppleOS 26, *)
     func aRetryComesFromANewConnectionID() throws {
-        let server = try RetryServer(driver: .stateMachine, connectionIDGenerator: EchoingGenerator())
+        let server = try RetryServer(connectionIDGenerator: EchoingGenerator())
         let destinationConnectionID = server.randomConnectionID()
 
         // A client discards a Retry from the connection ID its Initial went to (RFC 9000 Section
@@ -407,21 +405,5 @@ struct QUICHandlerRetryTests {
         )
 
         #expect(retry.sourceConnectionID != destinationConnectionID)
-    }
-
-    @Test(.timeLimit(.minutes(1)))
-    @available(anyAppleOS 26, *)
-    func swiftNetworkConnectionsSendTheirOwnRetry() throws {
-        let server = try RetryServer(driver: .swiftNetwork)
-        let destinationConnectionID = server.randomConnectionID()
-
-        _ = try server.fireInitial(
-            destinationConnectionID: destinationConnectionID,
-            sourceConnectionID: server.randomConnectionID()
-        )
-
-        // The handler made a SwiftNetwork connection, which validates the address itself.
-        #expect(server.handler._forTesting_retriesSent == 0)
-        #expect(try server.isRoutable(destinationConnectionID))
     }
 }

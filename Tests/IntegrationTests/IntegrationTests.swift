@@ -26,7 +26,7 @@ import XCTest
 @testable import NIOQUIC
 
 @available(anyAppleOS 26, *)
-final class IntegrationTests: StreamChannelsTestCase {
+final class IntegrationTests: XCTestCase {
     func testHTTP09Requests() async throws {
         // To open more streams you will need to plumb this through on the QUIC stream options. Max is 8.
         let requestCount = 6
