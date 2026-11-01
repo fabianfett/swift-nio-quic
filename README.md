@@ -1,8 +1,8 @@
 # SwiftNIO QUIC
 
 SwiftNIO QUIC provides bindings between [SwiftNIO][swift-nio] and a Swift
-implementation of the QUIC network protocol from
-[Swift Network Evolution][swift-network]. It makes use
+implementation of the QUIC network protocol, the `QUICStateMachine` of
+[Swift Network Evolution][swift-network], which it drives directly. It makes use
 of [Swift TLS][swift-tls] and [SwiftNIO QUIC Helpers][swift-nio-quic-helpers]
 and integrates with [SwiftNIO HTTP/3][swift-nio-http3].
 

@@ -19,13 +19,8 @@ public struct QUICError: Error, Hashable, Sendable {
         case quicHandlerShuttingDown
         case quicHandlerShutdown
         case tlsConfigurationIncomplete
-        case invalidConfiguration
         case invalidStreamTypeForRole
-        case unknownVersion(UInt32)
         case invalidStreamState
-        case streamLimit
-        case streamStopped
-        case streamReset
         case unableToLoadCertificates
         case unableToLoadPrivateKey
         case certificatesMissing
@@ -33,12 +28,10 @@ public struct QUICError: Error, Hashable, Sendable {
         case failedToAssociateConnectionID
         case failedToRetireConnectionID
         case streamWriteFailed
-        case streamHandlerNotFound
         case noStreamConsumer
         case datagramTooLarge
         case datagramWriteFailed
         case peerDoesNotAcceptDatagrams
-        case unknownError(Int)
     }
 
     let code: Code
@@ -55,26 +48,11 @@ public struct QUICError: Error, Hashable, Sendable {
     /// Indicates that the TLS configuration is incomplete.
     public static let tlsConfigurationIncomplete: Self = .init(code: .tlsConfigurationIncomplete)
 
-    /// Indicates that the QUIC configuration is invalid and cannot continue.
-    public static let invalidConfiguration: Self = .init(code: .invalidConfiguration)
-
     /// Indicates that a QUIC stream cannot be opened because its stream type does not match the role.
     public static let invalidStreamTypeForRole: Self = .init(code: .invalidStreamTypeForRole)
 
-    /// Indicates that a QUIC packet header failed decoding
-    public static func unknownVersion(_ version: UInt32) -> Self { .init(code: .unknownVersion(version)) }
-
     /// Indicates that the stream is in a bad state
     public static let invalidStreamState: Self = .init(code: .invalidStreamState)
-
-    /// Indicates that the stream limit was hit
-    public static let streamLimit: Self = .init(code: .streamLimit)
-
-    /// Indicates that the stream stopped
-    public static let streamStopped: Self = .init(code: .streamStopped)
-
-    /// Indicates that the stream was reset
-    public static let streamReset: Self = .init(code: .streamReset)
 
     /// Indicates that the certificates could not be loaded from storage
     public static let unableToLoadCertificates: Self = .init(code: .unableToLoadCertificates)
@@ -95,9 +73,6 @@ public struct QUICError: Error, Hashable, Sendable {
 
     /// Indicates that a retired connection ID could not be removed from an existing connection.
     public static let failedToRetireConnectionID: Self = .init(code: .failedToRetireConnectionID)
-
-    /// Indicates that no stream handler was found for the given stream ID.
-    public static let streamHandlerNotFound: Self = .init(code: .streamHandlerNotFound)
 
     /// Indicates that the handler services its streams with `Channel`s rather than a
     /// ``QUICStreamConsumer``, so it can't create a connection whose streams are consumed.
@@ -120,7 +95,4 @@ public struct QUICError: Error, Hashable, Sendable {
 
     /// Inidicates that the peer advertised a maximum datagram size of 0.
     public static let peerDoesNotAcceptDatagrams: Self = .init(code: .peerDoesNotAcceptDatagrams)
-
-    /// Indicates an unknown error
-    public static func unknownError(_ code: Int) -> Self { .init(code: .unknownError(code)) }
 }

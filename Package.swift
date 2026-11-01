@@ -17,16 +17,16 @@ import PackageDescription
 
 let isRunningInCI = Context.environment["CI"] != nil
 
-// Enable the QlogOutput in CI as some tests depend on it; also enable a setting NIOQUIC uses
-// to write qlog files with the trait, and our tests to gate whether the Qlog tests are
-// expected to run or not.
-let swiftNetworkTraits: Set<Package.Dependency.Trait>
+// Enable swift-network-evolution's QlogOutput trait in CI, which makes QUICStateMachine write
+// qlog files, as some tests depend on it; also enable a setting NIOQUIC uses to write qlog files
+// with the trait, and our tests to gate whether the Qlog tests are expected to run or not.
+let networkEvolutionTraits: Set<Package.Dependency.Trait>
 let qlogSetting: [SwiftSetting]
 if isRunningInCI {
-    swiftNetworkTraits = [.defaults, "QlogOutput"]
+    networkEvolutionTraits = [.defaults, "QlogOutput"]
     qlogSetting = [.define("QLOG_ENABLED")]
 } else {
-    swiftNetworkTraits = [.defaults]
+    networkEvolutionTraits = [.defaults]
     qlogSetting = []
 }
 
@@ -53,7 +53,7 @@ let package = Package(
         .package(
             url: "https://github.com/fabianfett/swift-network-evolution.git",
             revision: "f922a0f0c9060d859ecf07b5de547b5bb6f23195",
-            traits: swiftNetworkTraits
+            traits: networkEvolutionTraits
         ),
         .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.1.0")),
     ],
@@ -78,7 +78,6 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "SwiftTLS", package: "swift-tls"),
-                .product(name: "SwiftNetwork", package: "swift-network-evolution"),
                 .product(name: "QUICStateMachine", package: "swift-network-evolution"),
                 .product(name: "DequeModule", package: "swift-collections"),
             ],
