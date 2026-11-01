@@ -1151,6 +1151,10 @@ final class QUICProtocolStackTests: XCTestCase {
                 let filePath = path.appending(component: filename)
                 let resultData = try Data(contentsOf: filePath)
                 XCTAssert(!resultData.isEmpty, "qlog file is unexpectedly empty")
+                // The configured title and description.
+                let root = try XCTUnwrap(JSONSerialization.jsonObject(with: resultData) as? [String: Any])
+                XCTAssertEqual(root["title"] as? String, title)
+                XCTAssertEqual(root["description"] as? String, "TestLogDescription")
                 // The transport parameters of both endpoints, and the packets sent and received.
                 let contents = String(decoding: resultData, as: UTF8.self)
                 XCTAssertEqual(contents.components(separatedBy: "PARAMETERS_SET").count - 1, 2, contents)
