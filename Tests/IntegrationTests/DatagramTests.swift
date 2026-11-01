@@ -654,18 +654,11 @@ struct DatagramTests {
 
         try await performSyncHandshake(streamCreator, signal: syncSignal, serverReceived: serverReceivedSync)
 
-        // The state machine's core drops a DATAGRAM frame as too large for any packet when the
-        // room left after a coalesced Handshake packet doesn't fit it, which a client sends while
-        // the server retransmits its handshake, as under load: the payload then never arrives.
-        try await withKnownIssue("A DATAGRAM after a coalesced Handshake packet is dropped", isIntermittent: true) {
-            clientConnectionChannel.writeAndFlush(payload, promise: nil)
-            try await clientReceivedMarker.futureResult.get()
+        clientConnectionChannel.writeAndFlush(payload, promise: nil)
+        try await clientReceivedMarker.futureResult.get()
 
-            let receivedSizes = clientReceived.withLockedValue { $0.map(\.readableBytes) }
-            #expect(receivedSizes == expectedSizes)
-        } when: {
-            driver == .stateMachine
-        }
+        let receivedSizes = clientReceived.withLockedValue { $0.map(\.readableBytes) }
+        #expect(receivedSizes == expectedSizes)
 
         try await serverChannel.close()
 
