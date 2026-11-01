@@ -14,7 +14,6 @@
 
 import NIOCore
 @_spi(ProtocolProvider) import QUICStateMachine
-@_spi(ProtocolProvider) import SwiftNetwork
 
 @available(anyAppleOS 26, *)
 extension UInt8 {
@@ -198,85 +197,34 @@ extension NIOCore.ByteBuffer {
     ///
     /// - Parameters:
     ///   - shortHeaderDCIDLength: The length of the destination connection ID. Required to parse short header packets.
-    /// - Returns: The parsed `QUICPacketHeader` or `nil`.
+    /// - Returns: The parsed `QUICPacketHeader`, or `nil` if the datagram is shorter than 21 bytes,
+    ///   its header is truncated or malformed, or it's an Initial whose token runs past its end.
     func parseQUICPacketHeader(
         destinationIDLength shortHeaderDCIDLength: Int
     ) -> QUICPacketHeader? {
-        self.withUnsafeReadableBytes { buffer in
-            // Needed to decide if this is a long or short header packet.
-            guard let firstByte = buffer.first else {
-                return nil
-            }
-
-            let header = QUICConnectionUtilities.parseInboundPacket(
-                buffer,
-                shortHeaderDestinationCIDLength: Int(shortHeaderDCIDLength)
-            )
-
-            guard let header, let dcid = header.destinationConnectionID else {
-                return nil
-            }
-
-            // NOTE: This will swollow unknown versions. Since the header is only parsed
-            // for connection routing (accept new, forward to existing, stateless reset),
-            // the accuracy here is not important.
-            var version: QUICPacketHeader.Version = .v1
-            if let rawVersion = header.version {
-                version = QUICPacketHeader.Version(rawVersion)
-            }
-
-            let packetType: QUICPacketHeader.PacketType = QUICPacketHeader.PacketType(
-                firstByte: firstByte,
-                version: version
-            )
-
-            var scid: QUICConnectionID? = nil
-            if let parsedSCID = header.sourceConnectionID {
-                scid = QUICConnectionID(parsedSCID)
-            }
-
-            var token = header.token
-            if packetType == .initial {
-                // The routing parser reads the tokens of Retry packets only. A server validates
-                // a client's address with the token of its Initial (RFC 9000 Section 8.1.2).
-                guard
-                    let initialToken = Self.initialToken(
-                        in: buffer,
-                        connectionIDsLength: dcid.length + (scid?.length ?? 0)
-                    )
-                else {
-                    return nil
-                }
-                token = initialToken
-            }
-
-            return QUICPacketHeader(
-                type: packetType,
-                version: version,
-                destinationConnectionID: QUICConnectionID(dcid),
-                sourceConnectionID: scid,
-                token: token
+        let routingHeader = self.withUnsafeReadableBytes { buffer in
+            QUICStatelessPackets.routingHeader(
+                buffer.bytes,
+                shortHeaderDestinationConnectionIDLength: shortHeaderDCIDLength
             )
         }
-    }
-
-    /// The token of the Initial packet in `packet` (RFC 9000 Section 17.2.2), which follows the
-    /// connection IDs and the token's length, or `nil` if the packet ends before it does.
-    private static func initialToken(in packet: UnsafeRawBufferPointer, connectionIDsLength: Int) -> [UInt8]? {
-        // The first byte, the version, and the lengths of the two connection IDs.
-        var index = 1 + 4 + 1 + 1 + connectionIDsLength
-        guard index < packet.count else { return nil }
-        // A variable-length integer: the two high bits of its first byte give its size (RFC 9000
-        // Section 16).
-        let lengthSize = 1 << Int(packet[index] >> 6)
-        guard lengthSize <= packet.count - index else { return nil }
-        var length = UInt64(packet[index] & 0x3f)
-        for offset in 1..<lengthSize {
-            length = length << 8 | UInt64(packet[index + offset])
+        guard let routingHeader else {
+            return nil
         }
-        index += lengthSize
-        guard length <= UInt64(packet.count - index) else { return nil }
-        return Array(packet[index..<(index + Int(length))])
+
+        // NOTE: A short header has no version. Since the header is only parsed for connection
+        // routing (accept new, forward to existing, stateless reset), it counts as version 1.
+        let version = routingHeader.version.map(QUICPacketHeader.Version.init) ?? .v1
+
+        return QUICPacketHeader(
+            type: QUICPacketHeader.PacketType(firstByte: routingHeader.firstByte, version: version),
+            version: version,
+            destinationConnectionID: QUICConnectionID(routingHeader.destinationConnectionID),
+            sourceConnectionID: routingHeader.sourceConnectionID.map(QUICConnectionID.init),
+            // The token of an Initial, which validates the client's address (RFC 9000 Section
+            // 8.1.2), or of a Retry.
+            token: routingHeader.token
+        )
     }
 }
 
